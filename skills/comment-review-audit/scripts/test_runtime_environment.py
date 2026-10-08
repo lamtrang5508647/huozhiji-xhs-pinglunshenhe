@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runtime_environment import child_environment, process_group_options, terminate_process_tree, powershell_command
-from profile_lock import ProfileLock, default_profile
+from profile_lock import ProfileLock, default_profile, prepare_profile
 import session_environment as network
 from browser_environment import find_chrome
 
@@ -44,11 +44,18 @@ class RuntimeTests(unittest.TestCase):
     def test_windows_profile_permissions_are_private(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / "私有 会话"
+            profile.mkdir()
+            env = child_environment({"HUOZHIJI_PROFILE_DIRECTORY": str(profile)})
+            # No owner/group identifiers enter logs; they are retained in memory.
+            descriptor_script = "$acl=Get-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY; Write-Output ($acl.Owner + '|' + $acl.Group)"
+            before = subprocess.run(powershell_command(descriptor_script), env=env, capture_output=True,
+                                    encoding="utf-8", check=True, timeout=15).stdout
             with ProfileLock(profile):
                 script = """
 $acl = Get-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY
 $allowed = @([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')
 if (-not $acl.AreAccessRulesProtected) { throw 'unprotected' }
+if ($acl.Access.Count -ne 3) { throw 'unexpected rule count' }
 foreach ($rule in $acl.Access) {
   $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
   if ($sid -notin $allowed -or $rule.AccessControlType -ne 'Allow') { throw 'unexpected access' }
@@ -58,6 +65,17 @@ Write-Output 'private'
                 result = subprocess.run(powershell_command(script), env=child_environment({"HUOZHIJI_PROFILE_DIRECTORY": str(profile)}),
                                         capture_output=True, encoding="utf-8", check=True, timeout=15)
                 self.assertEqual(result.stdout.strip(), "private")
+            after = subprocess.run(powershell_command(descriptor_script), env=env, capture_output=True,
+                                   encoding="utf-8", check=True, timeout=15).stdout
+            self.assertTrue(before == after, "profile initialization changed ownership/group")
+
+    def test_profile_permissions_failure_is_private_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.CompletedProcess([], 1, "", "SetAcl_AclObject\nprivate data must not appear here\n")
+            with patch("profile_lock.sys.platform", "win32"), patch("profile_lock.subprocess.run", return_value=result):
+                with self.assertRaises(RuntimeError) as caught:
+                    prepare_profile(Path(directory) / "profile")
+            self.assertEqual(str(caught.exception), "browser_profile_permissions_failed:SetAcl_AclObject")
 
     def test_profile_lock_across_processes_and_exception_release(self):
         with tempfile.TemporaryDirectory(prefix="audit-") as directory:

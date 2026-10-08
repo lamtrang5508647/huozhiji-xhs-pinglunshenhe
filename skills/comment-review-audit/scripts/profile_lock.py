@@ -37,8 +37,12 @@ def prepare_profile(profile: Path) -> None:
     # chmod(0700) does NOT provide Windows privacy. Restrict this dedicated
     # directory's DACL; never change a parent directory or delete Chrome locks.
     script = """
-$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+try {
+# Keep a valid owner/group descriptor; an empty DirectorySecurity object is
+# not a complete descriptor for Windows PowerShell's Set-Acl provider.
+$acl = Get-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY
 $acl.SetAccessRuleProtection($true, $false)
+foreach ($existing in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($existing) }
 $ids = @([System.Security.Principal.WindowsIdentity]::GetCurrent().User,
          [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
          [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
@@ -51,13 +55,24 @@ foreach ($id in $ids) {
   $acl.AddAccessRule($rule)
 }
 Set-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY -AclObject $acl
+} catch {
+  # Fixed error identifiers only: no user paths, account SIDs or raw messages.
+  [Console]::Error.WriteLine($_.Exception.GetType().Name)
+  [Console]::Error.WriteLine($_.FullyQualifiedErrorId.Split(',')[0])
+  exit 1
+}
 """
     try:
-        subprocess.run(powershell_command(script),
-                       env=child_environment({"HUOZHIJI_PROFILE_DIRECTORY": str(profile)}),
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True)
+        result = subprocess.run(powershell_command(script),
+                                env=child_environment({"HUOZHIJI_PROFILE_DIRECTORY": str(profile)}),
+                                capture_output=True, encoding="utf-8", timeout=15, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("browser_profile_permissions_failed") from exc
+        raise RuntimeError("browser_profile_permissions_failed") from None
+    if result.returncode != 0:
+        import re
+        codes = [line for line in result.stderr.splitlines() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,100}", line)]
+        reason = ":".join(codes[:2]) or "powershell_failed"
+        raise RuntimeError(f"browser_profile_permissions_failed:{reason}")
 
 
 class ProfileLock:
