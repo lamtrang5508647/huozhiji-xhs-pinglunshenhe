@@ -1,0 +1,27 @@
+name: Offline audit regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run offline regressions
+        run: |
+          for audit_test in skills/comment-review-audit/scripts/test_*.py; do
+            python "$audit_test" || exit 1
+          done
+      - name: Check syntax
+        run: |
+          python -m compileall -q skills/comment-review-audit/scripts
+          node --check skills/comment-review-audit/scripts/build_audited_workbook.mjs
+          bash -n skills/comment-review-audit/scripts/sync_openclaw_skill.sh

@@ -1,0 +1,4 @@
+interface:
+  display_name: "评论审核与回填"
+  short_description: "核验抖音/小红书文字与图片评论、金额，回填结果并生成审核汇总"
+  default_prompt: "使用 $comment-review-audit 先跑一条样本，再批量核对表格中的评论与金额；按成功、失败、待人审以及图文细分类回填，并生成审核汇总。"
