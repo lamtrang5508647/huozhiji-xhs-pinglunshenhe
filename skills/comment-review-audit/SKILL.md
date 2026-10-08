@@ -1,19 +1,19 @@
 ---
 name: comment-review-audit
-description: Audit required text/image comments on Xiaohongshu or Douyin against XLSX requirements, reconcile table-defined amounts, and return audited workbooks with settlement summaries. Use for 评论审核/核对评论 requests or Feishu audit-template attachments; associate adjacent messages from the same sender.
+description: Audit required text/image comments on Xiaohongshu or Douyin against XLSX requirements, reconcile table-defined amounts, and return audited workbooks with settlement summaries. Use for 评论审核/核对评论 requests, local audit tables, or programmatic comment-review workflows. Feishu is an optional integration, not a requirement.
 ---
 
 # Comment Review Audit
 
 Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against comments visible on Douyin or Xiaohongshu. Produce an auditable workbook, not only a prose answer.
 
-## Mandatory Feishu routing
+## Host-independent use
 
-- In a Feishu direct chat, the phrases `请审核`, `审核一下`, `核对评论`, `评论审核`, or an XLSX carrying the known audit columns are sufficient authorization to run the complete audit workflow.
-- Treat an attachment and an adjacent instruction from the same sender as one request even when Feishu delivers them as separate events or in either order.
-- Prefer this skill over a generic spreadsheet skill. The spreadsheet skill is a supporting implementation skill only; it must not replace this audit workflow.
-- Do not ask what the sender wants when the workbook matches the audit template. Acknowledge receipt briefly, then start the canary and full resumable audit.
-- If the instruction arrives after the attachment has already been inspected, reuse the staged attachment path from the current conversation and continue; do not request another upload unless the binary is actually unavailable.
+The audit engines run independently of Codex, OpenClaw and Feishu. The repository provides the Python SDK `huozhiji_audit` and `huozhiji-audit` CLI. Core conversion, comparison and portable XLSX export require only Python 3.11+. If only this skill directory is installed, run the scripts below directly.
+
+For offline evidence-based review, convert the table, compare supplied observations, then export. This does not constitute live platform verification. Read [references/programmatic-use.md](references/programmatic-use.md) for the independent script interface and its limitations.
+
+Feishu intake/delivery and OpenClaw synchronization apply only when that integration is selected and configured. Read [references/feishu-integration.md](references/feishu-integration.md) only for that mode. Never require a bot or request bot credentials for local/API use.
 
 ## Operating boundary
 
@@ -38,8 +38,9 @@ Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against
    ```
 
    If cells are blank but the header defines rates, the converter derives amounts from the comment type. Supply `--amount-rules text=1.5,text+image=2,image=1.5` only when the workbook does not carry usable rules.
-   For Feishu intake, image-heavy workbooks can exceed OpenClaw's default 30 MB inbound-media limit. Keep `channels.feishu.mediaMaxMb` at 100 MB or higher and restart the gateway after changing it. When an inbound event contains `[feishu attachment unavailable]`, do not claim that the sender failed to upload and do not repeatedly ask for identical re-uploads. First check the configured limit and the event's `message_id`; distinguish an oversize/download-permission failure from an absent attachment. After correcting the limit, request one fresh upload because a previously rejected binary is not recoverable from the local staging directory.
 3. Establish the persistent desktop environment before opening batch targets:
+   - Only for live capture. Offline comparison of supplied evidence does not require a browser/account.
+   - Find ordinary Chrome automatically or set `COMMENT_AUDIT_CHROME`; do not assume a workstation-specific path exists.
    - Xiaohongshu profile: `~/.comment-review-audit/xhs-profile`
    - Douyin profile: `~/.comment-review-audit/douyin-profile`
    - Keep the profile directory mode at `0700`; the included profile lock prevents two processes from corrupting one session.
@@ -49,7 +50,7 @@ Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against
    - Xiaohongshu: `xhs_batch_capture.py --headed --expand-dom --only-note-id ...`
    - Douyin: `douyin_batch_capture.py --only-target-key ...`
 5. Capture the remaining unique targets serially. The standard runner uses its low-risk profile by default: a quiet session-settle wait, three slow warm-up targets, 12–18 second target intervals, at least 4 seconds of rest, 60–90 second breaks every eight targets, and one extra same-page DOM expansion for an incomplete first pass. It is designed to reduce risk controls and incomplete captures without changing accounts, networks, or login state. `--normal-pace` is an explicit legacy opt-out only when the owner approves the trade-off.
-- Xiaohongshu legacy target interval: 6–10 seconds; 25–45 second break every 12 processed targets. Use `--risk-averse` for the default low-risk profile described above.
+   - Xiaohongshu legacy target interval: 6–10 seconds; 25–45 second break every 12 processed targets. Use `--risk-averse` for the default low-risk profile described above.
    - Douyin target interval: 5–8 seconds; 20–35 second break every 10 processed targets.
    - A scheduled long break replaces the ordinary target pause, and the final target never sleeps after checkpointing. Use `--pace-mode fixed` only when slower legacy pacing is required.
    - Both adapters checkpoint after every target and automatically resume only complete, healthy evidence from the same parser revision captured within 24 hours. Incomplete captures and unknown image states are never skipped by `--skip-existing-ok` (now a compatibility flag). Use a separate work directory for a new audit, or `--refresh` for an explicit fresh recheck. If every selected target is reusable, return without opening Chrome; filtering completed targets before pacing also avoids idle waits at the tail.
@@ -67,7 +68,11 @@ Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against
    - General triage: `成功`, `失败`, `待人审`.
    - Text+image detail: `图字成功`, `文字成功`, `图片成功`, `失败`, `待人审`.
    - `文字成功` and `图片成功` use the source table's explicit text/image component rate and count in general triage `成功`. If the table does not define a component rate, they remain `待人审` with a blank amount. Full success receives the combined table amount, confirmed failure receives `0.00`, and unresolved `待人审` remains blank.
-8. Build the audited workbook with the spreadsheet runtime supplied by the host. Preserve the original sheets and embedded images, write the row category to column G and the approved amount to column H, and add/refresh `审核汇总` in the required settlement template: `团长 / 产品名 / 涉及工作表数 / 总条数 / 成功数 / 失败数 / 需人审数 / 成功率 / 报销金额 / 涉及工作表 / 团长联系方式 / 跟团长结算时间 / 结算凭证 / 二维码`. The summary `团长` must directly use the complete value from the product sheet's `团长` field (legacy `团` is accepted); never substitute the `负责人` abbreviation. Group rows by source `团长` + `产品`; preserve previously entered values in the last four manual columns when rebuilding.
+8. Build the audited workbook. Preserve the original sheets and embedded images, write the row category to column G and the approved amount to column H, and add/refresh `审核汇总` in the required settlement template: `团长 / 产品名 / 涉及工作表数 / 总条数 / 成功数 / 失败数 / 需人审数 / 成功率 / 报销金额 / 涉及工作表 / 团长联系方式 / 跟团长结算时间 / 结算凭证 / 二维码`. The summary `团长` must directly use the complete value from the product sheet's `团长` field (legacy `团` is accepted); never substitute the `负责人` abbreviation. Group rows by source `团长` + `产品`; preserve previously entered values in the last four manual columns when rebuilding.
+
+   Standalone hosts use `python3 scripts/build_audited_workbook.py --source ... --expected ... --report ... --output ...`. It checks row backfill, Decimal totals, formula caches, source-media preservation and ZIP integrity. It does not render previews or recalculate arbitrary Excel formulas. Unsupported protected/merged/drawing layouts produce an error rather than silently deleting data.
+
+   When the host supplies the spreadsheet runtime and visual verification is needed, use the optional artifact engine:
 
    ```bash
    node scripts/build_audited_workbook.mjs \
@@ -76,9 +81,9 @@ Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against
      --preview-dir /path/evidence/previews
    ```
 
-   Follow the spreadsheet skill: inspect/render the source before editing, render every output sheet, scan formula errors, and reconcile summary totals with the JSON report. The summary formulas must remain traceable to per-row results.
+   For the artifact engine, follow the available spreadsheet skill: inspect/render the source before editing, render every output sheet, scan formula errors, and reconcile summary totals with the JSON report. The summary formulas in either engine remain traceable to per-row results; do not claim portable cached-value checks are full visual/formula verification.
    If a cropped preview appears blank, compare the exported cell values, styles and actual merge ranges, then render a view beginning at column A before diagnosing missing data or changing layout. A preview alone does not prove merged cells or failed writes.
-   For standard Xiaohongshu XLSX jobs, prefer the one-command resumable runner below. It converts the workbook, reuses a prior healthy canary, captures each unique note once, checkpoints every target, compares rows, builds previews/workbook, and writes `job-result.json`. Re-running the same command resumes healthy completed targets instead of opening them again.
+   For standard Xiaohongshu XLSX jobs, prefer the one-command resumable runner below. It converts the workbook, reuses a prior healthy canary, captures each unique note once, checkpoints every target, compares rows, builds the workbook, and writes `job-result.json`. The default engine is portable; add `--workbook-engine artifact` only when the host runtime/preview capability is available. Re-running the same command resumes healthy completed targets instead of opening them again.
 
    ```bash
    python3 scripts/run_comment_review_job.py \
@@ -91,8 +96,7 @@ Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against
    A post-stop canary must be freshly captured. An incomplete canary blocks the batch. Reusing a complete canary is only permitted for a healthy uninterrupted same-job resume.
    `job-result.json` is rewritten to `in_progress` at run start, then `blocked`/`error` on interruption. `complete` requires exact row identities, valid categories, monetary invariants, a nonempty workbook and reconciled summary. It contains source/output SHA-256 fingerprints; a changed source requires a new job directory. These checks protect against accidental delivery of a previous run's result.
 
-   A nonzero capture exit means the platform requested a stop (login, CAPTCHA, risk control, network change, or repeated navigation failure). Keep the checkpoint, notify the owner, and rerun the same command only after the normal authorized session is restored. Do not send the output unless `job-result.json` has `status: complete` and final workbook visual verification passes.
-   Deliver each workbook separately to its verified original sender through the configured audit bot. Check file size and bot app ID before upload, not after a failed send. A larger inbound-media limit does not raise Feishu IM's outbound upload limit. For an oversized final workbook, preserve its original images; use supported Drive multipart upload and private access for that sender if available, then verify the uploaded file and recipient permission before sending its link. Do not broaden public access, silently strip images, use another app identity, or call a text-only fallback a successful attachment delivery. Save the actual message receipt or explicit delivery blocker. Read back the receipt's message ID: confirm file name for attachments, or the verified private URL for text/rich-post link delivery. On an uncertain send outcome, check that receipt before retrying to avoid duplicate deliveries.
+   A nonzero capture exit means an unresolved stop or execution error, not a completed audit. Keep the checkpoint, notify the owner, and rerun only after the blocker is resolved. Do not deliver a prior result when the current manifest is not `complete`. Local/API jobs return their file paths and JSON directly; do not send external messages or require a configured bot. For explicitly authorized Feishu delivery, use its optional integration reference and verify the receipt.
 9. Keep final `.xlsx` files. Maintain intermediate JSON/screenshots/previews with `maintain_audit_storage.py`; run dry-run first, then `--apply` only on the managed audit output root. The default policy compresses raw evidence older than 14 days, prunes compressed evidence archives after another 14 days, and never touches final workbooks.
 
 ## Accuracy rules
@@ -112,11 +116,11 @@ For every real false positive, false negative, or excess manual-review case:
 1. Save a minimal redacted fixture that reproduces the exact signal.
 2. Add a failing offline regression test before changing the rule.
 3. Change only the comparator or platform adapter responsible for the error.
-4. Run all offline tests, syntax compilation, workbook formula scan, and visual verification.
+4. Run all offline tests and syntax compilation. Verify portable workbook row/summary/media invariants; when using the artifact engine, also run its formula scan and visual verification.
 5. Update the data contract when a status or reason code changes.
-6. Treat deployment as part of the iteration: after validation, rebuild the distributable ZIP and run `scripts/sync_openclaw_skill.sh`. An iteration is not complete until the script confirms that `comment-review-audit` is Ready, visible to OpenClaw agent `main`, has no missing requirements, the Feishu inbound attachment limit is at least 100 MB, and the Feishu channel is connected and working.
+6. Publish the validated SDK/CLI/skill source together and test installation outside the checkout. Rebuild the selected distributable. OpenClaw synchronization is optional: run `scripts/sync_openclaw_skill.sh` only for a configured deployment that the user wants updated; its health checks are not a prerequisite for independent use.
 
-If synchronization fails, keep the validated source as the canonical version, report that the Feishu bot is still on the prior version, and retry only after the local OpenClaw gateway or channel is healthy. Never modify or print the Feishu App Secret during synchronization.
+If a selected integration's synchronization fails, keep the validated source as canonical and report that deployment separately. Never modify or print the Feishu App Secret during synchronization.
 
 Never “improve” success rate by weakening completeness, image, duplicate, or risk-control safeguards.
 
@@ -131,6 +135,7 @@ Never “improve” success rate by weakening completeness, image, duplicate, or
 - `scripts/merge_observations.py`: combines observations, with later captures replacing the same platform/target.
 - `scripts/run_comment_review_job.py`: one-command, resumable Xiaohongshu XLSX audit orchestration with canary reuse and a machine-readable completion manifest.
 - `scripts/review_comments.py`: deterministic comparison and result classification.
+- `scripts/audit_validation.py`, `scripts/build_audited_workbook.py`: host-independent monetary invariants and loss-conscious OOXML export.
 - `scripts/build_audited_workbook.mjs`: preserves source workbooks, backfills G/H, and creates formula-driven `审核汇总` plus audit detail.
 - `scripts/maintain_audit_storage.py`: dry-run-first 14-day intermediate evidence maintenance; preserves final spreadsheets.
 - `scripts/sync_openclaw_skill.sh`: force-syncs the validated source into OpenClaw agent `main` and verifies Skill readiness plus Feishu channel health without sending a message.

@@ -208,6 +208,9 @@ def compare(
     allow_duplicates: bool = False,
 ) -> Dict[str, Any]:
     expected_rows = list(expected_rows)
+    expected_by_case = {}
+    for row in expected_rows:
+        expected_by_case.setdefault(row.get("case_id"), row)
     prepared_observations = [prepare_observation(item) for item in observations]
     by_target: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for item in prepared_observations:
@@ -408,7 +411,7 @@ def compare(
             result["result_category"] = "图字成功"
         else:
             result["result_category"] = category_map[result["status"]]
-        expected_row = next((row for row in expected_rows if row.get("case_id") == result.get("case_id")), {})
+        expected_row = expected_by_case.get(result.get("case_id"), {})
         component_amount = None
         if result["status"] == "partial_text":
             component_amount = parse_amount(expected_row.get("partial_text_amount"))

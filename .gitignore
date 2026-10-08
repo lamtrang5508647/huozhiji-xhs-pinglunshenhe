@@ -16,6 +16,9 @@ media/
 *.xlsx
 *.xls
 *.zip
+build/
+dist/
+*.egg-info/
 *cookies*.json
 *session*.json
 *credentials*.json

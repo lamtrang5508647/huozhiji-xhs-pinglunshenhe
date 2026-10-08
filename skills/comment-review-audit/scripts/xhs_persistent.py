@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Type
 
 from profile_lock import ProfileLock
+from browser_environment import find_chrome
 
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -28,15 +29,14 @@ def persistent_client(
         def start(self) -> None:
             from playwright.sync_api import sync_playwright
 
-            if not Path(CHROME).exists():
-                raise FileNotFoundError("Google Chrome was not found")
+            chrome = find_chrome(CHROME)
             self._audit_profile_lock = ProfileLock(profile_path)
             self._audit_profile_lock.__enter__()
             try:
                 self._playwright_ctx = sync_playwright().start()
                 self._browser = self._playwright_ctx.chromium.launch_persistent_context(
                     user_data_dir=str(profile_path),
-                    executable_path=CHROME,
+                    executable_path=chrome,
                     headless=not headed,
                     viewport={"width": 1440, "height": 900},
                 )

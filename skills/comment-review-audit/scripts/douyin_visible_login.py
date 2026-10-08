@@ -8,9 +8,9 @@ import os
 import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
 from profile_lock import ProfileLock
-from douyin_batch_capture import security_status
+from douyin_batch_capture import security_status, sync_playwright
+from browser_environment import find_chrome
 
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -54,7 +54,7 @@ def main() -> int:
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(profile),
-                executable_path=CHROME,
+                executable_path=find_chrome(CHROME),
                 headless=False,
                 viewport={"width": 1440, "height": 900},
             )

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from capture_resume import reusable_capture
+from audit_validation import validate_results
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -87,30 +88,6 @@ def discover_node_modules(explicit: str | None) -> str:
     raise RuntimeError("spreadsheet_runtime_not_found: pass --node-modules")
 
 
-def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) -> Decimal:
-    expected_ids = [row["case_id"] for row in rows]
-    actual_ids = [item.get("case_id") for item in results]
-    if len(set(expected_ids)) != len(expected_ids) or len(set(actual_ids)) != len(actual_ids) or set(expected_ids) != set(actual_ids):
-        raise RuntimeError("report_row_identity_mismatch")
-    payout = Decimal("0")
-    for item in results:
-        triage = item.get("triage")
-        if triage not in ("成功", "失败", "待人审") or item.get("result_category") not in ("成功", "失败", "待人审", "图字成功", "文字成功", "图片成功"):
-            raise RuntimeError("report_category_missing_or_invalid")
-        value = item.get("approved_amount")
-        if triage == "待人审":
-            if value not in (None, ""):
-                raise RuntimeError("manual_review_amount_must_be_blank")
-            continue
-        if value in (None, ""):
-            raise RuntimeError("settled_amount_missing")
-        amount = Decimal(str(value))
-        if not amount.is_finite() or amount < 0 or (triage == "失败" and amount != 0):
-            raise RuntimeError("settled_amount_invalid")
-        payout += amount
-    return payout
-
-
 def write_manifest(path: Path, source: Path, output: Path, report: Path, expected: Path) -> None:
     payload = json.loads(report.read_text(encoding="utf-8"))
     results = payload.get("results", [])
@@ -145,6 +122,8 @@ def main() -> int:
     parser.add_argument("--amount-rules")
     parser.add_argument("--profile", default=str(Path.home() / ".comment-review-audit/xhs-profile"))
     parser.add_argument("--node-modules")
+    parser.add_argument("--workbook-engine", choices=("portable", "artifact"), default="portable",
+                        help="Portable stdlib OOXML export (default); artifact enables host rendering")
     parser.add_argument("--headed", action="store_true", default=True)
     parser.add_argument("--normal-pace", action="store_true",
                         help="Opt out of the default low-risk capture profile for an explicitly approved legacy run")
@@ -174,7 +153,7 @@ def main() -> int:
 
     try:
         return execute_job(args, source, expected, observations, report, output, previews, manifest)
-    except (subprocess.CalledProcessError, RuntimeError) as exc:
+    except (subprocess.CalledProcessError, RuntimeError, OSError, ValueError) as exc:
         phase = "blocked" if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (2, 3) else "error"
         checkpoint = json.loads(observations.read_text(encoding="utf-8")) if observations.exists() else {}
         reason = checkpoint.get("stop_reason") or ("subprocess_failed" if isinstance(exc, subprocess.CalledProcessError) else str(exc))
@@ -240,15 +219,20 @@ def execute_job(args, source, expected, observations, report, output, previews, 
         "--expected", str(expected), "--observations", str(observations),
         "--amount-mode", "expected-only", "--output", str(report),
     ])
-    node_modules = discover_node_modules(args.node_modules)
-    env = os.environ.copy()
-    env["CODEX_NODE_MODULES"] = node_modules
-    run([
-        "node", str(SCRIPT_DIR / "build_audited_workbook.mjs"),
-        "--source", str(source), "--expected", str(expected),
-        "--report", str(report), "--output", str(output),
-        "--preview-dir", str(previews),
-    ], env=env)
+    if args.workbook_engine == "portable":
+        run([sys.executable, str(SCRIPT_DIR / "build_audited_workbook.py"),
+             "--source", str(source), "--expected", str(expected),
+             "--report", str(report), "--output", str(output)])
+    else:
+        node_modules = discover_node_modules(args.node_modules)
+        env = os.environ.copy()
+        env["CODEX_NODE_MODULES"] = node_modules
+        run([
+            "node", str(SCRIPT_DIR / "build_audited_workbook.mjs"),
+            "--source", str(source), "--expected", str(expected),
+            "--report", str(report), "--output", str(output),
+            "--preview-dir", str(previews),
+        ], env=env)
     write_manifest(manifest, source, output, report, expected)
     print(manifest.read_text(encoding="utf-8"), end="")
     return 0

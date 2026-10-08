@@ -13,16 +13,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+except ImportError:
+    PlaywrightTimeoutError = TimeoutError  # parser-only hosts never call a live browser
 from capture_pacing import has_remaining_target, pause_seconds
 from capture_resume import pending_targets, PARSER_REVISIONS
 from profile_lock import ProfileLock
 from session_environment import network_fingerprint
+from browser_environment import find_chrome
 
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 TIME_LINE = re.compile(r"^(?:刚刚|\d+\s*(?:秒钟|分钟|小时|天|周|月|年)前|\d{1,2}[-/.]\d{1,2})(?:·.*)?$")
+
+
+def sync_playwright():
+    from playwright.sync_api import sync_playwright as start
+    return start()
 
 
 def atomic_write(path: Path, payload: Dict[str, Any]) -> None:
@@ -301,7 +309,7 @@ def main() -> int:
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=args.profile,
-                executable_path=CHROME,
+                executable_path=find_chrome(CHROME),
                 headless=False,
                 viewport={"width": 1440, "height": 900},
             )

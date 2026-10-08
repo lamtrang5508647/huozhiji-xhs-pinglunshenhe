@@ -1,0 +1,4 @@
+{"observations":[
+  {"platform":"xiaohongshu","target_key":"synthetic-note","capture_status":"ok","capture_complete":true,"image_detection_complete":true,"comments":[{"text":"已收到，感谢","has_image":false}]},
+  {"platform":"douyin","target_key":"synthetic-video","capture_status":"captcha","capture_complete":false,"image_detection_complete":false,"comments":[]}
+]}

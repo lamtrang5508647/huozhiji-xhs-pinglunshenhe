@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
 
 
 def _command_output(argv: list[str]) -> str:
@@ -17,6 +18,9 @@ def _command_output(argv: list[str]) -> str:
 
 def network_fingerprint() -> str:
     """Hash route/proxy state without storing addresses or credentials."""
+    if sys.platform.startswith("linux"):
+        payload = _command_output(["ip", "route", "show", "default"])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest() if payload else "unavailable"
     route = _command_output(["route", "-n", "get", "default"])
     route_lines = [
         line.strip() for line in route.splitlines()

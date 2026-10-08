@@ -1,0 +1,4 @@
+{"rows":[
+  {"case_id":"demo-1","platform":"xiaohongshu","target_key":"synthetic-note","comment_text":"已收到，感谢","comment_type":"text","expected_amount":"1.50"},
+  {"case_id":"demo-2","platform":"douyin","target_key":"synthetic-video","comment_text":"文字和图片","comment_type":"text+image","expected_amount":"2.00"}
+]}

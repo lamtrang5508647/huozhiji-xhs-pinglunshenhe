@@ -17,6 +17,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run offline regressions
         run: |
+          python -m unittest discover -s tests -v
           for audit_test in skills/comment-review-audit/scripts/test_*.py; do
             python "$audit_test" || exit 1
           done
@@ -25,3 +26,11 @@ jobs:
           python -m compileall -q skills/comment-review-audit/scripts
           node --check skills/comment-review-audit/scripts/build_audited_workbook.mjs
           bash -n skills/comment-review-audit/scripts/sync_openclaw_skill.sh
+      - name: Test installed wheel outside checkout
+        run: |
+          python -m pip wheel . --no-deps -w dist
+          python -m venv /tmp/audit-smoke
+          /tmp/audit-smoke/bin/python -m pip install --no-deps dist/*.whl
+          cd /tmp
+          /tmp/audit-smoke/bin/huozhiji-audit doctor
+          /tmp/audit-smoke/bin/huozhiji-audit run --help
