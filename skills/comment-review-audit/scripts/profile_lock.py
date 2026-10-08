@@ -38,8 +38,7 @@ def prepare_profile(profile: Path) -> None:
     # directory's DACL; never change a parent directory or delete Chrome locks.
     script = """
 try {
-# Keep a valid owner/group descriptor; an empty DirectorySecurity object is
-# not a complete descriptor for Windows PowerShell's Set-Acl provider.
+# Preserve the directory's existing owner/group while replacing its access rules.
 $acl = Get-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY
 $acl.SetAccessRuleProtection($true, $false)
 foreach ($existing in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($existing) }

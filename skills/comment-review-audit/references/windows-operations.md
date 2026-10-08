@@ -8,6 +8,8 @@ Default profiles are `%LOCALAPPDATA%\HuozhijiAudit\xhs-profile` and `douyin-prof
 
 Windows uses `msvcrt` byte locks and a protected directory ACL for the current user, SYSTEM and Administrators. POSIX uses `fcntl` and mode `0700`. Fail closed if permissions cannot be established; Windows `chmod(0700)` is not a privacy guarantee. Never point `--profile` to a general-purpose/shared directory or change permissions outside the dedicated profile. Existing custom profile children with independent ACLs need an administrator check.
 
+Preserve owner/group when updating a profile's ACL. Windows PowerShell helpers isolate their own module lookup to inbox modules: a PowerShell 7 parent can otherwise pass incompatible module paths to a 5.1 child. Do not change the owner's global `PSModulePath` or silently disable permission/network checks to hide a module-loading failure.
+
 Windows route/proxy checks use read-only PowerShell and save only a hash. An unavailable monitor is not proof of stable networking. Stop and checkpoint on a detected change; do not rotate accounts, browsers or networks to clear warnings.
 
 Keep owner-assisted verification in an interactive terminal. Preserve the existing page until explicit owner confirmation and a healthy-page check. Do not infer login from a dependency check, saved cookie or hidden window. After restoration, verify one fresh target before batching.

@@ -41,6 +41,17 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(process_group_options(), {"creationflags": 512})
 
     @unittest.skipUnless(sys.platform == "win32", "real Windows DACL check")
+    def test_windows_powershell_uses_inbox_modules_without_changing_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = child_environment({"HUOZHIJI_PROFILE_DIRECTORY": directory})
+            inherited = os.environ.get("PSModulePath")
+            script = "(Get-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY).GetType().Name"
+            proc = subprocess.run(powershell_command(script), env=env, capture_output=True,
+                                  encoding="utf-8", check=True, timeout=15)
+            self.assertEqual(proc.stdout.strip(), "DirectorySecurity")
+            self.assertEqual(os.environ.get("PSModulePath"), inherited)
+
+    @unittest.skipUnless(sys.platform == "win32", "real Windows DACL check")
     def test_windows_profile_permissions_are_private(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / "私有 会话"

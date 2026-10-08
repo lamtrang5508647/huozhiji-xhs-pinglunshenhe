@@ -24,7 +24,10 @@ def configure_stdio():
 
 
 def powershell_command(script):
-    prelude = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+    # A Windows PowerShell 5.1 child of pwsh can inherit incompatible PS7
+    # modules. Use only inbox modules without changing the owner's shell.
+    # Set the path before any cmdlet executes.
+    prelude = "$env:PSModulePath=$PSHOME + '\\Modules'; $ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
     encoded = base64.b64encode((prelude + script).encode("utf-16-le")).decode("ascii")
     return ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
 
