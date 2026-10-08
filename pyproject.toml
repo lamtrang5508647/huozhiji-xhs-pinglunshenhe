@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "huozhiji-xhs-pinglunshenhe"
-version = "0.2.0"
+version = "0.3.0"
 description = "Portable, evidence-based Xiaohongshu and Douyin comment audit toolkit"
 readme = "README.md"
 requires-python = ">=3.11"

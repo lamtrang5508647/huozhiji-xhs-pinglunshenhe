@@ -53,8 +53,9 @@ def fixture(path):
 class PortableAuditTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
-        self.root = Path(self.folder.name)
-        self.source = self.root / "synthetic.xlsx"
+        self.root = Path(self.folder.name) / "中文 空格😀"
+        self.root.mkdir()
+        self.source = self.root / "评论 源表.xlsx"
         self.evidence = fixture(self.source)
 
     def tearDown(self):
@@ -127,11 +128,11 @@ class PortableAuditTests(unittest.TestCase):
         evidence = self.root / "observations.json"
         evidence.write_text(json.dumps(self.evidence), encoding="utf-8")
         output = self.root / "cli.xlsx"
-        result = subprocess.run([sys.executable, "-m", "huozhiji_audit", "audit", "--source", str(self.source), "--observations", str(evidence), "--output", str(output), "--strict"], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-m", "huozhiji_audit", "audit", "--source", str(self.source), "--observations", str(evidence), "--output", str(output), "--strict"], capture_output=True, encoding="utf-8")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(json.loads(result.stdout)["summary"]["approved_amount"], "6.50")
         self.assertTrue(output.is_file())
-        result = subprocess.run([sys.executable, "-m", "huozhiji_audit", "doctor"], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-m", "huozhiji_audit", "doctor"], capture_output=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         status = json.loads(result.stdout)
         self.assertFalse(status["feishu_required"])
@@ -142,7 +143,7 @@ class PortableAuditTests(unittest.TestCase):
         job = self.root / "job"
         job.mkdir()
         (job / "job-result.json").write_text('{"status":"complete","output":"old.xlsx"}')
-        proc = subprocess.run([sys.executable, "-m", "huozhiji_audit", "run", "--source", str(self.root / "missing.xlsx"), f"--work-dir={job}"], capture_output=True, text=True)
+        proc = subprocess.run([sys.executable, "-m", "huozhiji_audit", "run", "--source", str(self.root / "missing.xlsx"), f"--work-dir={job}"], capture_output=True, encoding="utf-8")
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(json.loads(proc.stdout)["status"], "error")
 

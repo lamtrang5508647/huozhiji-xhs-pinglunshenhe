@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from runtime_environment import child_environment, configure_stdio, process_group_options, terminate_process_tree
 
 
 def first_value(item: Dict[str, Any], keys: Iterable[str]) -> Any:
@@ -150,18 +149,14 @@ def capture(note_id: str, timeout: float, evidence_path: Optional[str] = None) -
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
+        encoding="utf-8",
+        env=child_environment(),
+        **process_group_options(),
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+        terminate_process_tree(process)
         result = blocked_observation(note_id, "error", "adapter_timeout")
         if evidence_path:
             result["evidence_path"] = evidence_path
@@ -200,6 +195,7 @@ def capture(note_id: str, timeout: float, evidence_path: Optional[str] = None) -
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--note-id", required=True)
     parser.add_argument("--output", required=True)
@@ -215,7 +211,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         output.write_text(json.dumps({"observations": [result]}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"capture_status={result['capture_status']} target={args.note_id}")
         return 0
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         print(f"adapter_error: {type(exc).__name__}", file=sys.stderr)
         return 1
 

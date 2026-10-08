@@ -28,7 +28,7 @@ proc = subprocess.run([
     "huozhiji-audit", "audit", "--source", "评论.xlsx",
     "--observations", "observations.json", "--output", "审核版.xlsx",
     "--strict",
-], capture_output=True, text=True, check=False)
+], capture_output=True, encoding="utf-8", check=False)
 payload = json.loads(proc.stdout)
 if proc.returncode not in (0, 2):
     raise RuntimeError(payload)

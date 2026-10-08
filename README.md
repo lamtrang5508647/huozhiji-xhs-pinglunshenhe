@@ -4,6 +4,8 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
+0.3.0 支持 Windows、macOS、Linux 共用一套 SDK/CLI。Windows 提供 PowerShell 安装/启动入口，详见 [Windows 使用说明](docs/windows.md)。
+
 ## 安装与快速测试
 
 ```bash
@@ -47,7 +49,7 @@ huozhiji-audit audit --source 评论.xlsx --observations observations.json \
 
 ## 在线采集，可选
 
-在线模式额外需要普通 Chrome 和浏览器依赖；持久 profile 锁目前面向 macOS/Linux。离线接口不受此限制。
+在线模式额外需要普通 Chrome 和浏览器依赖；持久 profile 锁支持 Windows/macOS/Linux。Windows 使用原生文件锁和目录 ACL，默认会话存放在 Local AppData。
 
 ```bash
 python3 -m pip install '.[xhs]'
@@ -77,15 +79,11 @@ huozhiji-audit run --source 评论.xlsx --work-dir /path/outputs/job-id \
 以下检查只使用离线模拟数据，不访问平台：
 
 ```bash
-python3 -m unittest discover -s tests -v
-for audit_test in skills/comment-review-audit/scripts/test_*.py; do
-  python3 "$audit_test" || exit 1
-done
-python3 -m compileall -q skills/comment-review-audit/scripts
+python3 tests/run_regressions.py
 node --check skills/comment-review-audit/scripts/build_audited_workbook.mjs
 ```
 
-CI同时测试纯 Python 接口、旧适配器和 wheel 安装后的入口。将 `skills/comment-review-audit/` 安装到支持 skill 的程序即可使用。只有使用已有 OpenClaw/飞书集成时才执行 `scripts/sync_openclaw_skill.sh`；不需要它的使用者不用配置机器人密钥。
+CI在 Windows、macOS、Linux 的 Python 3.11/3.14 上测试纯 Python 接口、旧适配器、wheel 安装后的入口和真实 Chrome 空白页。不会测试真实账号登录或抓取真实评论。将 `skills/comment-review-audit/` 安装到支持 skill 的程序即可使用。只有使用已有 OpenClaw/飞书集成时才执行 `scripts/sync_openclaw_skill.sh`；不需要它的使用者不用配置机器人密钥。
 
 ## 存储与访问
 

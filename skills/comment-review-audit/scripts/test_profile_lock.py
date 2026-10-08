@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import tempfile
+import sys
 from pathlib import Path
 
 from profile_lock import ProfileLock
@@ -19,7 +20,8 @@ def main() -> None:
             except RuntimeError as exc:
                 assert str(exc).startswith("browser_profile_in_use:")
         with ProfileLock(profile):
-            assert profile.stat().st_mode & 0o777 == 0o700
+            if sys.platform != "win32":
+                assert profile.stat().st_mode & 0o777 == 0o700
     print("profile lock tests passed")
 
 

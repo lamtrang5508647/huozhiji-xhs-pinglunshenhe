@@ -10,6 +10,8 @@ This procedure improves stability without evading platform controls.
 4. Start and finish a batch on the same normal network route and proxy state. The adapters store only a hash of route/proxy state. If it changes, they checkpoint and stop with `network_changed`.
 5. Close competing automation for the same platform/account. Keep the computer awake and avoid changing VPN/hotspot during capture.
 
+On Windows, read `windows-operations.md`: native `msvcrt` locks, protected directory ACLs and Local AppData profiles replace Unix-only locks and permission modes. Use one interpreter/environment for Playwright and xhs-cli. An unavailable network monitor is not a healthy-session verdict.
+
 ## Login and canary
 
 - Navigate with the original source link, including its access query parameters. `expected.json.target_url` is a redacted identity, not a navigation URL. An error obtained from that redacted link does not prove platform risk control or target unavailability. Recheck the original source link before classification; never print its token.

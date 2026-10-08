@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Dict, Type
 
@@ -22,8 +21,6 @@ def persistent_client(
     initial_url: str = "https://www.xiaohongshu.com",
 ) -> Any:
     profile_path = Path(profile).expanduser().resolve()
-    profile_path.mkdir(parents=True, exist_ok=True)
-    os.chmod(profile_path, 0o700)
 
     class PersistentClient(base_class):
         def start(self) -> None:

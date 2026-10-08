@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -15,6 +14,8 @@ from pathlib import Path
 from . import _engine
 from .api import audit_workbook, convert_table, review
 from ._engine import table_to_expected
+from ._engine.runtime_environment import child_environment, configure_stdio
+from . import __version__
 
 
 def script_path(name):
@@ -41,13 +42,18 @@ def emit(value, output=None):
 
 def doctor():
     from ._engine.browser_environment import find_chrome
+    # Standalone adapter modules intentionally use sibling imports. Avoid importing
+    # profile_lock here, where the installed package has a different module path.
     try:
         chrome = find_chrome()
     except FileNotFoundError:
         chrome = None
     playwright = importlib.util.find_spec("playwright") is not None
     xhs = importlib.util.find_spec("xhs_cli") is not None
-    return {"schema_version": "1.0", "python": platform.python_version(), "offline_ready": True,
+    return {"schema_version": "1.0", "version": __version__, "os": platform.system(),
+            "python": platform.python_version(), "offline_ready": True,
+            "profile_lock_backend": "msvcrt" if sys.platform == "win32" else "fcntl",
+            "network_backend": "powershell" if sys.platform == "win32" else "ip" if sys.platform.startswith("linux") else "scutil",
             "chrome": chrome, "playwright": playwright, "xhs_cli": xhs,
             "live_xhs_dependencies_ready": bool(chrome and playwright and xhs),
             "live_session_verified": False, "feishu_required": False, "codex_required": False,
@@ -55,8 +61,9 @@ def doctor():
 
 
 def main(argv=None):
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Independent comment audit CLI; stdout is JSON, diagnostics are stderr.")
-    parser.add_argument("--version", action="version", version="0.2.0")
+    parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Check local dependencies without opening a browser")
     convert = commands.add_parser("convert", help="Convert a source table to expected.json")
@@ -89,8 +96,7 @@ def main(argv=None):
                 "capture-douyin": "douyin_batch_capture", "maintain": "maintain_audit_storage"}
     if argv and argv[0] in adapters:
         script = script_path(adapters[argv[0]])
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+        env = child_environment()
         if any(argument in ("--help", "-h") for argument in argv[1:]):
             return subprocess.call([sys.executable, str(script), *argv[1:]], env=env)
         if argv[0] == "maintain":

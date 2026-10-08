@@ -11,6 +11,8 @@ Use this skill to reconcile comment requirements in CSV/XLSX/JSON tables against
 
 The audit engines run independently of Codex, OpenClaw and Feishu. The repository provides the Python SDK `huozhiji_audit` and `huozhiji-audit` CLI. Core conversion, comparison and portable XLSX export require only Python 3.11+. If only this skill directory is installed, run the scripts below directly.
 
+Windows, macOS and Linux share the same core. Before Windows deployment or live capture, read [references/windows-operations.md](references/windows-operations.md); use native Windows locking/ACLs, UTF-8 subprocesses and a dedicated Local AppData profile. Do not require WSL or a Mac host.
+
 For offline evidence-based review, convert the table, compare supplied observations, then export. This does not constitute live platform verification. Read [references/programmatic-use.md](references/programmatic-use.md) for the independent script interface and its limitations.
 
 Feishu intake/delivery and OpenClaw synchronization apply only when that integration is selected and configured. Read [references/feishu-integration.md](references/feishu-integration.md) only for that mode. Never require a bot or request bot credentials for local/API use.
@@ -41,9 +43,9 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
 3. Establish the persistent desktop environment before opening batch targets:
    - Only for live capture. Offline comparison of supplied evidence does not require a browser/account.
    - Find ordinary Chrome automatically or set `COMMENT_AUDIT_CHROME`; do not assume a workstation-specific path exists.
-   - Xiaohongshu profile: `~/.comment-review-audit/xhs-profile`
-   - Douyin profile: `~/.comment-review-audit/douyin-profile`
-   - Keep the profile directory mode at `0700`; the included profile lock prevents two processes from corrupting one session.
+   - Mac/Linux profiles: `~/.comment-review-audit/xhs-profile` and `douyin-profile`.
+   - Windows profiles: `%LOCALAPPDATA%\HuozhijiAudit\xhs-profile` and `douyin-profile`.
+   - The included profile lock prevents concurrent sessions: POSIX uses `fcntl`/`0700`, Windows uses `msvcrt`/protected directory ACLs. Stop if permissions or locking fail; never modify a general-purpose Chrome directory.
    - Use the visible login helpers and allow the user enough time to scan. Do not repeatedly open login windows.
    - Persisted Chrome cookies take precedence over older CLI cookie files. After owner verification, use the same profile; do not overwrite its refreshed session.
 4. Run exactly one canary target first. Continue only when it returns `capture_status: ok`, the target identity is correct, comments are visible, and the completeness/image signals are credible.
@@ -116,7 +118,7 @@ For every real false positive, false negative, or excess manual-review case:
 1. Save a minimal redacted fixture that reproduces the exact signal.
 2. Add a failing offline regression test before changing the rule.
 3. Change only the comparator or platform adapter responsible for the error.
-4. Run all offline tests and syntax compilation. Verify portable workbook row/summary/media invariants; when using the artifact engine, also run its formula scan and visual verification.
+4. Run all offline tests and syntax compilation. For environment changes, test Windows/macOS/Linux, clean wheel installation, Unicode paths, profile locks/permissions and ordinary Chrome startup. A blank-page smoke test is not real account/comment verification. Verify workbook row/summary/media invariants; when using the artifact engine, also run its formula scan and visual verification.
 5. Update the data contract when a status or reason code changes.
 6. Publish the validated SDK/CLI/skill source together and test installation outside the checkout. Rebuild the selected distributable. OpenClaw synchronization is optional: run `scripts/sync_openclaw_skill.sh` only for a configured deployment that the user wants updated; its health checks are not a prerequisite for independent use.
 
@@ -132,6 +134,7 @@ Never “improve” success rate by weakening completeness, image, duplicate, or
 - `scripts/capture_pacing.py`: shared adaptive target pacing that counts page work, retains a minimum rest, and avoids tail sleeps.
 - `scripts/capture_resume.py`: shared freshness, parser-revision and completeness checks; plans pending targets before opening a browser.
 - `scripts/profile_lock.py`, `scripts/session_environment.py`: single-session profile protection and non-secret network stability fingerprinting.
+- `scripts/runtime_environment.py`: UTF-8 child execution and bounded cleanup of only the adapter's own process tree.
 - `scripts/merge_observations.py`: combines observations, with later captures replacing the same platform/target.
 - `scripts/run_comment_review_job.py`: one-command, resumable Xiaohongshu XLSX audit orchestration with canary reuse and a machine-readable completion manifest.
 - `scripts/review_comments.py`: deterministic comparison and result classification.

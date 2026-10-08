@@ -21,6 +21,8 @@ from xhs_capture import flatten_comments, has_more, normalize_comment
 from capture_pacing import has_remaining_target, pause_seconds
 from capture_resume import pending_targets, PARSER_REVISIONS
 from xhs_persistent import persistent_client
+from profile_lock import default_profile
+from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
 from xhs_visible_login import verification_status, wait_for_owner_confirmation
 
@@ -345,7 +347,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Use a slower single-account profile with extra same-page loading safeguards")
     parser.add_argument(
         "--profile",
-        default=str(Path.home() / ".comment-review-audit/xhs-profile"),
+        default=str(default_profile("xhs")),
         help="Persistent ordinary-Chrome profile",
     )
     args = parser.parse_args(argv)
@@ -548,4 +550,5 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    configure_stdio()
     raise SystemExit(main())

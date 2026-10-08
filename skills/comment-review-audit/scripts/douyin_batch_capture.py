@@ -19,7 +19,8 @@ except ImportError:
     PlaywrightTimeoutError = TimeoutError  # parser-only hosts never call a live browser
 from capture_pacing import has_remaining_target, pause_seconds
 from capture_resume import pending_targets, PARSER_REVISIONS
-from profile_lock import ProfileLock
+from profile_lock import ProfileLock, default_profile
+from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
 from browser_environment import find_chrome
 
@@ -263,7 +264,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected", action="append", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--profile", default=str(Path.home() / ".comment-review-audit/douyin-profile"))
+    parser.add_argument("--profile", default=str(default_profile("douyin")))
     parser.add_argument("--delay-min", type=float, default=5.0)
     parser.add_argument("--delay-max", type=float, default=8.0)
     parser.add_argument("--pace-mode", choices=("adaptive", "fixed"), default="adaptive")
@@ -305,10 +306,10 @@ def main() -> int:
     stop_reason = ""
     processed_count = 0
     initial_network = network_fingerprint()
-    with ProfileLock(args.profile):
+    with ProfileLock(args.profile) as profile_lock:
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
-                user_data_dir=args.profile,
+                user_data_dir=str(profile_lock.profile),
                 executable_path=find_chrome(CHROME),
                 headless=False,
                 viewport={"width": 1440, "height": 900},
@@ -386,4 +387,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_stdio()
     raise SystemExit(main())

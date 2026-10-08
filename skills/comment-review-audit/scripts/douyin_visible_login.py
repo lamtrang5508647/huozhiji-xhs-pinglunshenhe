@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from pathlib import Path
 
-from profile_lock import ProfileLock
+from profile_lock import ProfileLock, default_profile
+from runtime_environment import configure_stdio
 from douyin_batch_capture import security_status, sync_playwright
 from browser_environment import find_chrome
 
@@ -43,13 +43,11 @@ def visible_login_gate(page) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
-    parser.add_argument("--profile", default=str(Path.home() / ".comment-review-audit/douyin-profile"))
+    parser.add_argument("--profile", default=str(default_profile("douyin")))
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--wait-for-confirmation", action="store_true")
     args = parser.parse_args()
-    profile = Path(args.profile)
-    profile.mkdir(parents=True, exist_ok=True)
-    os.chmod(profile, 0o700)
+    profile = Path(args.profile).expanduser().resolve()
     with ProfileLock(profile):
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
@@ -81,4 +79,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_stdio()
     raise SystemExit(main())

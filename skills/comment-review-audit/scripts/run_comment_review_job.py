@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from capture_resume import reusable_capture
 from audit_validation import validate_results
+from profile_lock import default_profile
+from runtime_environment import child_environment, configure_stdio
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -30,7 +32,7 @@ DEFAULT_MAPS = (
 
 def run(argv: list[str], env: dict[str, str] | None = None) -> None:
     print("+ " + " ".join(argv), flush=True)
-    subprocess.run(argv, check=True, env=env)
+    subprocess.run(argv, check=True, env=child_environment(env))
 
 
 def run_capture(argv: list[str]) -> None:
@@ -120,7 +122,7 @@ def main() -> int:
     parser.add_argument("--output-name", default="评论审核-最终版.xlsx")
     parser.add_argument("--map", action="append", dest="maps", help="Override/add destination=header mapping")
     parser.add_argument("--amount-rules")
-    parser.add_argument("--profile", default=str(Path.home() / ".comment-review-audit/xhs-profile"))
+    parser.add_argument("--profile", default=str(default_profile("xhs")))
     parser.add_argument("--node-modules")
     parser.add_argument("--workbook-engine", choices=("portable", "artifact"), default="portable",
                         help="Portable stdlib OOXML export (default); artifact enables host rendering")
@@ -239,4 +241,5 @@ def execute_job(args, source, expected, observations, report, output, previews, 
 
 
 if __name__ == "__main__":
+    configure_stdio()
     raise SystemExit(main())

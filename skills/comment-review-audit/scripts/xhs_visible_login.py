@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from xhs_persistent import persistent_client
+from profile_lock import default_profile
+from runtime_environment import configure_stdio
 
 
 def load_xhs_modules():
@@ -87,7 +88,7 @@ def wait_for_owner_confirmation(client, required_cookies, save_cookies, confirm=
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=float, default=300.0)
-    parser.add_argument("--profile", default=os.path.expanduser("~/.comment-review-audit/xhs-profile"))
+    parser.add_argument("--profile", default=str(default_profile("xhs")))
     parser.add_argument("--url", type=supported_url, default="https://www.xiaohongshu.com",
                         help="Open the original target or verification page in this same profile")
     parser.add_argument("--wait-for-confirmation", action="store_true",
@@ -135,4 +136,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_stdio()
     raise SystemExit(main())
