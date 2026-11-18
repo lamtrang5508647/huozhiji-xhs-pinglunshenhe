@@ -54,7 +54,7 @@ class WorkbookWriterTests(unittest.TestCase):
 
             def wrong_final_amount(archive, name, *args, **kwargs):
                 raw = original_read(archive, name, *args, **kwargs)
-                if name == "xl/worksheets/sheet1.xml" and Path(archive.filename) != source:
+                if name == "xl/worksheets/sheet1.xml" and not source.samefile(archive.filename):
                     root = ET.fromstring(raw)
                     root.find(f".//{tag('c')}[@r='H4']/{tag('v')}").text = "0.01"
                     return ET.tostring(root)
