@@ -8,7 +8,9 @@ import json
 import re
 import sys
 import unicodedata
+from collections import deque
 from decimal import Decimal, InvalidOperation
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -172,9 +174,13 @@ def platform_key(row: Dict[str, Any]) -> str:
     return canonical_platform(row.get("platform")) or str(row.get("platform", "")).strip().casefold()
 
 
+def _matching_text(comment: Dict[str, Any]) -> str:
+    return normalize_text(comment.get("text", comment.get("comment_text", "")))
+
+
 def text_matches(expected: Dict[str, Any], comment: Dict[str, Any]) -> bool:
     expected_text = normalize_text(expected.get("comment_text", ""))
-    actual_text = normalize_text(comment.get("text", comment.get("comment_text", "")))
+    actual_text = _matching_text(comment)
     match_mode = str(expected.get("text_match", "exact")).strip().casefold()
     if not expected_text:
         return True
@@ -200,6 +206,162 @@ def format_amount(value: Optional[Decimal]) -> Optional[str]:
     return None if value is None else format(value, ".2f")
 
 
+def _observed_type(comment: Dict[str, Any]) -> Optional[str]:
+    return infer_type({**comment, "comment_text": comment.get("text", "")})
+
+
+class _TargetEvidence:
+    """Ordered captures for one target, with indexes built only when needed."""
+
+    def __init__(self):
+        self.captures = []
+        self.row_count = 0
+        self.last_row_index = None
+
+    @cached_property
+    def usable(self):
+        return [c for c in self.captures if str(c.get("capture_status", "error")).casefold() == "ok"]
+
+    @cached_property
+    def complete(self):
+        return any(c.get("capture_complete") is True for c in self.usable)
+
+    @cached_property
+    def image_detection_incomplete(self):
+        return any(c.get("image_detection_complete") is False for c in self.usable)
+
+    @cached_property
+    def comments(self):
+        return [comment for c in self.usable for comment in c["comments"] if isinstance(comment, dict)]
+
+    @cached_property
+    def capture_by_record(self):
+        sources = {}
+        for capture in self.usable:
+            for comment in capture["comments"]:
+                if isinstance(comment, dict):
+                    sources.setdefault(id(comment), capture)
+        return sources
+
+    def source(self, comment):
+        if len(self.usable) == 1:
+            return self.usable[0]
+        return self.capture_by_record[id(comment)]
+
+    @cached_property
+    def normalized_texts(self):
+        return [_matching_text(comment) for comment in self.comments]
+
+    @cached_property
+    def by_text(self):
+        by_text = {}
+        for text, comment in zip(self.normalized_texts, self.comments):
+            by_text.setdefault(text, []).append(comment)
+        return by_text
+
+    @cached_property
+    def by_type(self):
+        by_type = {}
+        for comment in self.comments:
+            by_type.setdefault(_observed_type(comment), []).append(comment)
+        return by_type
+
+    @cached_property
+    def image_only(self):
+        return [comment for comment in self.comments
+                if image_signal(comment) is True and not has_text(comment.get("text", ""))]
+
+    def matching(self, text: str, mode: str):
+        if not text:
+            return self.comments
+        if self.row_count == 1:
+            # A one-off requirement never reuses a normalized-text index.
+            if mode == "contains":
+                return [c for c in self.comments if text in _matching_text(c)]
+            return [c for c in self.comments if text == _matching_text(c)]
+        if mode == "contains":
+            # The same normalized text can recur after other matching comments.
+            return [c for actual, c in zip(self.normalized_texts, self.comments) if text in actual]
+        return self.by_text.get(text, [])
+
+
+def _claim_key(result, comment):
+    # DOM positions and equal text cannot identify a comment across captures.
+    identifier = comment.get("comment_id")
+    if type(identifier) in (str, int) and str(identifier).strip():
+        return result["platform"], result["target_key"], "id", str(identifier).strip()
+    return result["platform"], result["target_key"], "record", id(comment)
+
+
+def _capture_details(comment, source):
+    return {"captured_at": source.get("captured_at"),
+            "evidence_path": comment.get("evidence_path") or source.get("evidence_path"),
+            "capture_complete": source.get("capture_complete") is True}
+
+
+def _assign_distinct_comment(row, choices, owners, assigned):
+    """Find an unused eligible comment, moving earlier flexible matches if needed."""
+    queue = deque([row])
+    previous = {row: None}
+    while queue:
+        current = queue.popleft()
+        for key in choices[current]:
+            owner = owners.get(key)
+            if owner is None:
+                while current is not None:
+                    old_key = assigned.get(current)
+                    owners[key] = current
+                    assigned[current] = key
+                    current, key = previous[current], old_key
+                return set()
+            if owner not in previous:
+                queue.append(owner)
+                previous[owner] = current
+    # All reachable evidence is spoken for; row order cannot settle ownership.
+    return set(previous)
+
+
+def _check_settlement_claims(results, claims, amount_mode, allow_duplicates):
+    owners, assigned, choices = {}, {}, {}
+    disputed = set()
+    for index, (comments, _) in claims.items():
+        result = results[index]
+        if result["triage"] != "成功":
+            continue
+        if not allow_duplicates:
+            for comment in comments:
+                owner = owners.setdefault(_claim_key(result, comment), index)
+                if owner != index:
+                    disputed.update((owner, index))
+            continue
+        eligible = {}
+        required_amount = (Decimal(result["expected_amount"])
+                           if amount_mode == "observed" and result["status"] == "verified" else None)
+        for position, comment in enumerate(comments):
+            if position and required_amount is not None:
+                amount, _ = observed_amount(comment)
+                if amount != required_amount:
+                    continue
+            eligible.setdefault(_claim_key(result, comment), comment)
+        choices[index] = eligible
+        disputed.update(_assign_distinct_comment(index, choices, owners, assigned))
+
+    for index, key in assigned.items():
+        comments, sources = claims[index]
+        chosen = choices[index][key]
+        if index not in disputed and chosen is not comments[0]:
+            result = results[index]
+            result["matched_comment"] = compact_comment(chosen)
+            result["capture"] = _capture_details(chosen, sources[id(chosen)])
+    for index in disputed:
+        result = results[index]
+        if "matched_comment" in result:
+            result["candidates"] = [compact_comment(c) for c in claims[index][0]]
+            del result["matched_comment"]
+        result.update(status="needs_review", reason_codes=["evidence_claimed_by_multiple_rows"],
+                      result_category="待人审", triage="待人审", approved_amount=None)
+
+
 def compare(
     expected_rows: Iterable[Dict[str, Any]],
     observations: Iterable[Dict[str, Any]],
@@ -211,30 +373,46 @@ def compare(
     expected_by_case = {}
     for row in expected_rows:
         expected_by_case.setdefault(row.get("case_id"), row)
-    prepared_observations = [prepare_observation(item) for item in observations]
-    by_target: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for item in prepared_observations:
-        by_target.setdefault((item["platform"], item["target_key"]), []).append(item)
+    by_target: Dict[Tuple[str, str], _TargetEvidence] = {}
+    for raw in observations:
+        item = prepare_observation(raw)
+        key = (item["platform"], item["target_key"])
+        if key not in by_target:
+            by_target[key] = _TargetEvidence()
+        by_target[key].captures.append(item)
 
     combo_rows_by_target: Dict[Tuple[str, str], int] = {}
-    for row in expected_rows:
+    for index, row in enumerate(expected_rows):
+        key = (platform_key(row), target_key(row))
+        evidence = by_target.get(key)
+        if evidence is not None:
+            evidence.row_count += 1
+            evidence.last_row_index = index
         if infer_type({**row, "comment_text": row.get("comment_text", "")}) == "text+image":
-            key = (platform_key(row), target_key(row))
             combo_rows_by_target[key] = combo_rows_by_target.get(key, 0) + 1
 
     results: List[Dict[str, Any]] = []
-    for expected in expected_rows:
+    settlement_claims = {}
+    for index, expected in enumerate(expected_rows):
+        key = (platform_key(expected), target_key(expected))
+        # Release large text indexes after the last row for their target.
+        evidence = by_target.get(key)
+        if evidence is not None and index == evidence.last_row_index:
+            del by_target[key]
         result: Dict[str, Any] = {
             "case_id": expected.get("case_id"),
-            "platform": platform_key(expected),
-            "target_key": target_key(expected),
+            "platform": key[0],
+            "target_key": key[1],
             "status": "needs_review",
             "reason_codes": [],
         }
         for provenance_key in ("source_file", "source_sheet", "source_row"):
             if provenance_key in expected:
                 result[provenance_key] = expected[provenance_key]
+        expected_text = normalize_text(expected.get("comment_text", ""))
         expected_type = infer_type({**expected, "comment_text": expected.get("comment_text", "")})
+        if expected_type == "text" and not expected_text:
+            expected_type = None
         result["expected_type"] = expected_type
         expected_amount = parse_amount(expected.get("expected_amount"))
         if not result["case_id"] or not result["platform"] or not result["target_key"]:
@@ -249,33 +427,29 @@ def compare(
             results.append(result)
             continue
 
-        captures = by_target.get((result["platform"], result["target_key"]), [])
-        if not captures:
+        if evidence is None:
             result["status"] = "blocked"
             result["reason_codes"].append("no_observation_for_target")
             results.append(result)
             continue
 
-        usable = [
-            item for item in captures
-            if str(item.get("capture_status", "error")).casefold() == "ok"
-        ]
-        complete = [item for item in usable if item.get("capture_complete") is True]
-        blockers = [item for item in captures if item not in usable]
+        usable = evidence.usable
         if not usable:
+            first = evidence.captures[0]
             result["status"] = "blocked"
-            result["reason_codes"].append(str(blockers[0].get("capture_status", "blocked")))
+            result["reason_codes"].append(str(first.get("capture_status", "blocked")))
             result["capture"] = {
-                "capture_status": blockers[0].get("capture_status"),
-                "evidence_path": blockers[0].get("evidence_path"),
-                "warnings": blockers[0].get("warnings", []),
+                "capture_status": first.get("capture_status"),
+                "evidence_path": first.get("evidence_path"),
+                "warnings": first.get("warnings", []),
             }
             results.append(result)
             continue
 
-        comments = [comment for item in usable for comment in item.get("comments", []) if isinstance(comment, dict)]
-        image_detection_incomplete = any(item.get("image_detection_complete") is False for item in usable)
-        same_text = [comment for comment in comments if text_matches(expected, comment)]
+        complete = evidence.complete
+        image_detection_incomplete = evidence.image_detection_incomplete
+        match_mode = str(expected.get("text_match", "exact")).strip().casefold()
+        same_text = evidence.matching(expected_text, match_mode)
         if expected_type == "text+image":
             text_with_image = [comment for comment in same_text if image_signal(comment) is True]
             if same_text and not text_with_image:
@@ -291,18 +465,23 @@ def compare(
                     result["candidates"] = [compact_comment(comment) for comment in same_text]
                     results.append(result)
                     continue
+                if len(same_text) > 1 and not allow_duplicates:
+                    result["reason_codes"].append("duplicate_matching_comments")
+                    result["candidates"] = [compact_comment(comment) for comment in same_text]
+                    results.append(result)
+                    continue
                 result["status"] = "partial_text"
                 result["reason_codes"].append("text_found_image_missing")
                 result["candidates"] = [compact_comment(comment) for comment in same_text]
                 result["expected_amount"] = format_amount(expected_amount)
+                if evidence.row_count > 1:
+                    sources = evidence.capture_by_record if allow_duplicates and len(same_text) > 1 else None
+                    settlement_claims[index] = same_text, sources
                 results.append(result)
                 continue
             if not same_text:
-                image_only = [
-                    comment for comment in comments
-                    if image_signal(comment) is True and not has_text(comment.get("text", ""))
-                ]
-                combo_count = combo_rows_by_target.get((result["platform"], result["target_key"]), 0)
+                image_only = evidence.image_only
+                combo_count = combo_rows_by_target.get(key, 0)
                 if len(image_only) == 1 and combo_count == 1:
                     if not complete:
                         result["status"] = "blocked"
@@ -314,6 +493,8 @@ def compare(
                     result["reason_codes"].append("image_found_text_missing")
                     result["candidates"] = [compact_comment(image_only[0])]
                     result["expected_amount"] = format_amount(expected_amount)
+                    if evidence.row_count > 1:
+                        settlement_claims[index] = image_only, None
                     results.append(result)
                     continue
                 if image_only:
@@ -329,11 +510,10 @@ def compare(
                     result["reason_codes"].append("comment_image_presence_unknown")
                     results.append(result)
                     continue
-        same_type = [
-            comment
-            for comment in same_text
-            if infer_type({**comment, "comment_text": comment.get("text", "")}) == expected_type
-        ]
+        if expected_text:
+            same_type = [comment for comment in same_text if _observed_type(comment) == expected_type]
+        else:
+            same_type = evidence.by_type.get(expected_type, [])
         if not same_text:
             if complete:
                 result["status"] = "not_found"
@@ -363,16 +543,15 @@ def compare(
             continue
 
         match = same_type[0]
+        if evidence.row_count > 1:
+            sources = evidence.capture_by_record if allow_duplicates and len(same_type) > 1 else None
+            settlement_claims[index] = same_type, sources
         if amount_mode == "expected-only":
             result["matched_comment"] = compact_comment(match)
             result["status"] = "verified"
             result["reason_codes"].append("comment_match_amount_from_table")
             result["expected_amount"] = format_amount(expected_amount)
-            result["capture"] = {
-                "captured_at": usable[0].get("captured_at"),
-                "evidence_path": match.get("evidence_path") or usable[0].get("evidence_path"),
-                "capture_complete": bool(complete),
-            }
+            result["capture"] = _capture_details(match, evidence.source(match))
             results.append(result)
             continue
         actual_amount, amount_state = observed_amount(match)
@@ -390,11 +569,7 @@ def compare(
             result["reason_codes"].append("comment_and_amount_match")
             result["expected_amount"] = format_amount(expected_amount)
             result["observed_amount"] = format_amount(actual_amount)
-        result["capture"] = {
-            "captured_at": usable[0].get("captured_at"),
-            "evidence_path": match.get("evidence_path") or usable[0].get("evidence_path"),
-            "capture_complete": bool(complete),
-        }
+        result["capture"] = _capture_details(match, evidence.source(match))
         results.append(result)
 
     category_map = {
@@ -431,6 +606,7 @@ def compare(
             result["triage"] = "待人审"
             result["approved_amount"] = None
 
+    _check_settlement_claims(results, settlement_claims, amount_mode, allow_duplicates)
     statuses = ("verified", "not_found", "mismatch", "partial_text", "partial_image", "needs_review", "blocked")
     counts = {status: sum(1 for item in results if item["status"] == status) for status in statuses}
     triage_counts = {

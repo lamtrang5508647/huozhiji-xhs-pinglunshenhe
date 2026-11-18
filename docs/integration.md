@@ -20,6 +20,8 @@
 
 在线 `run` 的进度和验证提示输出到stderr、完成清单输出到stdout，遇到未解决的验证返回3；已解决的验证子进程返回4，由runner恢复断点。依赖未安装或内部错误不会被描述成“审核成功”。`maintain` 输出其原生JSON计划。
 
+WorkBuddy 等调用方可加 `--brief`。对于 `convert`、`review`，通过 `--output` 保存完整 JSON。对于 `audit`，通过 `--output` 保存 XLSX，通过 `--report` 保存完整 JSON。标准输出仅包含状态、文件路径和计数。审核摘要还含各类条数和 `approved_amount`，配合 `--strict` 时仍按相同退出码处理。精简模式在执行前检查各输入和输出路径是否冲突。
+
 ```python
 import json
 import subprocess

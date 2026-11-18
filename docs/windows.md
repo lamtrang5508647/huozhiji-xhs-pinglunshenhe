@@ -1,4 +1,4 @@
-# Windows 使用说明（0.3.0）
+# Windows 使用说明
 
 使用原生 Windows + Python 3.11+，不需要 WSL、Mac、飞书机器人或 Excel。在线采集另需正常安装的 Google Chrome，扫码和安全验证仍由账号本人完成。
 

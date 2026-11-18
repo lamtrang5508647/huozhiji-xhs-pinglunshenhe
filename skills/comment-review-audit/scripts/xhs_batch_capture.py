@@ -110,7 +110,8 @@ def workbook_column_a(path: str) -> Iterable[tuple[str, int, str]]:
                 row_number = int(row.attrib.get("r", "0") or 0)
                 if row_number < 2:
                     continue
-                cell = next((item for item in row.findall("m:c", ns) if item.attrib.get("r", "").startswith("A")), None)
+                address = f"A{row_number}"
+                cell = next((item for item in row.iterfind("m:c", ns) if item.get("r") == address), None)
                 if cell is None:
                     yield sheet_name, row_number, ""
                     continue
@@ -129,7 +130,9 @@ def workbook_column_a(path: str) -> Iterable[tuple[str, int, str]]:
 
 def targets_from_workbooks(paths: Iterable[str]) -> List[Dict[str, Any]]:
     targets: Dict[str, Dict[str, Any]] = {}
+    seen_sources: set[tuple[str, str, str, int]] = set()
     for input_path in paths:
+        source_file = Path(input_path).name
         current_url_by_sheet: Dict[str, str] = {}
         for sheet_name, row_number, value in workbook_column_a(input_path):
             current_url = current_url_by_sheet.get(sheet_name, "")
@@ -146,9 +149,10 @@ def targets_from_workbooks(paths: Iterable[str]) -> List[Dict[str, Any]]:
             target = targets.setdefault(note_id, candidate)
             if token and not target["token"]:
                 target["token"] = token
-            source = {"file": Path(input_path).name, "sheet": sheet_name, "row": row_number}
-            if source not in target["sources"]:
-                target["sources"].append(source)
+            source_key = (note_id, source_file, sheet_name, row_number)
+            if source_key not in seen_sources:
+                seen_sources.add(source_key)
+                target["sources"].append({"file": source_file, "sheet": sheet_name, "row": row_number})
     return list(targets.values())
 
 

@@ -2,9 +2,12 @@
 """Offline regression tests for XHS DOM expansion parsing and completeness."""
 
 from argparse import Namespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from zipfile import ZipFile
 
 from xhs_batch_capture import apply_risk_averse_profile, dom_capture_complete, parse_dom_comment
-from xhs_batch_capture import target_from_url, visible_terminal, expand_dom_comments
+from xhs_batch_capture import target_from_url, targets_from_workbooks, visible_terminal, expand_dom_comments
 
 
 class FakeLocator:
@@ -46,7 +49,33 @@ class FakeReplyItem(FakeItem):
         return FakeLocator(0)
 
 
+def test_target_column_and_carried_rows():
+    sheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    document_rels = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rels = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "capture.xlsx"
+        with ZipFile(path, "w") as archive:
+            archive.writestr("xl/workbook.xml", f'''<workbook xmlns="{sheet_ns}" xmlns:r="{document_rels}">
+                <sheets><sheet name="Tasks" sheetId="1" r:id="rId1"/></sheets></workbook>''')
+            archive.writestr("xl/_rels/workbook.xml.rels", f'''<Relationships xmlns="{package_rels}">
+                <Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="{document_rels}/worksheet"/>
+                </Relationships>''')
+            archive.writestr("xl/worksheets/sheet1.xml", f'''<worksheet xmlns="{sheet_ns}"><sheetData>
+                <row r="2"><c r="AA2" t="inlineStr"><is><t>https://www.xiaohongshu.com/explore/wrong</t></is></c></row>
+                <row r="3"><c r="A3" t="inlineStr"><is><t>https://www.xiaohongshu.com/explore/right</t></is></c></row>
+                <row r="4"><c r="AB4" t="inlineStr"><is><t>https://www.xiaohongshu.com/explore/other</t></is></c></row>
+                </sheetData></worksheet>''')
+        targets = targets_from_workbooks([str(path), str(path)])
+        assert [target["note_id"] for target in targets] == ["right"]
+        assert targets[0]["sources"] == [
+            {"file": path.name, "sheet": "Tasks", "row": 3},
+            {"file": path.name, "sheet": "Tasks", "row": 4},
+        ]
+
+
 def main() -> None:
+    test_target_column_and_carried_rows()
     assert parse_dom_comment(FakeReplyItem('请问喝哪家啊？'))['text'] == '请问喝哪家啊？'
     assert parse_dom_comment(FakeReplyItem('回复 小明：这是作者自己写的正文'))['text'] == '回复 小明：这是作者自己写的正文'
     long_target = target_from_url('标题 https://www.xiaohongshu.com/explore/n1?xsec_token=fixture&xsec_source=pc_ad')

@@ -166,64 +166,69 @@ def worksheet_image_cells(archive: zipfile.ZipFile, worksheet_member: str) -> Li
     return cells
 
 
-def read_xlsx(path: Path, sheet_name: Optional[str] = None) -> List[Dict[str, Any]]:
-    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main", "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
-    with zipfile.ZipFile(path) as archive:
-        shared_strings: List[str] = []
-        if "xl/sharedStrings.xml" in archive.namelist():
-            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-            for si in root:
-                shared_strings.append("".join(item.text or "" for item in si.iter() if local_name(item.tag) == "t"))
+def xlsx_sheet_members(archive: zipfile.ZipFile) -> Dict[str, str]:
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    rel_targets = {
+        rel.attrib["Id"]: rel.attrib["Target"]
+        for rel in relationships
+        if local_name(rel.tag) == "Relationship"
+    }
+    rel_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    sheets = {}
+    for sheet in workbook.iter():
+        if local_name(sheet.tag) == "sheet":
+            target = rel_targets.get(sheet.get(rel_id), "").lstrip("/")
+            sheets[sheet.get("name", "")] = target if target.startswith("xl/") else "xl/" + target
+    return sheets
 
-        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-        relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-        rel_targets = {
-            rel.attrib["Id"]: rel.attrib["Target"]
-            for rel in relationships
-            if local_name(rel.tag) == "Relationship"
-        }
-        sheets = []
-        for sheet in workbook.iter():
-            if local_name(sheet.tag) != "sheet":
-                continue
-            relation_id = sheet.attrib.get("{%s}id" % ns["rel"])
-            target = rel_targets.get(relation_id, "")
-            target = target.lstrip("/")
-            if not target.startswith("xl/"):
-                target = "xl/" + target
-            sheets.append((sheet.attrib.get("name", ""), target))
+
+def xlsx_shared_strings(archive: zipfile.ZipFile) -> List[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    return ["".join(item.text or "" for item in si.iter() if local_name(item.tag) == "t") for si in root]
+
+
+def read_xlsx(path: Path, sheet_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    with zipfile.ZipFile(path) as archive:
+        sheets = xlsx_sheet_members(archive)
         if not sheets:
             raise ValueError("XLSX contains no worksheets")
-        selected = next((item for item in sheets if item[0] == sheet_name), None) if sheet_name else sheets[0]
-        if selected is None:
-            raise ValueError(f"Worksheet not found: {sheet_name}")
-        root = ET.fromstring(archive.read(selected[1]))
-        image_cells = worksheet_image_cells(archive, selected[1])
-        merged_ranges = [
-            item.attrib.get("ref", "")
-            for item in root.iter()
-            if local_name(item.tag) == "mergeCell"
-        ]
-        matrix: List[Dict[int, str]] = []
-        for row in root.iter():
-            if local_name(row.tag) != "row":
-                continue
-            try:
-                row_number = int(row.attrib.get("r", str(len(matrix) + 1)))
-            except ValueError:
-                row_number = len(matrix) + 1
-            while len(matrix) < row_number:
-                matrix.append({})
-            values: Dict[int, str] = {}
-            for cell in row:
-                if local_name(cell.tag) == "c":
-                    values[col_index(cell.attrib.get("r", "A1"))] = xlsx_text(cell, shared_strings)
-            matrix[row_number - 1].update(values)
-        for row_index, column_index in image_cells:
-            while len(matrix) <= row_index:
-                matrix.append({})
-            if not matrix[row_index].get(column_index, ""):
-                matrix[row_index][column_index] = "embedded-image.png"
+        selected = sheet_name or next(iter(sheets))
+        if selected not in sheets:
+            raise ValueError(f"Worksheet not found: {selected}")
+        return read_worksheet(archive, sheets[selected], xlsx_shared_strings(archive))
+
+
+def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[str]) -> List[Dict[str, Any]]:
+    root = ET.fromstring(archive.read(member))
+    image_cells = worksheet_image_cells(archive, member)
+    merged_ranges = [
+        item.attrib.get("ref", "")
+        for item in root.iter()
+        if local_name(item.tag) == "mergeCell"
+    ]
+    matrix: List[Dict[int, str]] = []
+    for row in root.iter():
+        if local_name(row.tag) != "row":
+            continue
+        try:
+            row_number = int(row.attrib.get("r", str(len(matrix) + 1)))
+        except ValueError:
+            row_number = len(matrix) + 1
+        while len(matrix) < row_number:
+            matrix.append({})
+        values: Dict[int, str] = {}
+        for cell in row:
+            if local_name(cell.tag) == "c":
+                values[col_index(cell.attrib.get("r", "A1"))] = xlsx_text(cell, shared_strings)
+        matrix[row_number - 1].update(values)
+    for row_index, column_index in image_cells:
+        while len(matrix) <= row_index:
+            matrix.append({})
+        if not matrix[row_index].get(column_index, ""):
+            matrix[row_index][column_index] = "embedded-image.png"
     for merged in merged_ranges:
         if ":" not in merged:
             continue
@@ -514,6 +519,20 @@ def convert(
     return output
 
 
+def convert_xlsx_sheets(path: Path, explicit: Dict[str, str], amount_rules: Optional[Dict[str, str]],
+                        *, skip_summary: bool = False) -> List[Dict[str, Any]]:
+    converted = []
+    with zipfile.ZipFile(path) as archive:
+        sheets = xlsx_sheet_members(archive)
+        strings = xlsx_shared_strings(archive)
+        for name, member in sheets.items():
+            if skip_summary and name == "审核汇总":
+                continue
+            rows = read_worksheet(archive, member, strings)
+            converted.extend(convert(rows, explicit, path.name, name, amount_rules))
+    return converted
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="CSV/TSV/JSON/XLSX source")
@@ -528,10 +547,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         explicit = parse_maps(args.map)
         rules = parse_amount_rules(args.amount_rules)
         if source.suffix.casefold() == ".xlsx" and args.all_sheets:
-            sheet_names = list_xlsx_sheets(source)
-            converted = []
-            for sheet_name in sheet_names:
-                converted.extend(convert(read_xlsx(source, sheet_name), explicit, source.name, sheet_name, rules))
+            converted = convert_xlsx_sheets(source, explicit, rules)
         else:
             sheet_name = args.sheet if source.suffix.casefold() == ".xlsx" else None
             converted = convert(read_rows(source, sheet_name), explicit, source.name, sheet_name, rules)

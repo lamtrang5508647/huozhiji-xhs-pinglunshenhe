@@ -112,6 +112,10 @@ Comment fields:
 | `needs_review` | Duplicate/ambiguous candidate, unknown image state, or contradictory metadata. |
 | `blocked` | Login, CAPTCHA, risk control, network change, inaccessible target, or incomplete capture prevents a conclusion. |
 
+Within a review, a comment used as settlement evidence for multiple task rows on the same platform and target can result in `evidence_claimed_by_multiple_rows`. Conflicting rows need manual review and have a blank approved amount. A text-only requirement whose body is empty after normalization also needs review.
+
+Automatic checks use the presence of an attached image. Verification that it depicts a particular reference image requires the source image and the actual attachment. Claim reconciliation covers the rows and observations supplied to the current review.
+
 ## User-facing classifications
 
 Every row has both `result_category` and `triage`.

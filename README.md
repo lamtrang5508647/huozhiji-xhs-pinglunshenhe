@@ -4,7 +4,13 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
-0.3.0 支持 Windows、macOS、Linux 共用一套 SDK/CLI。Windows 提供 PowerShell 安装/启动入口，详见 [Windows 使用说明](docs/windows.md)。
+0.4.0 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
+
+## WorkBuddy 使用
+
+在 WorkBuddy 的「专家·技能·连接器 → 技能 → 添加技能 → 上传技能」导入 `comment-review-audit.zip`。本地包内含审核脚本，离线审核使用 Python 3.11+。需要从源码生成技能包时，在仓库根目录运行 `python tools/package_workbuddy.py --output dist/comment-review-audit.zip`。导入入口见 [WorkBuddy 官方说明](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Skills-Market)。
+
+可直接告诉 WorkBuddy：“用评论审核技能核对这份原始 Excel 和采集证据，返回审核版、待人审条数和核定总额。” 在离线模式中，WorkBuddy 使用 `audit --brief --strict`，对话只返回统计和文件位置，逐条证据保存在 JSON 报告里。只有原表且要现场核对时，按平台进入采集流程。
 
 ## 安装与快速测试
 
@@ -82,6 +88,8 @@ huozhiji-audit run --source 评论.xlsx --work-dir /path/outputs/job-id \
 python3 tests/run_regressions.py
 node --check skills/comment-review-audit/scripts/build_audited_workbook.mjs
 ```
+
+迭代性能时运行 `python tools/benchmark_audit.py`。它用 12 个工作表、1,200 行任务和 7,200 条模拟评论跑完整离线审核，默认报告 5 次耗时的中位数，以及逐行结果和 Excel 各部件的内容签名。加入 `--checkout <旧版仓库路径>` 可用相同样本复测旧版本。
 
 CI在 Windows、macOS、Linux 的 Python 3.11/3.14 上测试纯 Python 接口、旧适配器、wheel 安装后的入口和真实 Chrome 空白页。不会测试真实账号登录或抓取真实评论。将 `skills/comment-review-audit/` 安装到支持 skill 的程序即可使用。只有使用已有 OpenClaw/飞书集成时才执行 `scripts/sync_openclaw_skill.sh`；不需要它的使用者不用配置机器人密钥。
 

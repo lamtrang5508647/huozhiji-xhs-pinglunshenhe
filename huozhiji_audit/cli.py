@@ -7,6 +7,7 @@ import json
 import platform
 import subprocess
 import sys
+import tempfile
 import zipfile
 from xml.etree import ElementTree as ET
 from pathlib import Path
@@ -29,15 +30,42 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def emit(value, output=None):
+def emit(value, output=None, *, brief=None):
     encoded = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
     if output:
         path = Path(output)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(encoded, encoding="utf-8")
-        temporary.replace(path)
+        stream = tempfile.NamedTemporaryFile(dir=path.parent, mode="w", encoding="utf-8", delete=False)
+        temporary = Path(stream.name)
+        try:
+            with stream:
+                stream.write(encoded)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    if brief is not None:
+        encoded = json.dumps(brief, ensure_ascii=False, separators=(",", ":")) + "\n"
     sys.stdout.write(encoded)
+
+
+def brief_destination(args):
+    flag = "--report" if args.command == "audit" else "--output"
+    filename = args.report if args.command == "audit" else args.output
+    if not filename:
+        raise ValueError(f"{args.command} --brief requires {flag}")
+    destination = Path(filename)
+    protected = [Path(value).resolve() for name in ("source", "expected", "observations")
+                 if (value := getattr(args, name, None))]
+    outputs = [destination.resolve()]
+    if args.command == "audit":
+        outputs.append(Path(args.output).resolve())
+    for output in outputs:
+        for other in protected:
+            if output == other or (output.exists() and other.exists() and output.samefile(other)):
+                raise ValueError("--brief requires distinct input and output paths")
+        protected.append(output)
+    # JSON writes atomically replace the directory entry, including an existing symlink.
+    return str(destination.parent.resolve() / destination.name)
 
 
 def doctor():
@@ -81,6 +109,9 @@ def main(argv=None):
     audit.add_argument("--output", required=True, help="Distinct audited XLSX destination")
     audit.add_argument("--report", help="Optional JSON report destination")
     audit.add_argument("--strict", action="store_true")
+    for command, flag in ((convert, "--output"), (compare, "--output"), (audit, "--report")):
+        command.add_argument("--brief", action="store_true",
+                             help=f"Write full JSON to {flag} (required) and print only paths and totals")
     for command in (convert, audit):
         command.add_argument("--map", action="append", default=[])
         command.add_argument("--amount-rules")
@@ -123,18 +154,30 @@ def main(argv=None):
         if args.command == "doctor":
             emit(doctor())
             return 0
+        destination = brief_destination(args) if args.brief else None
         if args.command == "convert":
-            emit(convert_table(args.source, mapping=table_to_expected.parse_maps(args.map),
-                               amount_rules=table_to_expected.parse_amount_rules(args.amount_rules), sheet=args.sheet), args.output)
+            expected = convert_table(args.source, mapping=table_to_expected.parse_maps(args.map),
+                                     amount_rules=table_to_expected.parse_amount_rules(args.amount_rules), sheet=args.sheet)
+            brief = None
+            if args.brief:
+                brief = {"status": "complete", "output": destination, "summary": {"total": len(expected["rows"])}}
+            emit(expected, args.output, brief=brief)
             return 0
         if args.command == "review":
             result = review(read_json(args.expected), read_json(args.observations))
-            emit(result, args.output)
+            report_path = args.output
         else:
             result = audit_workbook(args.source, read_json(args.observations), args.output,
                                     mapping=table_to_expected.parse_maps(args.map),
                                     amount_rules=table_to_expected.parse_amount_rules(args.amount_rules))
-            emit(result, args.report)
+            report_path = args.report
+        brief = None
+        if args.brief:
+            brief = {"status": "complete", "report": destination,
+                     "summary": {key: result["summary"][key] for key in ("total", "triage_counts", "approved_amount")}}
+            if args.command == "audit":
+                brief["output"] = result["workbook"]["output"]
+        emit(result, report_path, brief=brief)
         counts = result["summary"]["triage_counts"]
         return 2 if args.strict and (counts["失败"] or counts["待人审"]) else 0
     except (OSError, ValueError, RuntimeError, KeyError, zipfile.BadZipFile, ET.ParseError, ArithmeticError) as exc:

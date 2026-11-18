@@ -17,6 +17,7 @@ import tempfile
 import zipfile
 from collections import Counter
 from decimal import Decimal
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -88,14 +89,31 @@ def cell_value(cell, strings):
     return value
 
 
-def set_cell(data, address, value, *, style=None, formula=None):
+def sheet_cell_writer(data):
+    rows = {}
+    for row in data:
+        rows.setdefault(row.get("r"), row)
+    return partial(set_cell, data, row_index=rows)
+
+
+def set_cell(data, address, value, *, style=None, formula=None, row_index=None):
     row_number = int(re.search(r"\d+$", address)[0])
-    row = next((row for row in data if row.get("r") == str(row_number)), None)
+    row_key = str(row_number)
+    if row_index is None:
+        row = next((row for row in data if row.get("r") == row_key), None)
+    else:
+        row = row_index.get(row_key)
     if row is None:
-        row = ET.Element(tag("row"), {"r": str(row_number)})
-        index = next((i for i, item in enumerate(data) if int(item.get("r", "0")) > row_number), len(data))
-        data.insert(index, row)
-    existing = row.find(f"{tag('c')}[@r='{address}']")
+        row = ET.Element(tag("row"), {"r": row_key})
+        if not len(data) or int(data[-1].get("r", "0")) < row_number:
+            data.append(row)
+        else:
+            index = next((i for i, item in enumerate(data) if int(item.get("r", "0")) > row_number), len(data))
+            data.insert(index, row)
+        if row_index is not None:
+            row_index[row_key] = row
+    cell_tag = tag("c")
+    existing = next((item for item in row if item.tag == cell_tag and item.get("r") == address), None)
     attrs = {"r": address}
     if existing is not None and existing.get("s"):
         attrs["s"] = existing.get("s")
@@ -117,7 +135,8 @@ def set_cell(data, address, value, *, style=None, formula=None):
             node.text = str(value)
     if existing is not None:
         row.remove(existing)
-    index = next((i for i, item in enumerate(row) if item.tag == tag("c") and col_index(item.get("r")) > col_index(address)), len(row))
+    target_column = col_index(address)
+    index = next((i for i, item in enumerate(row) if item.tag == cell_tag and col_index(item.get("r")) > target_column), len(row))
     row.insert(index, cell)
     return cell
 
@@ -194,7 +213,7 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     if "xl/sharedStrings.xml" in parts:
         strings = ["".join(t.text or "" for t in item.iter(tag("t"))) for item in ET.fromstring(parts["xl/sharedStrings.xml"])]
     styles = add_styles(parts)
-    modified = set()
+    rows_by_sheet = {}
     locations = set()
     for item in rows:
         name, number = item.get("source_sheet"), item.get("source_row")
@@ -203,13 +222,14 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         if (name, number) in locations:
             raise ValueError("duplicate_source_row_location")
         locations.add((name, number))
-    for name in dict.fromkeys(item["source_sheet"] for item in rows):
+        rows_by_sheet.setdefault(name, []).append(item)
+    for name, selected in rows_by_sheet.items():
         path = sheet_paths[name]
         root = ET.fromstring(parts[path])
         if root.find(tag("sheetProtection")) is not None:
             raise ValueError("protected_source_sheet")
         data = root.find(tag("sheetData"))
-        selected = [item for item in rows if item["source_sheet"] == name]
+        write_cell = sheet_cell_writer(data)
         maximum = max(item["source_row"] for item in selected)
         merges = root.find(tag("mergeCells"))
         if merges is not None:
@@ -224,17 +244,16 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
             merges.set("count", str(len(merges)))
             if not len(merges):
                 root.remove(merges)
-        set_cell(data, "G1", "审核结果")
+        write_cell("G1", "审核结果")
         for item in selected:
             result = by_id[item["case_id"]]
-            set_cell(data, f'G{item["source_row"]}', result["result_category"])
+            write_cell(f'G{item["source_row"]}', result["result_category"])
             amount = result.get("approved_amount")
-            set_cell(data, f'H{item["source_row"]}', None if amount in (None, "") else Decimal(str(amount)), style=styles["money"])
+            write_cell(f'H{item["source_row"]}', None if amount in (None, "") else Decimal(str(amount)), style=styles["money"])
         dimension = root.find(tag("dimension"))
         if dimension is not None:
             dimension.set("ref", f"A1:{column(max(8, max((col_index(c.get('r')) for c in data.iter(tag('c'))), default=8)))}{max(maximum, max((int(r.get('r', '1')) for r in data), default=1))}")
         parts[path] = encode(root, original_parts[path])
-        modified.add(path)
     groups = {}
     for item in rows:
         key = (str(item.get("group_leader") or "未填写").strip(), str(item.get("product_name") or item["source_sheet"]).strip())
@@ -275,27 +294,28 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     for index, width in enumerate((13, 15, 14, 9, 9, 9, 11, 10, 12, 38, 16, 18, 16, 18), 1):
         ET.SubElement(cols, tag("col"), {"min": str(index), "max": str(index), "width": str(width), "customWidth": "1"})
     data = ET.SubElement(summary, tag("sheetData"))
+    write_cell = sheet_cell_writer(data)
     for index, header in enumerate(HEADERS, 1):
-        set_cell(data, f"{column(index)}1", header, style=styles["header" if index <= 10 else "manual"])
-    set_cell(data, "P1", "图文组合结果", style=styles["header"])
-    set_cell(data, "Q1", "数量", style=styles["header"])
+        write_cell(f"{column(index)}1", header, style=styles["header" if index <= 10 else "manual"])
+    write_cell("P1", "图文组合结果", style=styles["header"])
+    write_cell("Q1", "数量", style=styles["header"])
     for number, category in enumerate(("图字成功", "文字成功", "图片成功", "失败", "待人审"), 2):
         count = sum(item.get("comment_type") == "text+image" and by_id[item["case_id"]]["result_category"] == category for item in rows)
-        set_cell(data, f"P{number}", category, style=styles["body"])
-        set_cell(data, f"Q{number}", count, formula=f'COUNTIFS($U$12:$U${end},"text+image",$V$12:$V${end},P{number})', style=styles["body"])
+        write_cell(f"P{number}", category, style=styles["body"])
+        write_cell(f"Q{number}", count, formula=f'COUNTIFS($U$12:$U${end},"text+image",$V$12:$V${end},P{number})', style=styles["body"])
     for index, header in enumerate(("案例ID", "团长", "产品名", "工作表", "原行", "要求类型", "结果分类", "分流", "核定金额"), 16):
-        set_cell(data, f"{column(index)}11", header, style=styles["detail"])
+        write_cell(f"{column(index)}11", header, style=styles["detail"])
     counts = Counter(item["triage"] for item in results)
     for number, item in enumerate(rows, 12):
         result = by_id[item["case_id"]]
         key = (str(item.get("group_leader") or "未填写").strip(), str(item.get("product_name") or item["source_sheet"]).strip())
         for index, value in enumerate((item["case_id"], *key, item["source_sheet"], item["source_row"], item["comment_type"]), 16):
-            set_cell(data, f"{column(index)}{number}", value, style=styles["body"])
+            write_cell(f"{column(index)}{number}", value, style=styles["body"])
         quoted = "'" + item["source_sheet"].replace("'", "''") + "'"
-        set_cell(data, f"V{number}", result["result_category"], formula=f"{quoted}!G{item['source_row']}", style=styles["body"])
-        set_cell(data, f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),ISNUMBER({quoted}!H{item["source_row"]}))),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"])
+        write_cell(f"V{number}", result["result_category"], formula=f"{quoted}!G{item['source_row']}", style=styles["body"])
+        write_cell(f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),ISNUMBER({quoted}!H{item["source_row"]}))),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"])
         amount = result.get("approved_amount")
-        set_cell(data, f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=f'IF(ISNUMBER({quoted}!H{item["source_row"]}),{quoted}!H{item["source_row"]},"")', style=styles["money"])
+        write_cell(f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=f'IF(ISNUMBER({quoted}!H{item["source_row"]}),{quoted}!H{item["source_row"]},"")', style=styles["money"])
     new_row_numbers = {}
     for number, (key, members) in enumerate(groups.items(), 2):
         new_row_numbers[key] = number - 1
@@ -309,13 +329,13 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         criteria = f'$Q$12:$Q${end},{leader},$R$12:$R${end},{product}'
         formulas = {4: f"COUNTIFS({criteria})", 5: f'COUNTIFS({criteria},$W$12:$W${end},"成功")', 6: f'COUNTIFS({criteria},$W$12:$W${end},"失败")', 7: f'COUNTIFS({criteria},$W$12:$W${end},"待人审")', 8: f"IFERROR(E{number}/D{number},0)", 9: f"SUMIFS($X$12:$X${end},{criteria})"}
         for index, value in enumerate(values, 1):
-            set_cell(data, f"{column(index)}{number}", value, formula=formulas.get(index), style=styles["money" if index == 9 else "percent" if index == 8 else "body"])
+            write_cell(f"{column(index)}{number}", value, formula=formulas.get(index), style=styles["money" if index == 9 else "percent" if index == 8 else "body"])
         for index, field in enumerate(("leader_contact", "settlement_time", "settlement_voucher", "qr_code"), 11):
             prior = manual.get(key, {}).get(index)
             value = next((item.get(field) for item in members if item.get(field)), None)
             if value == "embedded-image.png":
                 value = "见原工作表"
-            cell = set_cell(data, f"{column(index)}{number}", value, style=styles["body"])
+            cell = write_cell(f"{column(index)}{number}", value, style=styles["body"])
             if prior is not None:
                 old_number = int(re.search(r"\d+$", prior.get("r"))[0])
                 if prior.find(tag("f")) is not None and old_number != number:
@@ -328,7 +348,7 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     totals = ["合计", None, sum(len({item["source_sheet"] for item in members}) for members in groups.values()), len(results), counts["成功"], counts["失败"], counts["待人审"], counts["成功"] / len(results), payout]
     for index, value in enumerate(totals, 1):
         formula = (f"IFERROR(E{total_row}/D{total_row},0)" if index == 8 else f"SUM({column(index)}2:{column(index)}{total_row-1})") if 3 <= index <= 9 else None
-        set_cell(data, f"{column(index)}{total_row}", value, formula=formula, style=styles["total_money" if index == 9 else "total_percent" if index == 8 else "total"])
+        write_cell(f"{column(index)}{total_row}", value, formula=formula, style=styles["total_money" if index == 9 else "total_percent" if index == 8 else "total"])
     for row in data:
         if int(row.get("r")) <= total_row:
             row.set("ht", "30" if row.get("r") == "1" else "44")
@@ -409,11 +429,11 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
             for name in original_parts:
                 if name.startswith("xl/media/") and archive.read(name) != original_parts[name]:
                     raise RuntimeError("source_media_changed")
-            for path in modified:
-                root = ET.fromstring(archive.read(path))
-                for item in (item for item in rows if sheet_paths[item["source_sheet"]] == path):
+            for name, selected in rows_by_sheet.items():
+                root = ET.fromstring(archive.read(sheet_paths[name]))
+                cells = {c.get("r"): c for c in root.iter(tag("c"))}
+                for item in selected:
                     result = by_id[item["case_id"]]
-                    cells = {c.get("r"): c for c in root.iter(tag("c"))}
                     if cell_value(cells[f'G{item["source_row"]}'], strings) != result["result_category"]:
                         raise RuntimeError("export_row_category_mismatch")
                     actual = cell_value(cells[f'H{item["source_row"]}'], strings)

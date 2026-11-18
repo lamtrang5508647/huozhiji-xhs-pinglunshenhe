@@ -12,13 +12,15 @@ def convert_table(source: str | Path, *, mapping: dict[str, str] | None = None,
                   amount_rules: dict[str, str] | None = None, sheet: str | None = None) -> dict[str, Any]:
     """Read XLSX (all product sheets by default), CSV, TSV or JSON requirements."""
     path = Path(source)
-    names = ([sheet] if sheet else table_to_expected.list_xlsx_sheets(path)) if path.suffix.lower() == ".xlsx" else [None]
-    rows = []
-    for name in names:
+    is_xlsx = path.suffix.lower() == ".xlsx"
+    if is_xlsx and not sheet:
+        rows = table_to_expected.convert_xlsx_sheets(path, mapping or {}, amount_rules, skip_summary=True)
+    else:
+        name = sheet if is_xlsx else None
         if name == "审核汇总":
-            continue
-        rows.extend(table_to_expected.convert(table_to_expected.read_rows(path, name),
-                    mapping or {}, path.name, name, amount_rules))
+            raise ValueError("expected_rows_empty")
+        rows = table_to_expected.convert(table_to_expected.read_rows(path, name),
+                                         mapping or {}, path.name, name, amount_rules)
     if not rows:
         raise ValueError("expected_rows_empty")
     ids = [row.get("case_id") for row in rows]
