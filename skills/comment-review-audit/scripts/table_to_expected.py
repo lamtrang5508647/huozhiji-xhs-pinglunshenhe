@@ -66,19 +66,25 @@ def local_name(tag: str) -> str:
 
 
 def child(element: ET.Element, name: str) -> Optional[ET.Element]:
-    return next((item for item in list(element) if local_name(item.tag) == name), None)
+    for item in element:
+        if local_name(item.tag) == name:
+            return item
+    return None
 
 
 def xlsx_text(cell: ET.Element, shared_strings: List[str]) -> str:
     cell_type = cell.attrib.get("t")
+    if not len(cell):
+        return "FALSE" if cell_type == "b" else ""
     if cell_type == "inlineStr":
         inline = child(cell, "is")
         return "".join(item.text or "" for item in inline.iter() if local_name(item.tag) == "t") if inline is not None else ""
     value = child(cell, "v")
     raw = "" if value is None or value.text is None else value.text
-    formula = child(cell, "f")
-    if not raw and formula is not None and formula.text:
-        return "=" + formula.text
+    if not raw:
+        formula = child(cell, "f")
+        if formula is not None and formula.text:
+            return "=" + formula.text
     if cell_type == "s" and raw:
         return shared_strings[int(raw)]
     if cell_type == "b":
@@ -404,12 +410,12 @@ def convert(
     previous_target_key = ""
     previous_group_leader = ""
     previous_product_name = ""
+    relevant_sources = [
+        mapping[field]
+        for field in ("target_key", "target_url", "comment_text", "comment_type", "expected_amount", "reply_text", "image_requirement")
+        if field in mapping
+    ]
     for row_number, row in enumerate(rows, start=2):
-        relevant_sources = [
-            mapping[field]
-            for field in ("target_key", "target_url", "comment_text", "comment_type", "expected_amount", "reply_text", "image_requirement")
-            if field in mapping
-        ]
         if not any(str(row.get(source, "")).strip() for source in relevant_sources):
             continue
         item: Dict[str, Any] = {

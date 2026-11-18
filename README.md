@@ -4,13 +4,13 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
-0.4.0 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
+0.4.1 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
 
 ## WorkBuddy 使用
 
-在 WorkBuddy 的「专家·技能·连接器 → 技能 → 添加技能 → 上传技能」导入 `comment-review-audit.zip`。本地包内含审核脚本，离线审核使用 Python 3.11+。需要从源码生成技能包时，在仓库根目录运行 `python tools/package_workbuddy.py --output dist/comment-review-audit.zip`。导入入口见 [WorkBuddy 官方说明](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Skills-Market)。
+下载 [WorkBuddy 技能包](https://github.com/lamtrang5508647/huozhiji-xhs-pinglunshenhe/releases/latest/download/comment-review-audit.zip)，在 WorkBuddy 的「专家·技能·连接器 → 技能 → 添加技能 → 上传技能」导入。本地包内含审核脚本，离线审核使用 Python 3.11+。需要从源码生成技能包时，在仓库根目录运行 `python tools/package_workbuddy.py --output dist/comment-review-audit.zip`。导入入口见 [WorkBuddy 官方说明](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Skills-Market)。
 
-可直接告诉 WorkBuddy：“用评论审核技能核对这份原始 Excel 和采集证据，返回审核版、待人审条数和核定总额。” 在离线模式中，WorkBuddy 使用 `audit --brief --strict`，对话只返回统计和文件位置，逐条证据保存在 JSON 报告里。只有原表且要现场核对时，按平台进入采集流程。
+可直接告诉 WorkBuddy：“用评论审核技能去小红书原帖核对这张表，展开指定楼层的回复，返回审核版和剩余待审原因。” 小红书在线入口 `run` 会按笔记合并复查并保存断点。若只要核对现有采集文件，使用 `audit --brief --strict`，对话返回统计和文件位置，逐条证据保存在 JSON 报告里。
 
 ## 安装与快速测试
 
@@ -76,6 +76,7 @@ huozhiji-audit run --source 评论.xlsx --work-dir /path/outputs/job-id \
 - 图文结果：图字成功、文字成功、图片成功、失败、待人审。
 - 成功按源表金额结算；部分成功仅在源表明确分项价格时结算；失败金额为0；待人审金额留空。
 - 评论缺失只有在完整、正常的评论列表中才能判失败。验证码、登录失效、分页不完整或图片不明确会保留为待人审。
+- 工作表写明“回复第 N 条”时，同时核对正文和直接父评论。在线运行会打开同帖评论区并展开待核回复，复用已充分的证据。复查后仍无法确定父级的行保留待人审，报告区分源表编号有歧义和平台父级证据不足，并记录该帖的复查情况。
 - 每个文件独立生成 `审核汇总`，按团长和产品统计，并保留结算信息。
 
 协议详见 [data-contract.md](skills/comment-review-audit/references/data-contract.md)。`job-result.json` 区分 `in_progress`/`blocked`/`error`/`complete`，包含源文件与成品 SHA-256。在线登录是否正常不能只靠 `doctor` 的依赖检查判断。

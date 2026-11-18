@@ -6,12 +6,21 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from table_to_expected import convert, read_xlsx, infer_platform  # noqa: E402
+from table_to_expected import convert, read_xlsx, infer_platform, xlsx_text  # noqa: E402
 
 
 def run():
+    for xml, expected in (
+        ('<c r="B2" s="4"/>', ''),
+        ('<c r="B2" t="b"/>', 'FALSE'),
+        ('<c r="B2" t="b"><v>1</v></c>', 'TRUE'),
+        ('<c r="B2"><f>1+1</f><v>2</v></c>', '2'),
+        ('<c r="B2"><f>1+1</f><v/></c>', '=1+1'),
+    ):
+        assert xlsx_text(ET.fromstring(xml), []) == expected
     annotated = '@点点 大豆异黄酮对女性有什么好处？ （辛苦@点点要手打艾特出来！）'
     note_rows = convert([{'文章链接':'https://www.xiaohongshu.com/explore/fixture', '评论文字需求':annotated}], {}, 'fixture.xlsx')
     assert note_rows[0]['comment_text'] == '@点点 大豆异黄酮对女性有什么好处？'

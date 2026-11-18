@@ -12,6 +12,7 @@ from xhs_capture import (  # noqa: E402
     flatten_comments,
     has_more,
     normalize_comment,
+    normalized_comments,
 )
 
 
@@ -37,6 +38,17 @@ def run():
     assert classify_failure(1, "redirected to /website-login/error") == "risk_control"
     nested = [{"id": "p", "content": "父评论", "subComments": [{"id": "r", "content": "回复"}]}]
     assert [item["id"] for item in flatten_comments(nested)] == ["p", "r"]
+    thread = [{"id": "root", "subComments": [
+        {"id": "first", "target_comment": {"id": "root"}},
+        {"id": "second", "targetComment": {"commentId": "first"}},
+        {"id": "unknown", "rootCommentId": "root"},
+        {"id": "unidentified", "targetComment": {"userId": "private"}},
+        {"id": "conflict", "targetCommentId": "first", "parent_comment_id": "root"},
+    ]}]
+    normalized = normalized_comments(thread, root_list=True)
+    assert [item.get("parent_comment_id", "missing") for item in normalized] == [
+        None, "root", "first", "missing", "missing", "missing"]
+    assert "parent_comment_id" not in normalized_comments(thread)[0]
     print("ok: xhs capture adapter regression tests")
 
 

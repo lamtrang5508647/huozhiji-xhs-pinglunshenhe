@@ -64,15 +64,17 @@ def main() -> None:
         job = folder / "job"
         job.mkdir()
         (job / "job-result.json").write_text('{"status":"complete"}')
+        expected_row = {"case_id": "a", "platform": "xiaohongshu", "target_key": "x1"}
         def simulate(argv, env=None):
-            if "table_to_expected.py" in argv[1]:
-                (job / "expected.json").write_text(json.dumps({"rows": [{"case_id": "a", "platform": "xiaohongshu", "target_key": "x1"}]}))
-            else:
-                (job / "observations.json").write_text(json.dumps({"observations": [{"platform":"xiaohongshu", "target_key":"x1", "capture_status":"ok", "capture_complete":False}]}))
+            assert "--only-note-id" in argv
+            (job / "observations.json").write_text(json.dumps({"observations": [
+                {"platform": "xiaohongshu", "target_key": "x1", "capture_status": "ok", "capture_complete": False}
+            ]}))
         args = ["job", "--source", str(source), "--work-dir", str(job)]
-        with patch.object(sys, "argv", args), patch("run_comment_review_job.run", side_effect=simulate) as mocked:
+        with patch.object(sys, "argv", args), patch("run_comment_review_job.convert_xlsx_sheets", return_value=[expected_row]), \
+             patch("run_comment_review_job.run", side_effect=simulate) as mocked:
             assert run_job() == 3
-            assert mocked.call_count == 2  # incomplete canary never starts the full batch
+            assert mocked.call_count == 1  # incomplete canary never starts the full batch
             assert json.loads((job / "job-result.json").read_text())["status"] == "blocked"
     print("comment review job tests passed")
 

@@ -8,26 +8,24 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from decimal import Decimal
 from hashlib import sha256
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from xml.etree import ElementTree as ET
 from capture_resume import reusable_capture
 from audit_validation import validate_results
+from build_audited_workbook import build_workbook
 from profile_lock import default_profile
+from review_comments import compare, unwrap_rows
 from runtime_environment import child_environment, configure_stdio
+from table_to_expected import convert_xlsx_sheets, parse_amount_rules, parse_maps
+from xhs_batch_capture import group_reply_requirements, needs_reply_recheck, plan_targets, targets_from_workbooks
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MAPS = (
-    "target_url=文章链接",
-    "product_name=产品",
-    "comment_text=评论文字需求",
-    "reply_text=需要回复评论内容【左边填写回第几条】",
-    "image_requirement=评论图片需求",
-    "expected_amount=金额【文字1.5，文字加图2元，单图1.5】",
-)
 
 
 def run(argv: list[str], env: dict[str, str] | None = None) -> None:
@@ -53,12 +51,16 @@ def write_state(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def load_items(path: Path, key: str) -> list[dict[str, Any]]:
+def read_checkpoint(path: Path) -> dict:
     if not path.exists():
-        return []
+        return {"observations": []}
     payload = json.loads(path.read_text(encoding="utf-8"))
-    items = payload.get(key, payload) if isinstance(payload, dict) else payload
-    return items if isinstance(items, list) else []
+    # Older evidence files are bare arrays. Keep stop metadata on newer files.
+    if isinstance(payload, list):
+        return {"observations": payload}
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_observations_checkpoint")
+    return payload
 
 
 def first_target(rows: Iterable[dict[str, Any]], platform: str) -> str:
@@ -68,11 +70,21 @@ def first_target(rows: Iterable[dict[str, Any]], platform: str) -> str:
     return ""
 
 
-def has_healthy_capture(observations: Iterable[dict[str, Any]], target_key: str) -> bool:
-    return any(
-        reusable_capture(item, "xiaohongshu", target_key)
-        for item in observations
-    )
+def has_healthy_capture(observations: list[dict[str, Any]], target_key: str) -> bool:
+    last = next((item for item in reversed(observations) if item.get("platform") == "xiaohongshu"
+                 and str(item.get("target_key")) == target_key), None)
+    return reusable_capture(last, "xiaohongshu", target_key)
+
+
+def checkpoint_covers_workbook(source, checkpoint, requirements):
+    if checkpoint.get("stopped"):
+        return False
+    captures = unwrap_rows(checkpoint, "observations")
+    if not captures:
+        return False
+    existing = {str(item.get("target_key")): item for item in captures if item.get("platform") == "xiaohongshu"}
+    targets = targets_from_workbooks([str(source)])
+    return bool(targets) and not plan_targets(targets, existing, requirements)
 
 
 def discover_node_modules(explicit: str | None) -> str:
@@ -90,10 +102,8 @@ def discover_node_modules(explicit: str | None) -> str:
     raise RuntimeError("spreadsheet_runtime_not_found: pass --node-modules")
 
 
-def write_manifest(path: Path, source: Path, output: Path, report: Path, expected: Path) -> None:
-    payload = json.loads(report.read_text(encoding="utf-8"))
-    results = payload.get("results", [])
-    payout = validate_results(load_items(expected, "rows"), results)
+def write_manifest(path: Path, source: Path, output: Path, rows, results, workbook) -> None:
+    payout = validate_results(rows, results)
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("final_workbook_missing")
     counts = {label: 0 for label in ("成功", "失败", "待人审")}
@@ -110,8 +120,8 @@ def write_manifest(path: Path, source: Path, output: Path, report: Path, expecte
                 "failure": counts["失败"],
                 "manual_review": counts["待人审"],
                 "approved_amount": float(payout.quantize(Decimal("0.01"))),
-                "source_sha256": sha256(source.read_bytes()).hexdigest(),
-                "output_sha256": sha256(output.read_bytes()).hexdigest(),
+                "source_sha256": workbook["source_sha256"] if workbook else sha256(source.read_bytes()).hexdigest(),
+                "output_sha256": workbook["output_sha256"] if workbook else sha256(output.read_bytes()).hexdigest(),
             })
 
 
@@ -155,10 +165,12 @@ def main() -> int:
 
     try:
         return execute_job(args, source, expected, observations, report, output, previews, manifest)
-    except (subprocess.CalledProcessError, RuntimeError, OSError, ValueError) as exc:
+    except (subprocess.CalledProcessError, RuntimeError, OSError, ValueError, KeyError,
+            ArithmeticError, zipfile.BadZipFile, ET.ParseError) as exc:
         phase = "blocked" if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (2, 3) else "error"
-        checkpoint = json.loads(observations.read_text(encoding="utf-8")) if observations.exists() else {}
-        reason = checkpoint.get("stop_reason") or ("subprocess_failed" if isinstance(exc, subprocess.CalledProcessError) else str(exc))
+        reason = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError):
+            reason = read_checkpoint(observations).get("stop_reason") or "subprocess_failed"
         write_state(manifest, {"status": phase, "source": str(source), "source_sha256": source_hash,
                                "reason": reason, "checkpoint": str(observations)})
         print(f"[job] {phase}: {reason}; checkpoint retained", flush=True)
@@ -166,24 +178,15 @@ def main() -> int:
 
 
 def execute_job(args, source, expected, observations, report, output, previews, manifest) -> int:
-
-    convert = [
-        sys.executable,
-        str(SCRIPT_DIR / "table_to_expected.py"),
-        "--input", str(source), "--output", str(expected), "--all-sheets",
-    ]
-    for mapping in args.maps or DEFAULT_MAPS:
-        convert.extend(("--map", mapping))
-    if args.amount_rules:
-        convert.extend(("--amount-rules", args.amount_rules))
-    run(convert)
-
-    rows = load_items(expected, "rows")
+    rows = convert_xlsx_sheets(source, parse_maps(args.maps or []), parse_amount_rules(args.amount_rules),
+                               skip_summary=True)
+    write_state(expected, {"rows": rows})
     target = first_target(rows, "xiaohongshu")
     if not target:
         raise RuntimeError("no_xiaohongshu_target_found")
-    captures = load_items(observations, "observations")
-    checkpoint = json.loads(observations.read_text(encoding="utf-8")) if observations.exists() else {}
+    checkpoint = read_checkpoint(observations)
+    captures = unwrap_rows(checkpoint, "observations")
+    requirements = group_reply_requirements(rows)
     restoring_session = checkpoint.get("stopped") is True
     if restoring_session:
         row_targets = {str(row.get("target_key")) for row in rows}
@@ -193,19 +196,23 @@ def execute_job(args, source, expected, observations, report, output, previews, 
     capture_base = [
         sys.executable,
         str(SCRIPT_DIR / "xhs_batch_capture.py"),
-        "--input", str(source), "--output", str(observations),
+        "--input", str(source), "--output", str(observations), "--verify-replies", str(expected),
         "--profile", args.profile, "--expand-dom", "--headed",
     ]
     if not args.normal_pace:
         capture_base.append("--risk-averse")
     if args.wait_for_confirmation:
         capture_base.append("--wait-for-confirmation")
-    if restoring_session or not has_healthy_capture(captures, target):
+    last_canary = next((item for item in reversed(captures) if item.get("platform") == "xiaohongshu"
+                        and str(item.get("target_key")) == target), None)
+    if (restoring_session or not reusable_capture(last_canary, "xiaohongshu", target)
+            or needs_reply_recheck(requirements.get(target, []), last_canary)):
         canary = capture_base + ["--only-note-id", target]
         if restoring_session:
             canary.append("--refresh")
         run_capture(canary)
-        if not has_healthy_capture(load_items(observations, "observations"), target):
+        checkpoint = read_checkpoint(observations)
+        if not has_healthy_capture(unwrap_rows(checkpoint, "observations"), target):
             write_state(manifest, {"status": "blocked", "source": str(source),
                                    "source_sha256": sha256(source.read_bytes()).hexdigest(),
                                    "reason": "canary_incomplete", "checkpoint": str(observations)})
@@ -213,18 +220,15 @@ def execute_job(args, source, expected, observations, report, output, previews, 
             return 3
     else:
         print(f"[canary] resume-skip healthy target {target}", flush=True)
-    run_capture(capture_base)
+    if not checkpoint_covers_workbook(source, checkpoint, requirements):
+        run_capture(capture_base)
+        checkpoint = read_checkpoint(observations)
 
-    run([
-        sys.executable,
-        str(SCRIPT_DIR / "review_comments.py"),
-        "--expected", str(expected), "--observations", str(observations),
-        "--amount-mode", "expected-only", "--output", str(report),
-    ])
+    payload = compare(rows, unwrap_rows(checkpoint, "observations"), amount_mode="expected-only")
+    write_state(report, payload)
+    workbook = None
     if args.workbook_engine == "portable":
-        run([sys.executable, str(SCRIPT_DIR / "build_audited_workbook.py"),
-             "--source", str(source), "--expected", str(expected),
-             "--report", str(report), "--output", str(output)])
+        workbook = build_workbook(source, rows, payload["results"], output)
     else:
         node_modules = discover_node_modules(args.node_modules)
         env = os.environ.copy()
@@ -235,7 +239,7 @@ def execute_job(args, source, expected, observations, report, output, previews, 
             "--report", str(report), "--output", str(output),
             "--preview-dir", str(previews),
         ], env=env)
-    write_manifest(manifest, source, output, report, expected)
+    write_manifest(manifest, source, output, rows, payload["results"], workbook)
     print(manifest.read_text(encoding="utf-8"), end="")
     return 0
 

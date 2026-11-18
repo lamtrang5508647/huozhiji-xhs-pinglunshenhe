@@ -1,5 +1,5 @@
 """Public API; importing it does not open a browser or connect to a bot."""
 from .api import audit_workbook, convert_table, review
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __all__ = ["audit_workbook", "convert_table", "review", "__version__"]

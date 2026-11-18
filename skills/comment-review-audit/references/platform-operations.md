@@ -24,6 +24,7 @@ On Windows, read `windows-operations.md`: native `msvcrt` locks, protected direc
 - Xiaohongshu: a saved session file alone does not prove login. A visible `手机号登录`, `输入验证码`, `登录后推荐更懂你的笔记`, or `登录后查看更多评论` gate is `session_expired`.
 - Douyin: visible scan/code/password login gates are `session_expired`; visible security verification is `captcha`.
 - After login, run one known target. Confirm target identity, visible comments, capture count, completeness, and image handling before batch mode.
+- The Xiaohongshu job passes the converted task rows to `capture-xhs --verify-replies`. If a numbered reply is unresolved, inspect the visible comments panel on that same note and expand replies, even when the initial fetch is complete. Multiple rows share one page check. A fresh checkpoint can still need this check if the source requirements have changed. Preserve the page-check outcome and any unresolved reasons in the job evidence.
 
 ## Batch loop
 
@@ -45,7 +46,7 @@ Use navigate → observe → load comments → observe → checkpoint. Do not cl
 
 Xiaohongshu DOM text extraction reads `.content .note-text`, not the entire comment item's label text. The sibling `回复` and `.nickname` nodes are UI metadata. Do not regex-strip user-authored prose, including comments whose actual body starts with “回复”. Re-capture legacy affected observations with the structured extractor while keeping the original evidence; never silently rewrite their text.
 
-Retain image-only DOM comments even when their text is empty. A terminal marker must be visible to establish completeness; a hidden marker is insufficient. If any rendered comment cannot be parsed, mark the list incomplete and image detection incomplete, including when the displayed counter is stale. Parser revision `xhs-body-20261008-v3` applies these checks; older observations remain evidence but are not reusable by the current parser.
+Retain image-only DOM comments even when their text is empty. A terminal marker must be visible to establish completeness. If any rendered comment cannot be parsed, mark the list and image detection incomplete, including when the displayed counter is stale. Parser revision `xhs-replies-20261118-v4` also preserves direct parent IDs when provided. Records with unknown parentage omit the field. An older parser's observations remain available for offline review; a new live run collects fresh evidence.
 
 Douyin similarly reads the observed comment-body span (`.FduGc_lz > .Sh1Da424`) separately from sibling `.comment-item-tag` badges such as “作者赞过”. Preserve emoji-image `alt` text in the body, excluding avatars and labels. Recheck a real target when the DOM changes; never delete matching words from user-authored prose to remove a badge.
 

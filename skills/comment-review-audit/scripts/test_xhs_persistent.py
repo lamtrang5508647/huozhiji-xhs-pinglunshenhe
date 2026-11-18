@@ -32,6 +32,14 @@ def main():
             client.start()
             assert client.visited.endswith("/fixture")
             assert bool(added) is (not bool(stored))
+            original = "https://www.xiaohongshu.com/explore/n1?extra=a%2Bb&xsec_source=pc_share&xsec_token=fixture"
+            client.use_source_note("n1", original)
+            for _ in range(2):
+                client._goto("https://www.xiaohongshu.com/explore/n1?xsec_token=fixture&xsec_source=pc_feed")
+                assert client.visited == original
+            other = "https://www.xiaohongshu.com/explore/other"
+            client._goto(other)
+            assert client.visited == other
             client.close()
             client.fail = True
             try:

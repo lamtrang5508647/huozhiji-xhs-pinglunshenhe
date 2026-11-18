@@ -34,9 +34,44 @@ def has_image(item: Dict[str, Any]) -> bool:
     return bool(value)
 
 
-def normalize_comment(item: Dict[str, Any]) -> Dict[str, Any]:
+def clean_comment_id(value: Any) -> Optional[str]:
+    if type(value) not in (int, str):
+        return None
+    value = str(value).strip()
+    return value if value and value not in ("0", "-1") else None
+
+
+def deleted_placeholder(text: str) -> bool:
+    return text.strip().strip("[]【】") in ("原评论已删除", "该评论已删除", "评论已被删除", "该评论已被删除")
+
+
+def add_reply_relation(result: Dict[str, Any], raw: Dict[str, Any], *, root_list: bool) -> None:
+    direct_keys = ("parent_comment_id", "parentCommentId", "target_comment_id", "targetCommentId")
+    object_keys = ("target_comment", "targetComment", "parent_comment", "parentComment")
+    identifiers = set()
+    for key in direct_keys:
+        identifier = clean_comment_id(raw.get(key))
+        if identifier:
+            identifiers.add(identifier)
+    for key in object_keys:
+        target = raw.get(key)
+        if isinstance(target, dict):
+            identifier = clean_comment_id(first_value(target, ("id", "comment_id", "commentId", "cid")))
+            if identifier:
+                identifiers.add(identifier)
+    if len(identifiers) == 1 and result.get("comment_id") not in identifiers:
+        result["parent_comment_id"] = identifiers.pop()
+    elif not identifiers and root_list:
+        # Only classify the outer list of a known note-comments response as
+        # roots. A root/thread hint or unidentifiable target may mark a reply.
+        hints = (*direct_keys, *object_keys, "root_comment_id", "rootCommentId")
+        if not any(raw.get(key) not in (None, "", {}, 0, "0") for key in hints):
+            result["parent_comment_id"] = None
+
+
+def normalize_comment(item: Dict[str, Any], *, root_list: bool = False) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
-    comment_id = first_value(item, ("comment_id", "commentId", "id", "cid"))
+    comment_id = clean_comment_id(first_value(item, ("comment_id", "commentId", "id", "cid")))
     text = text_value(first_value(item, ("text", "content", "comment_text", "commentText", "desc")))
     if comment_id is not None:
         result["comment_id"] = str(comment_id)
@@ -46,21 +81,31 @@ def normalize_comment(item: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(observed_amount, (str, int, float)) and not isinstance(observed_amount, bool):
         result["observed_amount"] = observed_amount
         result["amount_source"] = "field"
+    add_reply_relation(result, item, root_list=root_list)
+    if deleted_placeholder(text) or item.get("is_deleted") is True or item.get("isDeleted") is True:
+        result.update(text="", has_image=False, deleted=True)
     return result
 
 
-def flatten_comments(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Flatten top-level comments and visible reply trees without leaking user payloads."""
-    flattened: List[Dict[str, Any]] = []
+def _walk_comments(items: Iterable[Dict[str, Any]], outer=True):
     for item in items:
         if not isinstance(item, dict):
             continue
-        flattened.append(item)
+        yield item, outer
         for key in ("subComments", "sub_comments", "replies", "children"):
             nested = item.get(key)
             if isinstance(nested, list):
-                flattened.extend(flatten_comments(nested))
-    return flattened
+                yield from _walk_comments(nested, False)
+
+
+def flatten_comments(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [item for item, _ in _walk_comments(items)]
+
+
+def normalized_comments(items: Iterable[Dict[str, Any]], *, root_list: bool = False) -> List[Dict[str, Any]]:
+    """Normalize a note's comments while retaining only confirmed immediate reply targets."""
+    # A nested list can contain replies to other replies within the same thread.
+    return [normalize_comment(item, root_list=root_list and outer) for item, outer in _walk_comments(items)]
 
 
 def find_comments(value: Any) -> Optional[List[Dict[str, Any]]]:
@@ -185,7 +230,8 @@ def capture(note_id: str, timeout: float, evidence_path: Optional[str] = None) -
         "target_key": note_id,
         "capture_status": "ok",
         "capture_complete": not has_more(payload),
-        "comments": [normalize_comment(item) for item in flatten_comments(raw_comments)],
+        "comments": normalized_comments(raw_comments, root_list=isinstance(payload, dict)
+                                        and payload.get("comments") is raw_comments),
     }
     if evidence_path:
         result["evidence_path"] = evidence_path

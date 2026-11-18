@@ -8,7 +8,7 @@ import json
 import re
 import sys
 import unicodedata
-from collections import deque
+from collections import Counter, deque
 from decimal import Decimal, InvalidOperation
 from functools import cached_property
 from pathlib import Path
@@ -198,8 +198,14 @@ def prepare_observation(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def compact_comment(comment: Dict[str, Any]) -> Dict[str, Any]:
-    keys = ("comment_id", "dom_index", "text", "comment_type", "has_image", "observed_amount", "amount_source", "evidence_path")
-    return {key: comment[key] for key in keys if key in comment}
+    keys = ("comment_id", "dom_index", "text", "comment_type", "has_image", "observed_amount", "amount_source",
+            "evidence_path", "parent_comment_id", "parent_text")
+    record = {key: comment[key] for key in keys if key in comment}
+    if "text" not in record and "comment_text" in comment:
+        record["text"] = comment["comment_text"]
+    if type(comment.get("thread_root_deleted")) is bool:
+        record["thread_root_deleted"] = comment["thread_root_deleted"]
+    return record
 
 
 def format_amount(value: Optional[Decimal]) -> Optional[str]:
@@ -208,6 +214,140 @@ def format_amount(value: Optional[Decimal]) -> Optional[str]:
 
 def _observed_type(comment: Dict[str, Any]) -> Optional[str]:
     return infer_type({**comment, "comment_text": comment.get("text", "")})
+
+
+_REPLY_DIRECTIVE = re.compile(r"(?:第[一二三四五六七八九十0-9]+条)?回复(?:第([一二三四五六七八九十0-9]+)条|图片)?")
+
+
+def _reply_number(value):
+    """None is an ordinary source note; zero is a directive without a resolvable number."""
+    if not value:
+        return None
+    match = _REPLY_DIRECTIVE.fullmatch(unicodedata.normalize("NFKC", str(value)).strip())
+    if not match:
+        return None
+    number = match[1] or ""
+    if number.isdecimal() and len(number) <= 6:
+        return int(number)
+    digits = "一二三四五六七八九"
+    if number and len(number) == 1 and number in digits:
+        return 1 + digits.index(number)
+    chinese = re.fullmatch(r"([一二三四五六七八九]?)十([一二三四五六七八九]?)", number)
+    if chinese:
+        tens = digits.index(chinese[1]) + 1 if chinese[1] else 1
+        ones = digits.index(chinese[2]) + 1 if chinese[2] else 0
+        return tens * 10 + ones
+    return 0
+
+
+def _reply_parents(rows):
+    """Resolve worksheet ordinals inside one platform, target and source block."""
+    numbers = {i: n for i, row in enumerate(rows) if (n := _reply_number(row.get("reply_to"))) is not None}
+    if not numbers:
+        return {}
+
+    def group(row):
+        return platform_key(row), target_key(row), str(row.get("source_file") or ""), str(row.get("source_sheet") or "")
+
+    groups = {group(rows[i]): [] for i in numbers}
+    for i, row in enumerate(rows):
+        group_rows = groups.get(group(row))
+        if group_rows is not None:
+            group_rows.append(i)
+    parents = dict.fromkeys(numbers)
+    for indices in groups.values():
+        positions = [rows[i].get("source_row") for i in indices]
+        if any(n is not None for n in positions):
+            if not all(type(n) is int for n in positions):
+                continue
+            indices = sorted(indices, key=lambda i: rows[i]["source_row"])
+            if sorted(positions) != list(range(min(positions), min(positions) + len(positions))):
+                # A repeated link in another block has its own ordinals.
+                continue
+        roots = [i for i in indices if i not in numbers]
+        bodies = {i: normalize_text(rows[i].get("comment_text")) for i in indices}
+        body_counts = Counter(bodies.values())
+        for position, i in enumerate(indices):
+            n = numbers.get(i, 0)
+            if not 1 <= n <= len(indices):
+                continue
+            candidate = indices[n - 1]
+            if candidate in numbers:
+                continue
+            if n <= len(roots):
+                if roots[n - 1] != candidate:
+                    continue  # Both numbering conventions are possible but disagree.
+            elif n > position:
+                continue  # Only use an all-row ordinal alone for an earlier parent.
+            body = bodies[candidate]
+            if body_counts[body] == 1:
+                parents[i] = body
+    return parents
+
+
+def _reply_page_check(captures):
+    """The last recorded same-target page attempt, or the latest explicit non-attempt."""
+    selected = None
+    for capture in reversed(captures):
+        marker = capture.get("reply_verification")
+        if not isinstance(marker, dict) or type(marker.get("page_attempted")) is not bool:
+            continue
+        if selected is None or marker["page_attempted"]:
+            selected = capture, marker
+        if marker["page_attempted"]:
+            break
+    audit = {"scope":"target", "page_attempted":None, "panel_available":None, "status":"not_recorded"}
+    if selected:
+        capture, marker = selected
+        audit.update(page_attempted=marker["page_attempted"], panel_available=marker.get("panel_available"),
+                     status=marker.get("status") or "recorded")
+        for field in ("attempt_count", "structured_read", "unconfirmed_before", "unconfirmed_after"):
+            if field in marker:
+                audit[field] = marker[field]
+        if capture.get("captured_at"):
+            audit["captured_at"] = capture["captured_at"]
+    return audit
+
+
+def _identifier(value):
+    return str(value).strip() if type(value) in (str, int) else ""
+
+
+def _matching_replies(evidence, parent_text, candidates):
+    if not parent_text or not candidates:
+        return []
+    parents = []
+    nested_ids = set()
+    for record in evidence.by_text.get(parent_text, []):
+        if _identifier(record.get("parent_comment_id")) or normalize_text(record.get("parent_text")):
+            nested_ids.add(_identifier(record.get("comment_id")))
+        else:
+            parents.append(record)
+    identities = {_identifier(p.get("comment_id")) or id(p) for p in parents}
+    if len(identities) != 1:
+        return []
+    parent_id = _identifier(parents[0].get("comment_id"))
+    if parent_id and parent_id in nested_ids:
+        return []  # Contradictory placement for the same observed parent.
+    parent_records = {id(p) for p in parents}
+    captures_with_parent = {id(evidence.source(p)) for p in parents}
+    replies = []
+    for comment in candidates:
+        if id(evidence.source(comment)) not in captures_with_parent or id(comment) in parent_records:
+            continue
+        direct_id = _identifier(comment.get("parent_comment_id"))
+        direct_text = normalize_text(comment.get("parent_text"))
+        if "parent_comment_id" in comment and not direct_id:
+            continue  # Explicitly top-level, or unusable identifier.
+        if direct_id and direct_id != parent_id:
+            continue
+        if direct_text and direct_text != parent_text:
+            continue
+        if parent_id and _identifier(comment.get("comment_id")) == parent_id:
+            continue
+        if (direct_id and direct_id == parent_id) or (direct_text and direct_text == parent_text):
+            replies.append(comment)
+    return replies
 
 
 class _TargetEvidence:
@@ -393,10 +533,14 @@ def compare(
 
     results: List[Dict[str, Any]] = []
     settlement_claims = {}
+    reply_parents = _reply_parents(expected_rows)
+    reply_checks = {}
     for index, expected in enumerate(expected_rows):
         key = (platform_key(expected), target_key(expected))
         # Release large text indexes after the last row for their target.
         evidence = by_target.get(key)
+        if index in reply_parents and key not in reply_checks:
+            reply_checks[key] = _reply_page_check(evidence.captures if evidence else [])
         if evidence is not None and index == evidence.last_row_index:
             del by_target[key]
         result: Dict[str, Any] = {
@@ -450,6 +594,20 @@ def compare(
         image_detection_incomplete = evidence.image_detection_incomplete
         match_mode = str(expected.get("text_match", "exact")).strip().casefold()
         same_text = evidence.matching(expected_text, match_mode)
+        constrained_reply = index in reply_parents
+        reply_images = []
+        if constrained_reply:
+            parent_text = reply_parents[index]
+            possible = same_text if expected_text else evidence.by_type.get(expected_type, [])
+            same_text = _matching_replies(evidence, parent_text, possible)
+            if not same_text and expected_type == "text+image":
+                reply_images = _matching_replies(evidence, parent_text, evidence.image_only)
+            if not same_text and not reply_images:
+                result["reason_codes"].append("reply_parent_unconfirmed" if parent_text else "reply_source_parent_ambiguous")
+                if possible:
+                    result["candidates"] = [compact_comment(c) for c in possible]
+                results.append(result)
+                continue
         if expected_type == "text+image":
             text_with_image = [comment for comment in same_text if image_signal(comment) is True]
             if same_text and not text_with_image:
@@ -480,7 +638,7 @@ def compare(
                 results.append(result)
                 continue
             if not same_text:
-                image_only = evidence.image_only
+                image_only = reply_images if constrained_reply else evidence.image_only
                 combo_count = combo_rows_by_target.get(key, 0)
                 if len(image_only) == 1 and combo_count == 1:
                     if not complete:
@@ -510,7 +668,7 @@ def compare(
                     result["reason_codes"].append("comment_image_presence_unknown")
                     results.append(result)
                     continue
-        if expected_text:
+        if expected_text or constrained_reply:
             same_type = [comment for comment in same_text if _observed_type(comment) == expected_type]
         else:
             same_type = evidence.by_type.get(expected_type, [])
@@ -607,6 +765,29 @@ def compare(
             result["approved_amount"] = None
 
     _check_settlement_claims(results, settlement_claims, amount_mode, allow_duplicates)
+    for index, parent in reply_parents.items():
+        result = results[index]
+        if result["triage"] == "待人审":
+            reasons = result["reason_codes"]
+            if not parent and "reply_source_parent_ambiguous" not in reasons:
+                reasons.append("reply_source_parent_ambiguous")
+            key = result["platform"], result["target_key"]
+            primary = next((reason for reason in reasons if reason in ("reply_parent_unconfirmed", "reply_source_parent_ambiguous")),
+                           reasons[0])
+            check = {**reply_checks[key], "source_parent_resolved": bool(parent), "reason": primary}
+            candidates = result.get("candidates", [])
+            if not candidates and "matched_comment" in result:
+                candidates = [result["matched_comment"]]
+            expected = expected_rows[index]
+            if has_text(expected.get("comment_text", "")):
+                deleted_matches = sum(c.get("thread_root_deleted") is True and text_matches(expected, c)
+                                      for c in candidates)
+                if deleted_matches:
+                    # A thread root and a direct parent can be different comments.
+                    reasons.append("reply_thread_root_deleted")
+                    check["matching_candidates_with_deleted_root"] = deleted_matches
+            check["reason_codes"] = list(reasons)
+            result["reply_verification"] = check
     statuses = ("verified", "not_found", "mismatch", "partial_text", "partial_image", "needs_review", "blocked")
     counts = {status: sum(1 for item in results if item["status"] == status) for status in statuses}
     triage_counts = {

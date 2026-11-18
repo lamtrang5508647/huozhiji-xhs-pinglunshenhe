@@ -31,7 +31,9 @@ def package(output: Path) -> None:
                 entry = zipfile.ZipInfo(name)
                 entry.create_system = 3
                 entry.external_attr = 0o100644 << 16
-                archive.writestr(entry, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+                # The package contains only UTF-8 text; normalize Git checkout line endings.
+                content = path.read_text(encoding="utf-8").encode("utf-8")
+                archive.writestr(entry, content, compress_type=zipfile.ZIP_DEFLATED)
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)

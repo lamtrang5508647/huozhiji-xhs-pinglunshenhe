@@ -91,6 +91,12 @@ Comment fields:
 - `observed_amount`: optional OCR/manual amount visible in the comment.
 - `amount_source`: `field`, `text_auto`, `ocr`, or `manual`.
 - `evidence_path`: absolute local evidence path.
+- `parent_comment_id`: ID of the directly replied-to comment when supplied by the platform. Explicit null denotes a known top-level comment. Omit the field when the relationship is unknown.
+- `parent_text`: optional direct-parent text from a trusted capture. The matcher checks its consistency with identifiers and the uniquely observed parent in the same capture.
+
+For a numbered reply directive (such as `回复第2条`), resolve the intended parent within the same source sheet and target. Some sheets count all rows and others count only primary comments. A source reference with no unique supported reading gets `reply_source_parent_ambiguous`. When the parent is identifiable but its direct relationship to the observed reply is unconfirmed, use `reply_parent_unconfirmed`. Both leave the amount blank. Pending reply rows expose target-level `reply_verification` information, including whether a page check was recorded and whether the comments panel was available. A matching text under a deleted parent or within the same thread alone cannot establish the required direct relationship.
+
+A candidate with `thread_root_deleted: true` was visible in a group whose root displayed a deletion notice. Pending rows with such a matching candidate retain the fact `reply_thread_root_deleted`. This observation does not reconstruct the original text of the deleted root.
 
 `image_detection_complete: false` means at least one comment image state could not be established. Image-dependent expectations become `待人审`, not a negative match.
 

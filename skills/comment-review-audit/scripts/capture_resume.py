@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 # Bump the relevant revision when comment extraction or completeness changes.
-PARSER_REVISIONS = {'xiaohongshu':'xhs-body-20261008-v3', 'douyin':'dy-body-20260930-v2'}
+PARSER_REVISIONS = {'xiaohongshu':'xhs-replies-20261118-v4', 'douyin':'dy-body-20260930-v2'}
 
 def reusable_capture(item, platform, key, *, now=None):
     if not isinstance(item, dict):

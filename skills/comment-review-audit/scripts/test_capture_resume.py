@@ -35,10 +35,16 @@ def main():
              patch('sys.argv',['capture','--expected','fixture.json','--output',str(checkpoint)]):
             assert dy.main()==0
         xhs_good={**good,'platform':'xiaohongshu','parser_revision':PARSER_REVISIONS['xiaohongshu']}
-        checkpoint.write_text(json.dumps({'observations':[xhs_good]}))
         with patch.object(xhs,'targets_from_workbooks',return_value=[{'note_id':'a'}]), \
              patch.object(xhs,'load_xhs_modules',side_effect=AssertionError('browser should not open')):
-            assert xhs.main(['--input','fixture.xlsx','--output',str(checkpoint)])==0
+            for original in ({'observations':[xhs_good]}, [good, xhs_good]):
+                checkpoint.write_text(json.dumps(original))
+                assert xhs.main(['--input','fixture.xlsx','--output',str(checkpoint)])==0
+                assert json.loads(checkpoint.read_text()) == original
+        others = [good, {**xhs_good,'target_key':'b'}, {**xhs_good,'target_key':'b'}]
+        last = {**xhs_good,'captured_comment_count':2}
+        previous = {'a':xhs_good,'b':others[-1]}
+        assert xhs.saved_observations([*others,xhs_good], previous, {**previous,'a':last}) == [*others,last]
     print('capture resume tests passed')
 
 if __name__=='__main__': main()

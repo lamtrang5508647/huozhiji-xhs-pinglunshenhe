@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Type
+from urllib.parse import urlsplit
 
 from profile_lock import ProfileLock
 from browser_environment import find_chrome
@@ -23,6 +24,19 @@ def persistent_client(
     profile_path = Path(profile).expanduser().resolve()
 
     class PersistentClient(base_class):
+        def use_source_note(self, note_id, url):
+            # Used only in memory. The source URL may carry private share parameters.
+            self._audit_note_id = note_id
+            self._audit_source_url = url
+
+        def _goto(self, url, **kwargs):
+            parsed = urlsplit(url)
+            note_id = getattr(self, "_audit_note_id", None)
+            if (note_id and self._audit_source_url and parsed.scheme == "https"
+                    and parsed.hostname == "www.xiaohongshu.com" and parsed.path == f"/explore/{note_id}"):
+                url = self._audit_source_url
+            return super()._goto(url, **kwargs)
+
         def start(self) -> None:
             from playwright.sync_api import sync_playwright
 

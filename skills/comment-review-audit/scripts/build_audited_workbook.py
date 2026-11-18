@@ -48,7 +48,8 @@ def encode(root, original=b""):
     for prefix, uri in namespaces.items():
         if not re.fullmatch(r"ns\d+", prefix):
             ET.register_namespace(prefix, uri)
-    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    # Serialize XML into a string buffer, then encode each complete part once.
+    data = ET.tostring(root, encoding="unicode", xml_declaration=True).encode("utf-8")
     first_end = data.index(b">", data.index(b"?>") + 2)
     first = data[:first_end]
     missing = []
@@ -114,9 +115,19 @@ def set_cell(data, address, value, *, style=None, formula=None, row_index=None):
             row_index[row_key] = row
     cell_tag = tag("c")
     existing = next((item for item in row if item.tag == cell_tag and item.get("r") == address), None)
+    if style is None and existing is not None:
+        style = existing.get("s") or None
+    cell = make_cell(address, value, style=style, formula=formula)
+    if existing is not None:
+        row.remove(existing)
+    target_column = col_index(address)
+    index = next((i for i, item in enumerate(row) if item.tag == cell_tag and col_index(item.get("r")) > target_column), len(row))
+    row.insert(index, cell)
+    return cell
+
+
+def make_cell(address, value, *, style=None, formula=None):
     attrs = {"r": address}
-    if existing is not None and existing.get("s"):
-        attrs["s"] = existing.get("s")
     if style is not None:
         attrs["s"] = str(style)
     cell = ET.Element(tag("c"), attrs)
@@ -133,11 +144,6 @@ def set_cell(data, address, value, *, style=None, formula=None, row_index=None):
             node = ET.SubElement(ET.SubElement(cell, tag("is")), tag("t"))
             node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
             node.text = str(value)
-    if existing is not None:
-        row.remove(existing)
-    target_column = col_index(address)
-    index = next((i for i, item in enumerate(row) if item.tag == cell_tag and col_index(item.get("r")) > target_column), len(row))
-    row.insert(index, cell)
     return cell
 
 
@@ -306,16 +312,20 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     for index, header in enumerate(("案例ID", "团长", "产品名", "工作表", "原行", "要求类型", "结果分类", "分流", "核定金额"), 16):
         write_cell(f"{column(index)}11", header, style=styles["detail"])
     counts = Counter(item["triage"] for item in results)
+    # Detail rows follow the fixed headers and their cells arrive in P:X order.
     for number, item in enumerate(rows, 12):
         result = by_id[item["case_id"]]
         key = (str(item.get("group_leader") or "未填写").strip(), str(item.get("product_name") or item["source_sheet"]).strip())
+        detail_row = ET.SubElement(data, tag("row"), {"r": str(number)})
         for index, value in enumerate((item["case_id"], *key, item["source_sheet"], item["source_row"], item["comment_type"]), 16):
-            write_cell(f"{column(index)}{number}", value, style=styles["body"])
+            detail_row.append(make_cell(f"{column(index)}{number}", value, style=styles["body"]))
         quoted = "'" + item["source_sheet"].replace("'", "''") + "'"
-        write_cell(f"V{number}", result["result_category"], formula=f"{quoted}!G{item['source_row']}", style=styles["body"])
-        write_cell(f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),ISNUMBER({quoted}!H{item["source_row"]}))),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"])
+        detail_row.append(make_cell(f"V{number}", result["result_category"], formula=f"{quoted}!G{item['source_row']}", style=styles["body"]))
+        detail_row.append(make_cell(f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),ISNUMBER({quoted}!H{item["source_row"]}))),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"]))
         amount = result.get("approved_amount")
-        write_cell(f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=f'IF(ISNUMBER({quoted}!H{item["source_row"]}),{quoted}!H{item["source_row"]},"")', style=styles["money"])
+        detail_row.append(make_cell(f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=f'IF(ISNUMBER({quoted}!H{item["source_row"]}),{quoted}!H{item["source_row"]},"")', style=styles["money"]))
+    # Large group tables may reach the detail rows from the left.
+    write_cell = sheet_cell_writer(data)
     new_row_numbers = {}
     for number, (key, members) in enumerate(groups.items(), 2):
         new_row_numbers[key] = number - 1

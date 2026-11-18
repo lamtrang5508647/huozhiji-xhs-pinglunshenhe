@@ -49,14 +49,15 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
    - Use the visible login helpers and allow the user enough time to scan. Do not repeatedly open login windows.
    - Persisted Chrome cookies take precedence over older CLI cookie files. After owner verification, use the same profile; do not overwrite its refreshed session.
 4. Run exactly one canary target first. Continue only when it returns `capture_status: ok`, the target identity is correct, comments are visible, and the completeness/image signals are credible.
-   - Xiaohongshu: `xhs_batch_capture.py --headed --expand-dom --only-note-id ...`
+   - Xiaohongshu: `xhs_batch_capture.py --headed --expand-dom --verify-replies /path/expected.json --only-note-id ...`. The one-command XLSX runner supplies the requirements automatically.
    - Douyin: `douyin_batch_capture.py --only-target-key ...`
 5. Capture the remaining unique targets serially. The standard runner uses its low-risk profile by default: a quiet session-settle wait, three slow warm-up targets, 12–18 second target intervals, at least 4 seconds of rest, 60–90 second breaks every eight targets, and one extra same-page DOM expansion for an incomplete first pass. It is designed to reduce risk controls and incomplete captures without changing accounts, networks, or login state. `--normal-pace` is an explicit legacy opt-out only when the owner approves the trade-off.
    - Xiaohongshu legacy target interval: 6–10 seconds; 25–45 second break every 12 processed targets. Use `--risk-averse` for the default low-risk profile described above.
    - Douyin target interval: 5–8 seconds; 20–35 second break every 10 processed targets.
    - A scheduled long break replaces the ordinary target pause, and the final target never sleeps after checkpointing. Use `--pace-mode fixed` only when slower legacy pacing is required.
    - Both adapters checkpoint after every target and automatically resume only complete, healthy evidence from the same parser revision captured within 24 hours. Incomplete captures and unknown image states are never skipped by `--skip-existing-ok` (now a compatibility flag). Use a separate work directory for a new audit, or `--refresh` for an explicit fresh recheck. If every selected target is reusable, return without opening Chrome; filtering completed targets before pacing also avoids idle waits at the tail.
-6. Merge observations and run the deterministic comparator. For table-defined payout amounts, use `--amount-mode expected-only`. Do not enable `--allow-duplicates` by default; duplicate exact candidates require review.
+6. For a live Xiaohongshu audit, collect same-note evidence for unresolved numbered replies, even if the initial comment count was complete. Expand visible replies, then inspect the direct-parent match and the recorded page-check outcome. If a task remains pending, report whether its source numbering or its platform evidence is unresolved.
+   Merge observations and run the deterministic comparator. For table-defined payout amounts, use `--amount-mode expected-only`. Do not enable `--allow-duplicates` by default; duplicate exact candidates require review.
 
    ```bash
    python3 scripts/review_comments.py \
