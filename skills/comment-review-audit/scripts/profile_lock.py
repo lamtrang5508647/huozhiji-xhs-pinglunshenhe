@@ -38,8 +38,9 @@ def prepare_profile(profile: Path) -> None:
     # directory's DACL; never change a parent directory or delete Chrome locks.
     script = """
 try {
-# Preserve the directory's existing owner/group while replacing its access rules.
-$acl = Get-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY
+# Read and persist only the DACL. Updating it does not require audit privileges.
+$directory = [System.IO.DirectoryInfo]::new($env:HUOZHIJI_PROFILE_DIRECTORY)
+$acl = $directory.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
 $acl.SetAccessRuleProtection($true, $false)
 foreach ($existing in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($existing) }
 $ids = @([System.Security.Principal.WindowsIdentity]::GetCurrent().User,
@@ -53,7 +54,7 @@ foreach ($id in $ids) {
     [System.Security.AccessControl.AccessControlType]::Allow)
   $acl.AddAccessRule($rule)
 }
-Set-Acl -LiteralPath $env:HUOZHIJI_PROFILE_DIRECTORY -AclObject $acl
+$directory.SetAccessControl($acl)
 } catch {
   # Fixed error identifiers only: no user paths, account SIDs or raw messages.
   [Console]::Error.WriteLine($_.Exception.GetType().Name)
