@@ -49,6 +49,7 @@ def add_reply_relation(result: Dict[str, Any], raw: Dict[str, Any], *, root_list
     direct_keys = ("parent_comment_id", "parentCommentId", "target_comment_id", "targetCommentId")
     object_keys = ("target_comment", "targetComment", "parent_comment", "parentComment")
     identifiers = set()
+    parent_bodies = set()
     for key in direct_keys:
         identifier = clean_comment_id(raw.get(key))
         if identifier:
@@ -59,9 +60,22 @@ def add_reply_relation(result: Dict[str, Any], raw: Dict[str, Any], *, root_list
             identifier = clean_comment_id(first_value(target, ("id", "comment_id", "commentId", "cid")))
             if identifier:
                 identifiers.add(identifier)
-    if len(identifiers) == 1 and result.get("comment_id") not in identifiers:
+            if target.get("is_deleted") is True or target.get("isDeleted") is True:
+                return
+            for field in ("text", "content", "comment_text", "commentText"):
+                body = target.get(field)
+                if isinstance(body, str) and body.strip():
+                    if deleted_placeholder(body):
+                        return
+                    parent_bodies.add(body.strip())
+    if len(identifiers) > 1 or result.get("comment_id") in identifiers or len(parent_bodies) > 1:
+        return
+    if parent_bodies:
+        # A direct target object can explicitly quote the parent without exposing its ID.
+        result["parent_text"] = parent_bodies.pop()
+    if identifiers:
         result["parent_comment_id"] = identifiers.pop()
-    elif not identifiers and root_list:
+    elif root_list:
         # Only classify the outer list of a known note-comments response as
         # roots. A root/thread hint or unidentifiable target may mark a reply.
         hints = (*direct_keys, *object_keys, "root_comment_id", "rootCommentId")
@@ -130,15 +144,34 @@ def find_comments(value: Any) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+PAGE_FLAGS = ("has_more", "hasMore", "more", "has_next", "hasNext")
+REPLY_FLAGS = ("sub_comment_has_more", "subCommentHasMore", "has_more_sub_comments", "hasMoreSubComments")
+
+
 def has_more(value: Any) -> bool:
     if isinstance(value, dict):
-        for key in ("has_more", "hasMore", "more", "has_next", "hasNext"):
-            if value.get(key) is True:
+        for key in (*PAGE_FLAGS, *REPLY_FLAGS):
+            if str(value.get(key)).lower() in ("true", "1"):
+                return True
+        count = first_value(value, ("sub_comment_count", "subCommentCount", "reply_count", "replyCount"))
+        if str(count).isdigit() and int(count) > 0:
+            children = first_value(value, ("subComments", "sub_comments", "replies", "children"))
+            if not isinstance(children, list) or len(children) < int(count):
                 return True
         return any(has_more(nested) for nested in value.values())
     if isinstance(value, list):
         return any(has_more(nested) for nested in value)
     return False
+
+
+def comments_exhausted(payload, comments):
+    """A bare list or missing pagination fields cannot establish a negative."""
+    if not isinstance(payload, dict):
+        return False
+    if any(payload.get(k) is comments for k in ("comments", "comment_list", "commentList", "commentData")):
+        return (any(str(payload.get(k)).lower() in ("false", "0") for k in PAGE_FLAGS)
+                and not has_more(payload))
+    return any(comments_exhausted(value, comments) for value in payload.values() if isinstance(value, dict))
 
 
 def decode_json_output(stdout: str) -> Any:
@@ -229,12 +262,14 @@ def capture(note_id: str, timeout: float, evidence_path: Optional[str] = None) -
         "platform": "xiaohongshu",
         "target_key": note_id,
         "capture_status": "ok",
-        "capture_complete": not has_more(payload),
+        "capture_complete": comments_exhausted(payload, raw_comments),
         "comments": normalized_comments(raw_comments, root_list=isinstance(payload, dict)
                                         and payload.get("comments") is raw_comments),
     }
     if evidence_path:
         result["evidence_path"] = evidence_path
+    if result["capture_complete"]:
+        result["capture_complete_source"] = "explicit_comment_pagination_end"
     if not result["capture_complete"]:
         result["warnings"] = ["comments_pagination_incomplete"]
     return result

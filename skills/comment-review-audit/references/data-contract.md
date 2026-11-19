@@ -81,7 +81,7 @@ Sanitized URLs are identifiers only. Live navigation must recover the original c
 }
 ```
 
-`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. `capture_complete: true` means the comment list reached an authoritative terminal or its declared count. An empty list proves absence only when capture is healthy and complete.
+`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, no outstanding reply controls and no extraction gaps. The badge count alone cannot establish absence. A v0.4.1 observation marked `xhs-replies-20261118-v4` can support a positive match. A new live capture is required to confirm missing comments when that old marker is the only indication of completeness.
 
 Comment fields:
 
@@ -97,6 +97,10 @@ Comment fields:
 For a numbered reply directive (such as `回复第2条`), resolve the intended parent within the same source sheet and target. Some sheets count all rows and others count only primary comments. A source reference with no unique supported reading gets `reply_source_parent_ambiguous`. When the parent is identifiable but its direct relationship to the observed reply is unconfirmed, use `reply_parent_unconfirmed`. Both leave the amount blank. Pending reply rows expose target-level `reply_verification` information, including whether a page check was recorded and whether the comments panel was available. A matching text under a deleted parent or within the same thread alone cannot establish the required direct relationship.
 
 A candidate with `thread_root_deleted: true` was visible in a group whose root displayed a deletion notice. Pending rows with such a matching candidate retain the fact `reply_thread_root_deleted`. This observation does not reconstruct the original text of the deleted root.
+
+`parent_evidence: "single_visible_reply_under_root"` records a relationship inferred from the fully displayed page. The standard reply group contained one intact root and one visible reply, with no competing addressee, pending expansion or conflicting relationship. The report preserves the displayed root text. A platform-supplied direct parent ID, when available, is a separate piece of evidence.
+
+Use the optional positive integer `task_ordinal` for a template that explicitly numbers its tasks or comments. Localized headers include `任务序号` and `评论序号`. If the owner defines another column as that numbering, pass e.g. `--map task_ordinal=账号`. The target number must identify a unique top-level task in the same contiguous source block. The published reply still needs corresponding platform evidence.
 
 `image_detection_complete: false` means at least one comment image state could not be established. Image-dependent expectations become `待人审`, not a negative match.
 

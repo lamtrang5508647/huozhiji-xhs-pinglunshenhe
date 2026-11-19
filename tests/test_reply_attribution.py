@@ -45,6 +45,32 @@ class ReplyAttributionTests(unittest.TestCase):
             for field in relation:
                 self.assertIn(field, row["matched_comment"])
 
+    def test_single_visible_reply_retains_page_basis_and_checks_its_prerequisites(self):
+        basis = "single_visible_reply_under_root"
+        displayed = comment("c", "reply text", parent_text="root text", parent_evidence=basis)
+        rows = [self.root, self.reply]
+        matched = audit(rows, [self.parent, displayed])["a"]["matched_comment"]
+        self.assertEqual((matched["parent_evidence"], matched["parent_text"]), (basis, "root text"))
+        self.assertNotIn("parent_comment_id", matched)
+        for candidate in (dict(displayed, parent_text=""), dict(displayed, parent_text="other root"),
+                          dict(displayed, thread_root_deleted=True)):
+            row = audit(rows, [self.parent, candidate])["a"]
+            self.assertEqual(row["triage"], "待人审")
+            self.assertEqual(row["candidates"][0]["parent_evidence"], basis)
+        base = dict(platform="xiaohongshu", target_key="note", capture_complete=False, capture_status="ok")
+        partial = dict(base, comments=[self.parent, displayed])
+        row = review(rows, [partial])["results"][1]
+        self.assertIn("reply_parent_unconfirmed", row["reason_codes"])
+        direct = dict(base, comments=[self.parent, comment("c", "reply text", parent_comment_id="root")])
+        row = review(rows, [direct])["results"][1]
+        self.assertEqual(row["status"], "verified")
+        self.assertNotIn("parent_evidence", row["matched_comment"])
+        earlier = dict(base, capture_complete=True, comments=[
+            dict(self.parent), comment("c", "reply text", parent_text="root text")])
+        later = dict(base, capture_complete=True, comments=[dict(self.parent), displayed])
+        row = review(rows, [earlier, later])["results"][1]
+        self.assertEqual(row["matched_comment"]["parent_evidence"], basis)
+
     def test_missing_or_ambiguous_parent_is_manual(self):
         matched = comment("c", "reply text", parent_comment_id="root")
         competing = comment("second", "root text")

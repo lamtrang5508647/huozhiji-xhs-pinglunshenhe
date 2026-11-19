@@ -12,14 +12,14 @@ import re
 import sys
 import time
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree as ET
 
-from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, deleted_placeholder, has_more, normalized_comments
+from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, deleted_placeholder, flatten_comments, has_more, normalize_comment, normalized_comments
 from capture_pacing import has_remaining_target, pause_seconds
 from capture_resume import pending_targets, PARSER_REVISIONS
 from review_comments import compare, platform_key, target_key, unwrap_rows
@@ -215,11 +215,30 @@ def login_gate_visible(client: Any) -> bool:
 
 
 DOM_COMMENT_FIELDS = r"""item => {
+    if (!item.getClientRects().length || getComputedStyle(item).visibility !== 'visible') return {hidden: true};
     const own = (element, selector) => [...element.querySelectorAll(selector)].filter(
         node => node.closest('.comment-item') === element);
     const commentId = element => element.getAttribute('data-comment-id') ||
         /^comment-([0-9a-f]{24})$/i.exec(element.id || '')?.[1] || null;
-    const bodies = own(item, '.content .note-text');
+    const bodyText = element => {
+        const emojis = [...element.querySelectorAll('img[alt]')].filter(img =>
+            img.matches('.emoji, .emoji-img, .emoji-icon, [data-emoji]') ||
+            /^\[[^\[\]]{1,24}\]$/.test(img.alt));
+        if (!emojis.length) return element.innerText;
+        const parts = [];
+        const walk = node => {
+            if (node.nodeType === Node.TEXT_NODE) parts.push(node.textContent);
+            else if (emojis.includes(node)) parts.push(node.alt);
+            else if (node instanceof Element && getComputedStyle(node).display !== 'none') {
+                if (node.tagName === 'BR') parts.push('\n');
+                else node.childNodes.forEach(walk);
+            }
+        };
+        walk(element);
+        return parts.join('');
+    };
+    let bodies = own(item, '.content .note-text');
+    if (!bodies.length) bodies = own(item, '.content').filter(node => !node.querySelector('.comment-item'));
     const ownText = bodies.length === 1;
     const nestedComments = item.querySelector('.comment-item');
     // A wrapper's aggregate innerText would also contain a nested comment.
@@ -231,6 +250,18 @@ DOM_COMMENT_FIELDS = r"""item => {
     const isReplyInGroup = group && roots.length === 1 && item !== roots[0] &&
         item.closest('.reply-container')?.parentElement === group;
     const rootBodies = isReplyInGroup ? own(roots[0], '.content .note-text') : [];
+    const content = own(item, '.content');
+    const singleDisplayedReply = isReplyInGroup && group.querySelectorAll('.comment-item').length === 2 &&
+        group.querySelectorAll(':scope > .reply-container').length === 1 &&
+        group.querySelectorAll(':scope > .reply-container > .list-container').length === 1 &&
+        item.matches('.reply-container > .list-container > .comment-item-sub') &&
+        roots[0].getClientRects().length && getComputedStyle(roots[0]).visibility === 'visible' &&
+        rootBodies.length === 1 && rootBodies[0].innerText.trim() &&
+        content.length === 1 && bodies.length === 1 && content[0].childElementCount === 1 &&
+        content[0].firstElementChild === bodies[0] && bodies[0].matches('span.note-text') &&
+        content[0].innerText.trim() === bodies[0].innerText.trim() &&
+        !/^回复(?:\s*@|\s*.{0,100}[:：])/s.test(bodies[0].innerText.trim()) &&
+        !group.querySelector('[data-reply-to], .reply-to, .reply-user, .mention, .at-user, [aria-expanded="false"], .folded, .deleted');
     let parentId = directId;
     let parentText = null;
     if (!directId && !targetId) {
@@ -246,18 +277,20 @@ DOM_COMMENT_FIELDS = r"""item => {
         if (parent?.matches('.comment-item') && (explicitGroup || parent.querySelectorAll('.comment-item').length === 1)) {
             parentId = commentId(parent);
             const texts = own(parent, '.content .note-text');
-            if (texts.length === 1) parentText = texts[0].innerText.trim();
+            if (texts.length === 1) parentText = bodyText(texts[0]).trim();
         }
     }
     return {
-        text: ownText ? bodies[0].innerText : item.innerText,
+        text: ownText ? bodyText(bodies[0]) : item.innerText,
         own_text: ownText,
         has_image: own(item, '.comment-picture img').length > 0,
         comment_id: commentId(item),
         parent_comment_id: parentId,
         target_comment_id: targetId,
         parent_text: parentText,
-        thread_root_text: rootBodies.length === 1 ? rootBodies[0].innerText.trim() : null
+        thread_root_text: rootBodies.length === 1 ? rootBodies[0].innerText.trim() : null,
+        single_displayed_root: singleDisplayedReply && !directId && !targetId ?
+            {text: bodyText(rootBodies[0]).trim(), comment_id: commentId(roots[0])} : null
     };
 }"""
 
@@ -270,6 +303,9 @@ def dom_comment_record(fields: Dict[str, Any]) -> Dict[str, Any]:
     add_reply_relation(result, fields, root_list=False)
     if fields.get("thread_root_text") and deleted_placeholder(fields["thread_root_text"]):
         result["thread_root_deleted"] = True
+    candidate = fields.get("single_displayed_root")
+    if candidate and not deleted_placeholder(candidate["text"]):
+        result["_displayed_root"] = candidate
     if fields.get("parent_text") and not deleted_placeholder(fields["parent_text"]):
         result["parent_text"] = fields["parent_text"]
     if deleted_placeholder(result["text"]):
@@ -296,17 +332,69 @@ def parse_dom_comment(item: Any) -> Dict[str, Any]:
     return dom_comment_record(item.evaluate(DOM_COMMENT_FIELDS))
 
 
-def prefer_comment_snapshot(current, incoming):
-    """Keep a single snapshot, enriching direct parents only for unambiguous IDs."""
+def apply_displayed_parents(comments, raw, complete):
+    """Attribute only the sole displayed reply of a complete, unambiguous thread."""
+    pending = []
+    for child in comments:
+        root = child.pop("_displayed_root", None)
+        if (complete and root and not child.get("deleted") and not child.get("thread_root_deleted")
+                and "parent_comment_id" not in child and not child.get("parent_text")):
+            pending.append((child, root))
+    if not pending:
+        return
+
+    roots = defaultdict(list)
+    members = defaultdict(list)
+    def identifiers(record):
+        return [(key, record[key]) for key in ("comment_id", "text") if record.get(key)]
+    for thread in raw:
+        if not isinstance(thread, dict):
+            continue
+        entries = [(normalize_comment(r), r) for r in flatten_comments([thread])]
+        first = entries[0][0]
+        for key in identifiers(first):
+            roots[key].append(entries)
+        for index, (record, source) in enumerate(entries):
+            for key in identifiers(record):
+                members[key].append((record, first, index, source))
+
+    def same(left, right):
+        if left.get("comment_id") and right.get("comment_id"):
+            return left["comment_id"] == right["comment_id"]
+        return bool(left.get("text") and left["text"] == right.get("text"))
+
+    directed_keys = ("target_comment", "targetComment", "parent_comment", "parentComment", "parent_comment_id",
+                     "parentCommentId", "target_comment_id", "targetCommentId", "reply_to_user", "replyToUser",
+                     "target_user", "targetUser", "target_user_id", "targetUserId")
+    def disagrees(child, root):
+        for key in identifiers(root):
+            for entries in roots.get(key, ()):
+                first = entries[0][0]
+                if same(first, root) and (first.get("deleted") or len(entries) > 2 or first["text"] != root["text"]
+                        or (len(entries) == 2 and not same(entries[1][0], child))):
+                    return True
+        for key in identifiers(child):
+            for record, first, index, source in members.get(key, ()):
+                if same(record, child) and (index == 0 or not same(first, root) or any(source.get(k) for k in directed_keys)):
+                    return True
+        return False
+
+    for child, root in pending:
+        if not disagrees(child, root):
+            child.update(parent_text=root["text"], parent_evidence="single_visible_reply_under_root")
+
+
+def prefer_comment_snapshot(current, incoming, *, visible_complete=False):
+    """Preserve distinct observed comments without multiplying anonymous copies across views."""
     if not incoming:
-        return current
+        return [] if visible_complete else current
     if not current:
         return incoming
     def quality(records):
         links = sum(bool(c.get("parent_comment_id") or c.get("parent_text")) for c in records)
         return (len(records), links, sum("comment_id" in c for c in records),
                 sum(c.get("thread_root_deleted") is True for c in records))
-    primary, secondary = (incoming, current) if quality(incoming) > quality(current) else (current, incoming)
+    primary, secondary = (incoming, current) if visible_complete or quality(incoming) > quality(current) else (current, incoming)
     counts = Counter(comment.get("comment_id") for comment in primary)
     known = {}
     for comment in secondary:
@@ -317,6 +405,10 @@ def prefer_comment_snapshot(current, incoming):
     for comment in primary:
         identifier = comment.get("comment_id")
         other = known.get(identifier)
+        if (primary is current and other and counts[identifier] == 1
+                and (other.get("text_source") == "dom_note_text" or other.get("deleted"))
+                and (other["text"], other["has_image"]) != (comment["text"], comment["has_image"])):
+            comment = other
         if (other and counts[identifier] == 1 and comment["text"] == other["text"]
                 and comment["has_image"] == other["has_image"]):
             if other.get("thread_root_deleted") is True:
@@ -327,23 +419,54 @@ def prefer_comment_snapshot(current, incoming):
             else:
                 comment = {**{k: other[k] for k in fields if k in other}, **comment}
         selected.append(comment)
+    if visible_complete:
+        return selected
+    # Reserve known ID matches first. An anonymous appearance can overlap one
+    # record with the same body and image, never two different known IDs.
+    def fingerprint(item):
+        return item["text"], item["has_image"]
+    shared_ids = set(counts).intersection(known) - {None}
+    available = Counter(fingerprint(c) for c in primary if c.get("comment_id") not in shared_ids)
+    anonymous = Counter(fingerprint(c) for c in primary if not c.get("comment_id"))
+    known_texts = {c["text"] for c in primary}
+    anonymous_texts = {c["text"] for c in primary if not c.get("comment_id")}
+    for other in sorted(secondary, key=lambda item: not bool(item.get("comment_id"))):
+        identifier = other.get("comment_id")
+        if identifier in shared_ids:
+            continue
+        key = fingerprint(other)
+        capacity = anonymous if identifier else available
+        if capacity[key] > 0:
+            available[key] -= 1
+            if identifier:
+                anonymous[key] -= 1
+        elif (key not in available and other["text"] in (anonymous_texts if identifier else known_texts)):
+            # An image-state difference on an unidentified copy of the same body
+            # cannot establish that two separate comments were published.
+            continue
+        else:
+            selected.append(other)
     return selected
 
 
-def dom_capture_complete(declared: Optional[int], captured: int, terminal_visible: bool) -> bool:
-    """A visible terminal is authoritative when platform counters are stale."""
-    return terminal_visible or (declared is not None and captured >= declared)
+MORE_REPLIES = re.compile(r"^(?:展开\s*(?:剩余\s*)?(?:\d+|更多)\s*条?\s*(?:回复|评论)|(?:查看|加载)更多(?:回复|评论)|更多回复|查看(?:被)?折叠(?:的)?评论)$")
+
+
+def reply_controls(container):
+    return container.get_by_text(MORE_REPLIES).and_(container.locator(
+        ':visible:not(.content):not(.content *):not(.note-text):not(.note-text *)'))
 
 
 def visible_terminal(container: Any) -> bool:
-    for marker in ("- THE END -", "没有更多评论", "暂时没有更多评论"):
-        try:
-            locator = container.get_by_text(marker, exact=False)
-            if locator.count() and locator.first.is_visible():
-                return True
-        except Exception:
-            continue
-    return False
+    marker = re.compile(r"^(?:-\s*THE END\s*-|没有更多评论|暂时没有更多评论)$", re.I)
+    # A comment (or reply thread) can itself contain the same words as a footer.
+    outside_comments = container.locator(
+        ':visible:not(.comment-item):not(.comment-item *):not(.reply-container):not(.reply-container *)')
+    if container.get_by_text(marker).and_(outside_comments).count():
+        return True
+    empty = re.compile(r"^(?:暂无评论|(?:暂时)?还没有评论(?:哦)?|还没有人评论)(?:[～~。！!])?$")
+    return (not container.locator(".comment-item:visible").count()
+            and container.get_by_text(empty).and_(outside_comments).count() > 0)
 
 
 def group_reply_requirements(rows):
@@ -404,7 +527,7 @@ def saved_observations(original, previous, existing):
 
 
 def open_comments_panel(page):
-    panel = page.locator(".comments-container").first
+    panel = page.locator(".comments-container:visible").first
     if panel.is_visible():
         return True
     button = page.get_by_role("button", name=re.compile(r"^(?:查看(?:全部)?评论|打开评论区|评论区)$")).first
@@ -445,33 +568,76 @@ def apply_risk_averse_profile(args: argparse.Namespace) -> None:
     args.warmup_max = max(args.warmup_max, 35.0)
 
 
+def read_visible_comments(container):
+    items = container.locator(".comment-item")
+    extract = "items => items.map(item => { try { return (" + DOM_COMMENT_FIELDS + ")(item); } catch { return null; } })"
+    try:
+        records = items.evaluate_all(extract)
+    except Exception:
+        return [], False
+    comments = []
+    identities = {}
+    parsed = True
+    for fields in records:
+        if fields is None:
+            parsed = False
+            continue
+        if fields.get("hidden"):
+            continue
+        comment = dom_comment_record(fields)
+        if not (comment["text"] or comment.get("has_image") is True or comment.get("deleted")):
+            parsed = False
+            continue
+        identifier = comment.get("comment_id")
+        if identifier:
+            if identifier in identities:
+                if identities[identifier] != comment:
+                    parsed = False
+                    identities[identifier] = None
+                continue
+            identities[identifier] = comment
+        comments.append(comment)
+    return [c for c in comments if not c.get("comment_id") or identities[c["comment_id"]] is not None], parsed
+
+
+def displayed_identities(records):
+    return Counter(c.get("comment_id") or (c["text"], c["has_image"]) for c in records)
+
+
 def expand_dom_comments(page: Any, max_rounds: int = 30) -> tuple[List[Dict[str, Any]], bool, bool]:
     """Expand reply groups and lazy-load comments without social interactions."""
-    container = page.locator(".comments-container")
-    if not container.count() or not container.first.is_visible():
-        return [], False, True
+    container = page.locator(".comments-container:visible").first
+    if not container.count():
+        return [], False, False
     stable = 0
-    previous_count = -1
+    previous = None
+    seen = []
+    parse_gap = False
     for _ in range(max_rounds):
-        clicked = False
-        expanders = container.get_by_text(
-            re.compile(r"(?:展开\s*\d+\s*条回复|展开更多回复|更多回复)"),
-            exact=False,
-        )
-        for index in range(expanders.count()):
+        expanders = reply_controls(container)
+        if not expanders.count() and visible_terminal(container):
+            break
+        # Read before scrolling because a virtualized list may recycle its earlier nodes.
+        rendered, parsed = read_visible_comments(container)
+        parse_gap |= not parsed
+        seen = prefer_comment_snapshot(seen, rendered)
+        state = (displayed_identities(rendered), expanders.count())
+        stable = stable + 1 if state == previous else 0
+        previous = state
+        if stable >= 4:
+            break
+        # Clicking can remove the node. Reverse order avoids skipping a sibling.
+        for index in reversed(range(expanders.count())):
             expander = expanders.nth(index)
             try:
                 if expander.is_visible():
                     expander.scroll_into_view_if_needed(timeout=2000)
                     expander.click(timeout=3000)
                     page.wait_for_timeout(random.randint(700, 1100))
-                    clicked = True
             except Exception:
                 continue
         items = container.locator(".comment-item")
         count = items.count()
-        stable = stable + 1 if count == previous_count and not clicked else 0
-        previous_count = count
         if count:
             try:
                 items.last.scroll_into_view_if_needed(timeout=3000)
@@ -480,52 +646,43 @@ def expand_dom_comments(page: Any, max_rounds: int = 30) -> tuple[List[Dict[str,
                 pass
         page.wait_for_timeout(random.randint(800, 1300))
         terminal = visible_terminal(container)
-        if terminal and stable >= 1:
+        if terminal and not reply_controls(container).count():
             break
-        if stable >= 4:
-            break
-    comments = []
-    extraction_complete = True
-    items = container.locator(".comment-item")
-    extract = "items => items.map(item => { try { return (" + DOM_COMMENT_FIELDS + ")(item); } catch { return null; } })"
-    try:
-        records = items.evaluate_all(extract)
-    except Exception:
-        return [], visible_terminal(container), False
-    for fields in records:
-        if fields is None:
-            extraction_complete = False
-            continue
-        comment = dom_comment_record(fields)
-        if comment["text"] or comment.get("has_image") is True or comment.get("deleted"):
-            comments.append(comment)
-    return comments, visible_terminal(container), extraction_complete
+    rendered, parsed = read_visible_comments(container)
+    parsed = parsed and not parse_gap
+    terminal = visible_terminal(container) and not reply_controls(container).count()
+    if displayed_identities(seen) - displayed_identities(rendered):
+        # Some previously displayed records disappeared mid-traversal. They were
+        # observed, but a rendered footer cannot prove we saw every intervening row.
+        return prefer_comment_snapshot(seen, rendered), False, parsed
+    return rendered, terminal, parsed
 
 
 def check_note_comments(page, key, raw_comments, declared, requirements, args, *, structured_ok=True, prior=None):
     captured = normalized_comments(raw_comments, root_list=True)
     observation = {"target_key": key, "platform": "xiaohongshu", "capture_status": "ok",
-                   "capture_complete": structured_ok and not has_more(raw_comments) and (declared is None or len(captured) >= declared),
-                   "comments": captured}
+                   "capture_complete": False, "comments": captured}
     missing = unconfirmed_replies(requirements, observation)
     page_needed = bool(missing or not structured_ok)
-    expand = bool(page_needed or (args.expand_dom and not observation["capture_complete"]))
+    expand = bool(page_needed or args.expand_dom)
     terminal, parse_failed = False, False
-    panel = open_comments_panel(page) if page_needed else None
-    if expand and panel is not False:
+    panel = open_comments_panel(page) if expand else None
+    if panel:
         incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds)
-        captured = prefer_comment_snapshot(captured, incoming)
+        complete_view = terminal and parsed
+        captured = prefer_comment_snapshot(captured, incoming, visible_complete=complete_view)
         parse_failed = not parsed
-        if (parse_failed or not dom_capture_complete(declared, len(captured), terminal)) and args.incomplete_dom_retry_rounds:
+        if (parse_failed or not terminal) and args.incomplete_dom_retry_rounds:
+            first_view = displayed_identities(incoming)
             incoming, end, parsed = expand_dom_comments(page, args.incomplete_dom_retry_rounds)
-            captured = prefer_comment_snapshot(captured, incoming)
-            terminal = terminal or end
+            end = end and not (first_view - displayed_identities(incoming))
+            captured = prefer_comment_snapshot(captured, incoming, visible_complete=end and parsed)
+            terminal = end
             parse_failed = not parsed
-    if panel is False:
-        if args.expand_dom and declared is None:
-            observation["capture_complete"] = False
-    elif expand:
-        observation["capture_complete"] = not parse_failed and dom_capture_complete(declared, len(captured), terminal)
+    observation["capture_complete"] = bool(panel and terminal and not parse_failed and not has_more(raw_comments))
+    apply_displayed_parents(captured, raw_comments, observation["capture_complete"])
+    if observation["capture_complete"]:
+        observation["capture_complete_source"] = "visible_comment_list_end"
     observation["comments"] = captured
     observation["image_detection_complete"] = not parse_failed
     if not structured_ok and (not panel or (not captured and not terminal)):
@@ -571,7 +728,7 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
         status = classify_failure(1, str(error))
         if status in ("session_expired", "captcha", "risk_control"):
             raise login_error(status if status != "session_expired" else "login required") from None
-        if not requirements:
+        if not requirements and not args.expand_dom:
             raise
         # An unavailable data view can still leave the ordinary note page usable.
         structured_ok = False
@@ -579,18 +736,19 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
     if login_gate_visible(client):
         raise login_error("login required: visible login gate")
     check_note_identity()
-    if not structured_ok:
+    if not structured_ok or args.expand_dom:
         blocker = reply_page_blocker(client)
         if blocker:
             raise login_error(blocker)
     evidence, terminal, parse_failed = check_note_comments(
         client._page, source_key, raw, declared, requirements, args, structured_ok=structured_ok, prior=prior)
     check = evidence.get("reply_verification", {})
-    if check.get("page_attempted"):
+    if check.get("page_attempted") or args.expand_dom:
         blocker = reply_page_blocker(client)
         if blocker:
             error = login_error(blocker)
-            error.reply_verification = {**check, "status": "blocked", "unconfirmed_after": None}
+            if check.get("page_attempted"):
+                error.reply_verification = {**check, "status": "blocked", "unconfirmed_after": None}
             raise error
         check_note_identity(check)
     return evidence, terminal, parse_failed, declared

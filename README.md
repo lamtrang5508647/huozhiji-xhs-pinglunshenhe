@@ -4,7 +4,7 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
-0.4.1 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
+0.4.2 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
 
 ## WorkBuddy 使用
 

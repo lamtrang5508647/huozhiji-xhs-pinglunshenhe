@@ -20,6 +20,7 @@ from xml.etree import ElementTree as ET
 
 FIELD_ALIASES = {
     "case_id": ["case_id", "caseid", "订单号", "编号", "案例id", "id"],
+    "task_ordinal": ["task_ordinal", "任务序号", "评论序号"],
     "platform": ["platform", "平台"],
     "target_key": ["target_key", "targetkey", "作品id", "笔记id", "视频id", "目标id"],
     "target_url": ["target_url", "targeturl", "文章链接", "作品链接", "笔记链接", "视频链接", "链接"],
@@ -275,14 +276,18 @@ def parse_maps(values: Iterable[str]) -> Dict[str, str]:
         if "=" not in value:
             raise ValueError(f"Mapping must use destination=source-header: {value}")
         destination, source = value.split("=", 1)
-        if destination not in {
-            "case_id", "platform", "target_key", "target_url", "comment_text", "comment_type",
-            "expected_amount", "reply_text", "image_requirement", "product_name", "group_leader",
-            "leader_contact", "settlement_time", "settlement_voucher", "qr_code",
-        }:
+        if destination not in FIELD_ALIASES:
             raise ValueError(f"Unknown destination field: {destination}")
         result[destination] = source
     return result
+
+
+def parse_task_ordinal(value: Any) -> Optional[int]:
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    match = re.fullmatch(r"([0-9]{1,6})(?:\.0+)?", text)
+    if not match:
+        return None
+    return int(match[1]) or None
 
 
 def extract_url(value: Any) -> str:
@@ -426,7 +431,10 @@ def convert(
         }
         for field, source in mapping.items():
             value = row.get(source, "")
-            if value != "":
+            if field == "task_ordinal":
+                # Retain explicit numbering mode even when a cell is unusable.
+                item[field] = parse_task_ordinal(value)
+            elif value != "":
                 item[field] = value
         # Many operational sheets use an unmerged visual block: the link is
         # written once and the following comment rows leave the link cell

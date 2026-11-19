@@ -38,6 +38,8 @@ PUNCTUATION = re.compile(
     r"[\s\u3000，。！？；：、‘’“”\"'（）()【】\[\]《》<>…·,!?;:/\\|~`@#$%^&*_+=-]"
 )
 XHS_EMOJI_TOKEN = re.compile(r"\[[^\[\]]+R\]", flags=re.IGNORECASE)
+DISPLAY_FORMAT = re.compile("[\u200b\u2060\ufeff\ufe0e\ufe0f]")
+LEGACY_XHS_REVISION = "xhs-replies-20261118-v4"
 AMOUNT_TOKEN = re.compile(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)(?:\s*)(万|千|百)?(?![\d.])")
 
 
@@ -73,7 +75,9 @@ def canonical_type(value: Any) -> Optional[str]:
 
 def normalize_text(value: Any) -> str:
     raw = "" if value is None else str(value)
-    normalized = unicodedata.normalize("NFKC", raw).casefold()
+    # Ignore zero-width spacing and emoji presentation style, while preserving
+    # the emoji itself, joined sequences, skin tone and numeric punctuation.
+    normalized = DISPLAY_FORMAT.sub("", unicodedata.normalize("NFKC", raw).casefold())
     normalized = XHS_EMOJI_TOKEN.sub("", normalized)
     # Treat a prose full stop like its Chinese counterpart, but retain decimal
     # points so materially different numbers never collapse (1.5 != 15).
@@ -159,7 +163,7 @@ def observed_amount(comment: Dict[str, Any]) -> Tuple[Optional[Decimal], str]:
     explicit = parse_amount(comment.get("observed_amount"))
     if explicit is not None:
         return explicit, str(comment.get("amount_source") or "field")
-    extracted, state = extract_single_amount(comment.get("text", ""))
+    extracted, state = extract_single_amount(_observed_body(comment))
     if extracted is not None:
         return extracted, "text_auto"
     return None, state
@@ -174,8 +178,12 @@ def platform_key(row: Dict[str, Any]) -> str:
     return canonical_platform(row.get("platform")) or str(row.get("platform", "")).strip().casefold()
 
 
+def _observed_body(comment: Dict[str, Any]) -> Any:
+    return comment.get("text", comment.get("comment_text", ""))
+
+
 def _matching_text(comment: Dict[str, Any]) -> str:
-    return normalize_text(comment.get("text", comment.get("comment_text", "")))
+    return normalize_text(_observed_body(comment))
 
 
 def text_matches(expected: Dict[str, Any], comment: Dict[str, Any]) -> bool:
@@ -199,7 +207,7 @@ def prepare_observation(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def compact_comment(comment: Dict[str, Any]) -> Dict[str, Any]:
     keys = ("comment_id", "dom_index", "text", "comment_type", "has_image", "observed_amount", "amount_source",
-            "evidence_path", "parent_comment_id", "parent_text")
+            "evidence_path", "parent_comment_id", "parent_text", "parent_evidence")
     record = {key: comment[key] for key in keys if key in comment}
     if "text" not in record and "comment_text" in comment:
         record["text"] = comment["comment_text"]
@@ -213,7 +221,7 @@ def format_amount(value: Optional[Decimal]) -> Optional[str]:
 
 
 def _observed_type(comment: Dict[str, Any]) -> Optional[str]:
-    return infer_type({**comment, "comment_text": comment.get("text", "")})
+    return infer_type({**comment, "comment_text": _observed_body(comment)})
 
 
 _REPLY_DIRECTIVE = re.compile(r"(?:第[一二三四五六七八九十0-9]+条)?回复(?:第([一二三四五六七八九十0-9]+)条|图片)?")
@@ -240,6 +248,30 @@ def _reply_number(value):
     return 0
 
 
+def _numbered_reply_parents(rows, indices, numbers, parents):
+    try:
+        from .table_to_expected import parse_task_ordinal
+    except ImportError:  # Standalone adapter.
+        from table_to_expected import parse_task_ordinal
+
+    by_number = {}
+    bodies = Counter(normalize_text(rows[i].get("comment_text")) for i in indices)
+    for i in indices:
+        ordinal = parse_task_ordinal(rows[i].get("task_ordinal"))
+        if ordinal is None:
+            return  # A missing label can conceal a second owner of any number.
+        by_number[ordinal] = i if ordinal not in by_number else None
+    for i in indices:
+        if i not in numbers:
+            continue
+        candidate = by_number.get(numbers[i])
+        if candidate is None or candidate == i or rows[candidate].get("reply_to"):
+            continue
+        body = normalize_text(rows[candidate].get("comment_text"))
+        if body and bodies[body] == 1:
+            parents[i] = body
+
+
 def _reply_parents(rows):
     """Resolve worksheet ordinals inside one platform, target and source block."""
     numbers = {i: n for i, row in enumerate(rows) if (n := _reply_number(row.get("reply_to"))) is not None}
@@ -261,9 +293,22 @@ def _reply_parents(rows):
             if not all(type(n) is int for n in positions):
                 continue
             indices = sorted(indices, key=lambda i: rows[i]["source_row"])
-            if sorted(positions) != list(range(min(positions), min(positions) + len(positions))):
-                # A repeated link in another block has its own ordinals.
+            positions = sorted(positions)
+            if len(set(positions)) != len(positions):
                 continue
+        else:
+            positions = indices
+        if any("task_ordinal" in rows[i] for i in indices):
+            # The same target can reappear later with its own numbering.
+            start = 0
+            for pos in range(1, len(positions)):
+                if positions[pos] != positions[pos - 1] + 1:
+                    _numbered_reply_parents(rows, indices[start:pos], numbers, parents)
+                    start = pos
+            _numbered_reply_parents(rows, indices[start:], numbers, parents)
+            continue
+        if rows[indices[0]].get("source_row") is not None and positions[-1] - positions[0] + 1 != len(positions):
+            continue  # The positional convention is ambiguous across separate blocks.
         roots = [i for i in indices if i not in numbers]
         bodies = {i: normalize_text(rows[i].get("comment_text")) for i in indices}
         body_counts = Counter(bodies.values())
@@ -313,6 +358,38 @@ def _identifier(value):
     return str(value).strip() if type(value) in (str, int) else ""
 
 
+def _distinct_matches(comments):
+    """Repeated snapshots can show the same stable ID, including at a new DOM index."""
+    if len(comments) < 2:
+        return comments
+    first_by_id = {}
+    distinct = []
+    fields = ("comment_type", "has_image", "image", "observed_amount", "amount_source",
+              "parent_comment_id", "parent_text", "thread_root_deleted", "deleted")
+    def record(comment):
+        return (_observed_body(comment),
+                [(field in comment, type(comment.get(field)), comment.get(field)) for field in fields])
+
+    for comment in comments:
+        cid = _identifier(comment.get("comment_id"))
+        if cid and cid not in ("0", "-1"):
+            position = first_by_id.get(cid)
+            if position is not None:
+                previous = distinct[position]
+                if record(previous) == record(comment):
+                    if comment.get("parent_evidence") and not previous.get("parent_evidence"):
+                        distinct[position] = comment
+                    continue
+            else:
+                first_by_id[cid] = len(distinct)
+        distinct.append(comment)
+    return distinct
+
+
+def _legacy_xhs(capture):
+    return capture["platform"] == "xiaohongshu" and capture.get("parser_revision") == LEGACY_XHS_REVISION
+
+
 def _matching_replies(evidence, parent_text, candidates):
     if not parent_text or not candidates:
         return []
@@ -333,10 +410,14 @@ def _matching_replies(evidence, parent_text, candidates):
     captures_with_parent = {id(evidence.source(p)) for p in parents}
     replies = []
     for comment in candidates:
-        if id(evidence.source(comment)) not in captures_with_parent or id(comment) in parent_records:
+        source = evidence.source(comment)
+        if id(source) not in captures_with_parent or id(comment) in parent_records:
             continue
         direct_id = _identifier(comment.get("parent_comment_id"))
         direct_text = normalize_text(comment.get("parent_text"))
+        if comment.get("parent_evidence") == "single_visible_reply_under_root":
+            if source.get("capture_complete") is not True or not direct_text or comment.get("thread_root_deleted") is True:
+                continue  # Page grouping requires a complete view and an intact, identified root.
         if "parent_comment_id" in comment and not direct_id:
             continue  # Explicitly top-level, or unusable identifier.
         if direct_id and direct_id != parent_id:
@@ -364,7 +445,11 @@ class _TargetEvidence:
 
     @cached_property
     def complete(self):
-        return any(c.get("capture_complete") is True for c in self.usable)
+        return any(c.get("capture_complete") is True and not _legacy_xhs(c) for c in self.usable)
+
+    @cached_property
+    def legacy_absence(self):
+        return not self.complete and any(c.get("capture_complete") is True and _legacy_xhs(c) for c in self.usable)
 
     @cached_property
     def image_detection_incomplete(self):
@@ -409,7 +494,7 @@ class _TargetEvidence:
     @cached_property
     def image_only(self):
         return [comment for comment in self.comments
-                if image_signal(comment) is True and not has_text(comment.get("text", ""))]
+                if image_signal(comment) is True and not has_text(_observed_body(comment))]
 
     def matching(self, text: str, mode: str):
         if not text:
@@ -533,6 +618,7 @@ def compare(
 
     results: List[Dict[str, Any]] = []
     settlement_claims = {}
+    legacy_absence_targets = set()
     reply_parents = _reply_parents(expected_rows)
     reply_checks = {}
     for index, expected in enumerate(expected_rows):
@@ -591,6 +677,8 @@ def compare(
             continue
 
         complete = evidence.complete
+        if evidence.legacy_absence:
+            legacy_absence_targets.add(key)
         image_detection_incomplete = evidence.image_detection_incomplete
         match_mode = str(expected.get("text_match", "exact")).strip().casefold()
         same_text = evidence.matching(expected_text, match_mode)
@@ -611,6 +699,7 @@ def compare(
         if expected_type == "text+image":
             text_with_image = [comment for comment in same_text if image_signal(comment) is True]
             if same_text and not text_with_image:
+                same_text = _distinct_matches(same_text)
                 if any(image_signal(comment) is None for comment in same_text) or image_detection_incomplete:
                     result["status"] = "needs_review"
                     result["reason_codes"].append("comment_image_presence_unknown")
@@ -638,7 +727,7 @@ def compare(
                 results.append(result)
                 continue
             if not same_text:
-                image_only = reply_images if constrained_reply else evidence.image_only
+                image_only = _distinct_matches(reply_images if constrained_reply else evidence.image_only)
                 combo_count = combo_rows_by_target.get(key, 0)
                 if len(image_only) == 1 and combo_count == 1:
                     if not complete:
@@ -688,11 +777,12 @@ def compare(
                 result["candidates"] = [compact_comment(comment) for comment in same_text if image_signal(comment) is None]
                 results.append(result)
                 continue
-            result["status"] = "mismatch"
-            result["reason_codes"].append("comment_type_mismatch")
+            result["status"] = "mismatch" if complete else "blocked"
+            result["reason_codes"].append("comment_type_mismatch" if complete else "capture_incomplete_required_type_not_seen")
             result["candidates"] = [compact_comment(comment) for comment in same_text]
             results.append(result)
             continue
+        same_type = _distinct_matches(same_type)
         if len(same_type) > 1 and not allow_duplicates:
             result["status"] = "needs_review"
             result["reason_codes"].append("duplicate_matching_comments")
@@ -718,8 +808,8 @@ def compare(
             result["status"] = "needs_review"
             result["reason_codes"].append("amount_ambiguous" if amount_state == "ambiguous" else "observed_amount_missing")
         elif actual_amount != expected_amount:
-            result["status"] = "mismatch"
-            result["reason_codes"].append("amount_mismatch")
+            result["status"] = "mismatch" if complete else "blocked"
+            result["reason_codes"].append("amount_mismatch" if complete else "capture_incomplete_required_amount_not_seen")
             result["expected_amount"] = format_amount(expected_amount)
             result["observed_amount"] = format_amount(actual_amount)
         else:
@@ -740,6 +830,10 @@ def compare(
         "partial_image": "图片成功",
     }
     for result in results:
+        if ((result["platform"], result["target_key"]) in legacy_absence_targets
+                and any(code.startswith("capture_incomplete_") or code == "reply_parent_unconfirmed"
+                        for code in result["reason_codes"])):
+            result["reason_codes"].append("legacy_xhs_visible_recheck_required")
         if result.get("expected_type") == "text+image" and result["status"] == "verified":
             result["result_category"] = "图字成功"
         else:

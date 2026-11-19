@@ -14,7 +14,7 @@ from xhs_cli.auth import REQUIRED_COOKIES, cookie_str_to_dict, get_cookie_string
 from xhs_cli.client import XhsClient
 from xhs_visible_login import load_xhs_modules as login_modules
 from xhs_batch_capture import expand_dom_comments, load_xhs_modules as capture_modules
-from test_xhs_batch_capture import exercise_real_reply_recheck
+from test_xhs_batch_capture import exercise_real_reply_recheck, exercise_visible_comments
 
 assert login_modules()[-1] is XhsClient
 assert capture_modules()[2] is XhsClient
@@ -53,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix="audit-browser-") as directory:
                 assert rows[1]["parent_comment_id"] == rows[0]["comment_id"]
                 if iteration == 0:
                     exercise_real_reply_recheck(page)
+                    exercise_visible_comments(page)
                 context.close()
     # Exercise the actual supported XHS client interface with our Chrome wrapper.
     client = persistent_client(XhsClient, {}, str(Path(directory) / "xhs 测试"),

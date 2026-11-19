@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
 
-from xhs_batch_capture import apply_risk_averse_profile, dom_capture_complete, parse_dom_comment
+from xhs_batch_capture import apply_risk_averse_profile, parse_dom_comment
 from xhs_batch_capture import target_from_url, targets_from_workbooks, visible_terminal, expand_dom_comments, prefer_comment_snapshot
 from xhs_batch_capture import check_note_comments, collect_note_evidence, plan_targets, reply_signature, unconfirmed_replies
 from capture_resume import PARSER_REVISIONS
@@ -19,6 +19,9 @@ class FakeLocator:
 
     def count(self) -> int:
         return self._count
+
+    def and_(self, other):
+        return self
 
 
 class FakeItem:
@@ -161,6 +164,64 @@ def exercise_real_reply_recheck(page):
     assert compare(rows, [evidence], amount_mode="expected-only")["results"][1]["triage"] == "待人审"
 
 
+def exercise_visible_comments(page):
+    args = Namespace(expand_dom=True, dom_max_rounds=0, incomplete_dom_retry_rounds=0)
+    def observe(body, raw=(), declared=None):
+        page.set_content('<div class="comments-container">' + body + '</div>')
+        return check_note_comments(page, "note", list(raw), declared, None, args)[0]
+    def item(text, identifier="v"):
+        return f'<div class="comment-item" data-comment-id="{identifier}"><div class="content">{text}</div></div>'
+    end = '<span>没有更多评论</span>'
+    assert observe(item("shown") + end)["comments"][0]["text"] == "shown"
+    assert observe(item('A<img class="emoji" alt="[笑]">B') + end)["comments"][0]["text"] == "A[笑]B"
+    assert not observe(item("没有更多评论"), declared=1)["capture_complete"]
+    assert not observe(item("shown") + end + '<button>展开2条回复</button>', declared=1)["capture_complete"]
+    assert not observe(item("shown"), [{"id":"v","text":"shown"}], 1)["capture_complete"]
+    assert not observe("<span>正在加载</span>", declared=0)["capture_complete"]
+    assert observe('<div class="empty">暂无评论</div>', declared=0)["capture_complete"]
+    assert not observe(item("shown") + '<div class="empty">暂无评论</div>')["capture_complete"]
+    assert not observe('<div class="comment-item">unparsed</div>' + end)["capture_complete"]
+    assert not observe(item("shown") + end, [{"id":"v","text":"shown","subCommentCount":3}], 1)["capture_complete"]
+    assert observe(item("shown") + '<div class="comment-item" hidden><div class="content">hidden</div></div>' + end)["comments"][0]["text"] == "shown"
+    stale = [{"id":"old","text":"removed"}, {"id":"v","text":"old content"}]
+    assert [c["text"] for c in observe(item("now shown") + end, stale)["comments"]] == ["now shown"]
+    partial = observe(item("now shown"), stale)
+    assert {c["text"] for c in partial["comments"]} == {"removed", "now shown"} and not partial["capture_complete"]
+    args.dom_max_rounds, args.incomplete_dom_retry_rounds = 1, 2
+    recycle = """<button onclick="document.getElementById('window').innerHTML=document.getElementById('last').innerHTML;
+                  this.remove()">查看更多评论</button>"""
+    window = ('<div id="window">' + item("first visible", "first") + '</div>' + recycle
+              + '<template id="last">' + item("last visible", "last") + end + '</template>')
+    recycled = observe(window)
+    assert {c["text"] for c in recycled["comments"]} == {"first visible", "last visible"}
+    assert not recycled["capture_complete"]
+
+    rows, raw = reply_case()
+    def thread(root="First", reply="Reply", extra="", prefix=""):
+        return (f'<div class="parent-comment">{item(root, "c1").replace(root, "<span class=note-text>" + root + "</span>")}'
+                '<div class="reply-container"><div class="list-container">'
+                '<div class="comment-item comment-item-sub" data-comment-id="c2">'
+                f'<div class="content">{prefix}<span class="note-text">{reply}</span></div></div>'
+                f'{extra}</div></div></div>')
+    args.dom_max_rounds = args.incomplete_dom_retry_rounds = 0
+    safe = observe(thread() + end, raw)
+    reply = safe["comments"][1]
+    assert reply["parent_text"] == "First" and reply["parent_evidence"] == "single_visible_reply_under_root"
+    assert "parent_comment_id" not in reply
+    assert compare(rows, [safe], amount_mode="expected-only")["results"][1]["triage"] == "成功"
+    elsewhere = [{"id":"other", "text":"Unrelated", "subComments":[{"id":"c2", "text":"Reply"}]}]
+    directed = [{"id":"c1", "text":"First", "subComments":[{"id":"c2","text":"Reply","targetCommentId":"other"}]}]
+    other_child = [{"id":"c1", "text":"First", "subComments":[{"id":"another","text":"Another"}]}]
+    for body, structured in [(thread(), []), (thread(extra=item("third","c3")) + end, []),
+            (thread(prefix="回复 小明：") + end, []), (thread(root="原评论已删除") + end, []),
+            (thread() + end + '<button>展开1条回复</button>', []), (thread() + end, elsewhere),
+            (thread() + end, directed), (thread() + end, other_child),
+            (thread(reply="回复 @某人 Reply") + end, []), (thread() + end, [{"id":"c2","text":"Reply"}])]:
+        evidence = observe(body, structured)
+        assert "parent_evidence" not in evidence["comments"][1]
+        assert compare(rows, [evidence], amount_mode="expected-only")["results"][1]["triage"] == "待人审"
+
+
 def test_reply_resume():
     from datetime import datetime, timezone
     from xhs_capture import normalized_comments
@@ -183,10 +244,11 @@ def test_reply_resume():
     altered = {key: [*rows[:1], {**rows[1], "comment_text": "Other"}]}
     assert plan_targets(targets, {key: {**fresh, "reply_verification": check}}, altered, False) == targets
     comments[0]["subComments"][0]["target_comment_id"] = "c1"
-    args = Namespace(expand_dom=True, dom_max_rounds=1, incomplete_dom_retry_rounds=0)
+    args = Namespace(expand_dom=False, dom_max_rounds=1, incomplete_dom_retry_rounds=0)
     satisfied, _, _ = check_note_comments(None, key, comments, 2, rows, args)
     assert satisfied["reply_verification"]["page_attempted"] is False
-    assert not plan_targets(targets, {key: {**fresh, **satisfied}}, requirements, False)
+    assert not satisfied["capture_complete"]
+    assert not plan_targets(targets, {key: {**fresh, "comments":satisfied["comments"]}}, requirements, False)
 
 
 def main() -> None:
@@ -210,8 +272,9 @@ def main() -> None:
         def __init__(self, visible):
             self.visible = visible
         def get_by_text(self, *args, **kw):
-            from types import SimpleNamespace
-            return SimpleNamespace(count=lambda: 1, first=SimpleNamespace(is_visible=lambda: self.visible))
+            return FakeLocator(int(self.visible))
+        def locator(self, selector):
+            return FakeLocator(0)
     assert not visible_terminal(Terminal(False))
     assert visible_terminal(Terminal(True))
     from types import SimpleNamespace
@@ -239,7 +302,7 @@ def main() -> None:
         def locator(self, selector):
             return self.items
         def get_by_text(self, marker, **kw):
-            return super().get_by_text(marker, **kw) if isinstance(marker, str) else FakeLocator(0)
+            return FakeLocator(1 if marker.search("没有更多评论") else 0)
     container = Container(True)
     container.items = Items([ImageOnly()])
     page = SimpleNamespace(locator=lambda selector: container, wait_for_timeout=lambda ms: None,
@@ -262,9 +325,6 @@ def main() -> None:
     assert prefer_comment_snapshot(structured, [identified, identified]) == [identified, identified]
     conflict = {**identified, "parent_comment_id": "other"}
     assert prefer_comment_snapshot(structured, [conflict, anonymous]) == [identified, anonymous]
-    assert dom_capture_complete(6, 6, False)
-    assert dom_capture_complete(7, 6, True)  # stale count but visible THE END
-    assert not dom_capture_complete(7, 6, False)
     args = Namespace(
         delay_min=6.0, delay_max=10.0, minimum_rest=1.5,
         break_every=12, break_min=25.0, break_max=45.0,
