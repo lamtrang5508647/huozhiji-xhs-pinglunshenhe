@@ -271,6 +271,8 @@ def main() -> None:
     class Terminal:
         def __init__(self, visible):
             self.visible = visible
+        def evaluate(self, expression):
+            return False  # No active loading indicator in this synthetic panel.
         def get_by_text(self, *args, **kw):
             return FakeLocator(int(self.visible))
         def locator(self, selector):

@@ -81,7 +81,7 @@ Sanitized URLs are identifiers only. Live navigation must recover the original c
 }
 ```
 
-`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, no outstanding reply controls and no extraction gaps. The badge count alone cannot establish absence. A v0.4.1 observation marked `xhs-replies-20261118-v4` can support a positive match. A new live capture is required to confirm missing comments when that old marker is the only indication of completeness.
+`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, fulfilled reply expansions and no extraction gaps. When a reply control advertises a quantity, the reader confirms the increase in visible replies inside that same thread. Observations from `xhs-replies-20261118-v4` and `xhs-visible-end-v5` can still support positive matches. A new page read is required to confirm absence when either revision supplies the only evidence of completeness.
 
 Comment fields:
 

@@ -13,6 +13,7 @@ import sys
 import time
 import zipfile
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -28,6 +29,7 @@ from profile_lock import default_profile
 from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
 from xhs_visible_login import verification_status, wait_for_owner_confirmation
+from table_to_expected import extract_url, parse_maps, read_worksheet, resolve_mapping, xlsx_shared_strings, xlsx_sheet_members
 
 
 NOTE_PATTERNS = (
@@ -131,13 +133,47 @@ def workbook_column_a(path: str) -> Iterable[tuple[str, int, str]]:
                 yield sheet_name, row_number, value
 
 
-def targets_from_workbooks(paths: Iterable[str]) -> List[Dict[str, Any]]:
+def task_link_cells(path, assigned, mapping):
+    """Read the original share URL only in memory, from the same column as intake."""
+    with zipfile.ZipFile(path) as archive:
+        strings = xlsx_shared_strings(archive)
+        for sheet, member in xlsx_sheet_members(archive).items():
+            positions = assigned.get((Path(path).name, sheet))
+            if not positions:
+                continue
+            rows = read_worksheet(archive, member, strings, target_url_header=mapping.get("target_url"))
+            header = resolve_mapping(rows[0] if rows else (), mapping).get("target_url")
+            current_url = ""
+            for number, row in enumerate(rows, 2):
+                value = str(row.get(header, "")).strip()
+                if value:
+                    current_url = extract_url(value)
+                if number in positions:
+                    key = positions[number]
+                    if not header and re.fullmatch(r"[a-zA-Z0-9]+", key):
+                        url = f"https://www.xiaohongshu.com/explore/{key}"
+                    else:
+                        url = current_url
+                    target = target_from_url(url)
+                    if not target or target["note_id"] != key:
+                        raise ValueError(f"capture_target_identity_mismatch:{sheet}:{number}")
+                    yield sheet, number, url
+
+
+def targets_from_workbooks(paths: Iterable[str], *, task_rows=None, mapping=None) -> List[Dict[str, Any]]:
     targets: Dict[str, Dict[str, Any]] = {}
     seen_sources: set[tuple[str, str, str, int]] = set()
+    assigned = defaultdict(dict)
+    if task_rows is not None:
+        for row in task_rows:
+            if platform_key(row) == "xiaohongshu":
+                assigned[row["source_file"], row["source_sheet"]][row["source_row"]] = target_key(row)
     for input_path in paths:
         source_file = Path(input_path).name
         current_url_by_sheet: Dict[str, str] = {}
-        for sheet_name, row_number, value in workbook_column_a(input_path):
+        cells = (workbook_column_a(input_path) if task_rows is None
+                 else task_link_cells(input_path, assigned, mapping or {}))
+        for sheet_name, row_number, value in cells:
             current_url = current_url_by_sheet.get(sheet_name, "")
             if isinstance(value, str) and re.search(r"https?://", value):
                 current_url = value.strip()
@@ -157,6 +193,8 @@ def targets_from_workbooks(paths: Iterable[str]) -> List[Dict[str, Any]]:
             if source_key not in seen_sources:
                 seen_sources.add(source_key)
                 target["sources"].append({"file": source_file, "sheet": sheet_name, "row": row_number})
+    if task_rows is not None and len(seen_sources) != sum(map(len, assigned.values())):
+        raise ValueError("capture_plan_source_rows_missing")
     return list(targets.values())
 
 
@@ -458,6 +496,12 @@ def reply_controls(container):
 
 
 def visible_terminal(container: Any) -> bool:
+    # A footer can remain mounted while the panel or a reply group is loading.
+    if container.evaluate("""panel => panel.getAttribute('aria-busy') === 'true' ||
+        [...panel.querySelectorAll('[aria-busy="true"], [role="progressbar"], .comments-loading, .reply-loading, .loading-more, .loading-container, .loading')]
+        .some(node => !node.closest('.content, .note-text, .comment-picture') &&
+            node.getClientRects().length && getComputedStyle(node).visibility === 'visible')"""):
+        return False
     marker = re.compile(r"^(?:-\s*THE END\s*-|没有更多评论|暂时没有更多评论)$", re.I)
     # A comment (or reply thread) can itself contain the same words as a footer.
     outside_comments = container.locator(
@@ -476,11 +520,6 @@ def group_reply_requirements(rows):
         if platform_key(row) == "xiaohongshu":
             groups.setdefault(target_key(row), []).append(row)
     return {key: rows for key, rows in groups.items() if any(row.get("reply_to") for row in rows)}
-
-
-def load_reply_requirements(paths):
-    return group_reply_requirements(
-        row for path in paths for row in unwrap_rows(json.loads(Path(path).read_text(encoding="utf-8")), "rows"))
 
 
 def reply_signature(rows):
@@ -532,7 +571,9 @@ def open_comments_panel(page):
         return True
     button = page.get_by_role("button", name=re.compile(r"^(?:查看(?:全部)?评论|打开评论区|评论区)$")).first
     try:
-        if button.is_visible():
+        # Either surface can be mounted after DOMContentLoaded.
+        panel.or_(button).first.wait_for(state="visible", timeout=3500)
+        if not panel.is_visible() and button.is_visible():
             button.click(timeout=3000)
             panel.wait_for(state="visible", timeout=3000)
     except Exception:
@@ -604,8 +645,67 @@ def displayed_identities(records):
     return Counter(c.get("comment_id") or (c["text"], c["has_image"]) for c in records)
 
 
-def expand_dom_comments(page: Any, max_rounds: int = 30) -> tuple[List[Dict[str, Any]], bool, bool]:
+class ExpansionChecks(ExitStack):
+    """A disappearing button and an old footer cannot confirm async replies arrived."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending = []
+
+    def click(self, page, control):
+        # An unchanged control may still be loading after a timeout. Let that
+        # request finish instead of toggling the same control again.
+        if any(control.evaluate("(node, s) => node === s.control && s.added() <= 0", receipt)
+               for receipt in self.pending):
+            return
+        receipt = control.evaluate_handle(r"""control => {
+            const scope = control.closest('.parent-comment, .comment-item');
+            const label = control.innerText.trim();
+            const listPager = /^(?:查看|加载)更多评论$/.test(label);
+            const group = scope?.closest('.parent-comment') || scope || (listPager && control.closest('.comments-container'));
+            const count = () => {
+                if (!group || !group.isConnected) return -1;
+                const identities = new Set();
+                for (const row of group.querySelectorAll('.comment-item')) {
+                    if (row.getClientRects().length && getComputedStyle(row).visibility === 'visible')
+                        identities.add(row.getAttribute('data-comment-id') || row.id || row);
+                }
+                return identities.size;
+            };
+            const before = count();
+            const required = Number(label.match(/\d+/)?.[0]) || 1;
+            return {control, added: () => count() - before, required, started: performance.now()};
+        }""")
+        self.callback(receipt.dispose)
+        self.pending.append(receipt)
+        control.click(timeout=3000)
+        # A partial page can expose the next button before the full advertised
+        # quantity arrives. Keep that obligation through the same-page retry.
+        page.wait_for_function("s => s.added() > 0", arg=receipt, timeout=3500).dispose()
+        if receipt.evaluate("s => s.added() >= s.required"):
+            self.pending.remove(receipt)
+
+    def confirmed(self, page):
+        for receipt in self.pending:
+            # Numbered replies may appear in consecutive renders. All checks
+            # share their original deadline, including across an optional retry.
+            remaining = receipt.evaluate("s => Math.ceil(3500 - (performance.now() - s.started))")
+            if remaining > 0:
+                try:
+                    page.wait_for_function("s => s.added() >= s.required", arg=receipt, timeout=remaining).dispose()
+                except Exception:
+                    pass
+            if not receipt.evaluate("s => s.added() >= s.required"):
+                return False
+        self.pending.clear()
+        return True
+
+
+def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tuple[List[Dict[str, Any]], bool, bool]:
     """Expand reply groups and lazy-load comments without social interactions."""
+    if checks is None:
+        with ExpansionChecks() as local_checks:
+            return expand_dom_comments(page, max_rounds, checks=local_checks)
     container = page.locator(".comments-container:visible").first
     if not container.count():
         return [], False, False
@@ -632,10 +732,11 @@ def expand_dom_comments(page: Any, max_rounds: int = 30) -> tuple[List[Dict[str,
             try:
                 if expander.is_visible():
                     expander.scroll_into_view_if_needed(timeout=2000)
-                    expander.click(timeout=3000)
-                    page.wait_for_timeout(random.randint(700, 1100))
+                    checks.click(page, expander)
             except Exception:
                 continue
+        if visible_terminal(container) and not reply_controls(container).count():
+            break
         items = container.locator(".comment-item")
         count = items.count()
         if count:
@@ -648,9 +749,11 @@ def expand_dom_comments(page: Any, max_rounds: int = 30) -> tuple[List[Dict[str,
         terminal = visible_terminal(container)
         if terminal and not reply_controls(container).count():
             break
+    terminal = visible_terminal(container) and not reply_controls(container).count() and checks.confirmed(page)
+    # Rows and a fresh pagination control may have appeared during confirmation.
     rendered, parsed = read_visible_comments(container)
     parsed = parsed and not parse_gap
-    terminal = visible_terminal(container) and not reply_controls(container).count()
+    terminal = terminal and visible_terminal(container) and not reply_controls(container).count()
     if displayed_identities(seen) - displayed_identities(rendered):
         # Some previously displayed records disappeared mid-traversal. They were
         # observed, but a rendered footer cannot prove we saw every intervening row.
@@ -668,17 +771,21 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     terminal, parse_failed = False, False
     panel = open_comments_panel(page) if expand else None
     if panel:
-        incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds)
-        complete_view = terminal and parsed
-        captured = prefer_comment_snapshot(captured, incoming, visible_complete=complete_view)
-        parse_failed = not parsed
-        if (parse_failed or not terminal) and args.incomplete_dom_retry_rounds:
-            first_view = displayed_identities(incoming)
-            incoming, end, parsed = expand_dom_comments(page, args.incomplete_dom_retry_rounds)
-            end = end and not (first_view - displayed_identities(incoming))
-            captured = prefer_comment_snapshot(captured, incoming, visible_complete=end and parsed)
-            terminal = end
+        with ExpansionChecks() as checks:
+            incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds, checks=checks)
+            captured = prefer_comment_snapshot(captured, incoming, visible_complete=terminal and parsed)
             parse_failed = not parsed
+            if (parse_failed or not terminal) and args.incomplete_dom_retry_rounds:
+                first_view = displayed_identities(incoming)
+                incoming, end, parsed = expand_dom_comments(page, args.incomplete_dom_retry_rounds, checks=checks)
+                end = end and not (first_view - displayed_identities(incoming))
+                captured = prefer_comment_snapshot(captured, incoming, visible_complete=end and parsed)
+                terminal = end
+                parse_failed = not parsed
+            if not terminal and checks.pending:
+                observation["warnings"] = ["reply_expansion_unconfirmed"]
+    elif expand:
+        observation["warnings"] = ["comments_panel_unavailable"]
     observation["capture_complete"] = bool(panel and terminal and not parse_failed and not has_more(raw_comments))
     apply_displayed_parents(captured, raw_comments, observation["capture_complete"])
     if observation["capture_complete"]:
@@ -760,6 +867,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--verify-replies", action="append", default=[], metavar="EXPECTED_JSON",
                         help="Check unresolved required reply threads on the same note page")
+    parser.add_argument("--task-targets", action="store_true",
+                        help="Use only source rows in --verify-replies and their mapped original note links")
+    parser.add_argument("--map", action="append", default=[], help="Source column mapping for --task-targets")
     parser.add_argument("--headed", action="store_true", help="Use a visible browser window")
     parser.add_argument("--wait-for-confirmation", action="store_true",
                         help="Keep a challenge visible; resume only after owner confirmation via stdin (use a PTY)")
@@ -806,7 +916,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         parser.error("invalid delay bounds")
 
-    targets = targets_from_workbooks(args.input)
+    task_rows = [row for path in args.verify_replies
+                 for row in unwrap_rows(json.loads(Path(path).read_text(encoding="utf-8")), "rows")]
+    if args.task_targets and not task_rows:
+        parser.error("--task-targets needs the converted task rows in --verify-replies")
+    targets = targets_from_workbooks(args.input, task_rows=task_rows if args.task_targets else None,
+                                     mapping=parse_maps(args.map))
     if args.only_note_id:
         targets = [target for target in targets if target["note_id"] in set(args.only_note_id)]
         if not targets:
@@ -819,7 +934,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     existing = previous.copy()
 
     total_targets = len(targets)
-    requirements = load_reply_requirements(args.verify_replies)
+    requirements = group_reply_requirements(task_rows)
     targets = plan_targets(targets, existing, requirements, args.refresh)
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
     if not targets:
@@ -896,7 +1011,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "source_refs": target["sources"],
                 }
                 if incomplete:
-                    observation["warnings"] = ["comment_dom_extraction_incomplete" if dom_parse_failed else "comments_pagination_incomplete"]
+                    observation.setdefault("warnings", []).append(
+                        "comment_dom_extraction_incomplete" if dom_parse_failed else "comments_pagination_incomplete")
                 elif dom_terminal and declared is not None and len(captured) < declared:
                     observation["warnings"] = ["visible_terminal_with_stale_declared_count"]
                 existing[note_id] = observation

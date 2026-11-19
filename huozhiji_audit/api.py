@@ -19,8 +19,8 @@ def convert_table(source: str | Path, *, mapping: dict[str, str] | None = None,
         name = sheet if is_xlsx else None
         if name == "审核汇总":
             raise ValueError("expected_rows_empty")
-        rows = table_to_expected.convert(table_to_expected.read_rows(path, name),
-                                         mapping or {}, path.name, name, amount_rules)
+        data = table_to_expected.read_rows(path, name, target_url_header=(mapping or {}).get("target_url"))
+        rows = table_to_expected.convert(data, mapping or {}, path.name, name, amount_rules)
     if not rows:
         raise ValueError("expected_rows_empty")
     ids = [row.get("case_id") for row in rows]

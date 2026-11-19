@@ -22,23 +22,24 @@ class CheckpointedJobTests(unittest.TestCase):
         self.job = Path(temp.name)
         self.source = self.job / "测试.xlsx"
         self.checkpoint = fixture(self.source)
+        self.rows = runner.convert_xlsx_sheets(self.source, {}, None)
         self.now = datetime.now(timezone.utc)
         for item in self.checkpoint["observations"]:
             item.update(captured_at=self.now.isoformat(), parser_revision=PARSER_REVISIONS["xiaohongshu"],
                         capture_complete=True)
 
     def test_every_workbook_target_needs_a_healthy_latest_capture(self):
-        self.assertTrue(runner.checkpoint_covers_workbook(self.source, self.checkpoint, {}))
-        self.assertFalse(runner.checkpoint_covers_workbook(self.source, {**self.checkpoint, "stopped": True}, {}))
+        self.assertTrue(runner.checkpoint_covers_workbook(self.rows, self.checkpoint, {}))
+        self.assertFalse(runner.checkpoint_covers_workbook(self.rows, {**self.checkpoint, "stopped": True}, {}))
         captures = self.checkpoint["observations"]
-        self.assertFalse(runner.checkpoint_covers_workbook(self.source, {"observations": captures[:-1]}, {}))
+        self.assertFalse(runner.checkpoint_covers_workbook(self.rows, {"observations": captures[:-1]}, {}))
         for change in ({"image_detection_complete": False}, {"parser_revision": "old"},
                        {"capture_status": "captcha"}, {"capture_complete": False},
                        {"captured_at": (self.now - timedelta(days=2)).isoformat()}):
             with self.subTest(change=change):
                 latest = [*captures, {**captures[0], **change}]
                 self.assertFalse(runner.has_healthy_capture(latest, captures[0]["target_key"]))
-                self.assertFalse(runner.checkpoint_covers_workbook(self.source, {"observations": latest}, {}))
+                self.assertFalse(runner.checkpoint_covers_workbook(self.rows, {"observations": latest}, {}))
 
     def test_live_job_rechecks_missing_parent_even_on_a_complete_checkpoint(self):
         captures = self.checkpoint["observations"]
@@ -50,7 +51,7 @@ class CheckpointedJobTests(unittest.TestCase):
                     dict(text="child", comment_id="c", has_image=False)]
         captures[0]["comments"] = comments
         requirements = runner.group_reply_requirements(rows)
-        self.assertFalse(runner.checkpoint_covers_workbook(self.source, self.checkpoint, requirements))
+        self.assertFalse(runner.checkpoint_covers_workbook(rows, self.checkpoint, requirements))
         checkpoint = self.job / "observations.json"
         runner.write_state(checkpoint, self.checkpoint)
 
@@ -69,7 +70,77 @@ class CheckpointedJobTests(unittest.TestCase):
             capture.assert_called_once()
         results = json.loads((self.job / "review-report.json").read_text(encoding="utf-8"))["results"]
         self.assertEqual(results[1]["triage"], "成功")
-        self.assertTrue(runner.checkpoint_covers_workbook(self.source, self.checkpoint, requirements))
+        self.assertTrue(runner.checkpoint_covers_workbook(rows, self.checkpoint, requirements))
+
+    def test_incomplete_first_note_recovers_and_reviews_every_row(self):
+        observations = self.checkpoint["observations"]
+        calls = []
+        def collect(argv):
+            key = argv[argv.index("--only-note-id") + 1] if "--only-note-id" in argv else None
+            calls.append(key)
+            if key is None:
+                captures = observations
+            else:
+                captures = [{**observations[0], "capture_complete": False}]
+                if key == "n2":
+                    captures.append(observations[1])
+            runner.write_state(self.job / "observations.json", {"observations": captures})
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=collect):
+            self.assertEqual(runner.main(), 0)
+        self.assertEqual(calls, ["n1", "n2", None])
+        manifest = json.loads((self.job / "job-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["total"], len(self.rows))
+
+    def test_platform_stop_records_unvisited_rows_without_opening_another_note(self):
+        import subprocess
+        def stop(argv):
+            runner.write_state(self.job / "observations.json", {"observations": [
+                {"platform": "xiaohongshu", "target_key": "n1", "capture_status": "captcha"}
+            ], "stopped": True, "stop_reason": "captcha"})
+            raise subprocess.CalledProcessError(3, argv)
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=stop) as calls:
+            self.assertEqual(runner.main(), 3)
+        self.assertEqual(calls.call_count, 1)
+        manifest = json.loads((self.job / "job-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["coverage"]["rows_without_capture_record"], 5)
+
+    def test_only_incomplete_actionable_note_is_recaptured_before_export(self):
+        original = self.checkpoint["observations"]
+        original[2]["capture_complete"] = False
+        runner.write_state(self.job / "observations.json", self.checkpoint)
+        calls = []
+        def collect(argv):
+            keys = [argv[i + 1] for i, value in enumerate(argv) if value == "--only-note-id"]
+            calls.append(keys)
+            if keys:
+                self.assertEqual(keys, ["n3"])
+                recovered = {**original[2], "capture_complete": True,
+                             "comments": [{"text":"待验证", "has_image":False}]}
+                path = Path(argv[argv.index("--output") + 1])
+                runner.write_state(path, {"observations": [recovered]})
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=collect):
+            self.assertEqual(runner.main(), 0)
+        self.assertEqual(calls, [[], ["n3"]])
+        results = json.loads((self.job / "review-report.json").read_text(encoding="utf-8"))["results"]
+        self.assertEqual(len(results), 6)
+        self.assertEqual(results[2]["triage"], "成功")
+
+    def test_recheck_preserves_an_observed_comment_if_the_new_view_loses_it(self):
+        rows = [{**row, "target_key": "n1"} for row in self.rows[:2]]
+        prior = {**self.checkpoint["observations"][0], "capture_complete": False}
+        first = {"observations": [prior]}
+        report = runner.compare(rows, [prior], amount_mode="expected-only")
+        def empty_page(argv):
+            path = Path(argv[argv.index("--output") + 1])
+            runner.write_state(path, {"observations": [{**prior, "comments": []}]})
+        with patch.object(runner, "run_capture", side_effect=empty_page):
+            checkpoint, checked = runner.retry_incomplete_notes(
+                rows, first, report, self.job / "checkpoint.json", ["capture", "--output", "initial.json"], set())
+        self.assertEqual(checkpoint["observations"], [prior])
+        self.assertEqual([r["triage"] for r in checked["results"]], ["成功", "待人审"])
 
     def test_completed_checkpoint_uses_source_rates_and_writes_all_outputs(self):
         with zipfile.ZipFile(self.source) as archive:

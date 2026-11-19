@@ -39,7 +39,7 @@ PUNCTUATION = re.compile(
 )
 XHS_EMOJI_TOKEN = re.compile(r"\[[^\[\]]+R\]", flags=re.IGNORECASE)
 DISPLAY_FORMAT = re.compile("[\u200b\u2060\ufeff\ufe0e\ufe0f]")
-LEGACY_XHS_REVISION = "xhs-replies-20261118-v4"
+LEGACY_XHS_REVISIONS = {"xhs-replies-20261118-v4", "xhs-visible-end-v5"}
 AMOUNT_TOKEN = re.compile(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)(?:\s*)(万|千|百)?(?![\d.])")
 
 
@@ -89,9 +89,10 @@ def has_text(value: Any) -> bool:
     return bool(normalize_text(value))
 
 
-def infer_type(row: Dict[str, Any]) -> Optional[str]:
+def infer_type(row: Dict[str, Any], *, text_present: Optional[bool] = None) -> Optional[str]:
     explicit = canonical_type(row.get("comment_type"))
-    text_present = has_text(row.get("comment_text", row.get("text", "")))
+    if text_present is None:
+        text_present = has_text(row.get("comment_text", row.get("text", "")))
     image_value = row.get("has_image", row.get("image", None))
     image_present = bool(image_value) if image_value is not None else False
     if explicit:
@@ -358,25 +359,44 @@ def _identifier(value):
     return str(value).strip() if type(value) in (str, int) else ""
 
 
+_ABSENT = object()
+
+
+def _same_observed_fields(left, right, fields):
+    for field in fields:
+        a, b = left.get(field, _ABSENT), right.get(field, _ABSENT)
+        if type(a) is not type(b) or a != b:
+            return False
+    return True
+
+
+def _same_stable_record(left, right):
+    # Amounts and relationship assertions must agree even across two adapters.
+    if not _same_observed_fields(left, right, ("observed_amount", "amount_source", "parent_comment_id",
+                                               "parent_text", "thread_root_deleted", "deleted")):
+        return False
+    a, b = _observed_body(left), _observed_body(right)
+    if a != b and DISPLAY_FORMAT.sub("", str(a)) != DISPLAY_FORMAT.sub("", str(b)):
+        return False
+    if _same_observed_fields(left, right, ("comment_type", "has_image", "image")):
+        return True
+    # An explicit text type and has_image=False can describe the same row.
+    return _observed_type(left) == _observed_type(right) and image_signal(left) == image_signal(right)
+
+
 def _distinct_matches(comments):
     """Repeated snapshots can show the same stable ID, including at a new DOM index."""
     if len(comments) < 2:
         return comments
     first_by_id = {}
     distinct = []
-    fields = ("comment_type", "has_image", "image", "observed_amount", "amount_source",
-              "parent_comment_id", "parent_text", "thread_root_deleted", "deleted")
-    def record(comment):
-        return (_observed_body(comment),
-                [(field in comment, type(comment.get(field)), comment.get(field)) for field in fields])
-
     for comment in comments:
         cid = _identifier(comment.get("comment_id"))
         if cid and cid not in ("0", "-1"):
             position = first_by_id.get(cid)
             if position is not None:
                 previous = distinct[position]
-                if record(previous) == record(comment):
+                if _same_stable_record(previous, comment):
                     if comment.get("parent_evidence") and not previous.get("parent_evidence"):
                         distinct[position] = comment
                     continue
@@ -387,15 +407,15 @@ def _distinct_matches(comments):
 
 
 def _legacy_xhs(capture):
-    return capture["platform"] == "xiaohongshu" and capture.get("parser_revision") == LEGACY_XHS_REVISION
+    return capture["platform"] == "xiaohongshu" and capture.get("parser_revision") in LEGACY_XHS_REVISIONS
 
 
-def _matching_replies(evidence, parent_text, candidates):
-    if not parent_text or not candidates:
-        return []
+def _observed_roots(evidence, parent_text):
     parents = []
     nested_ids = set()
     for record in evidence.by_text.get(parent_text, []):
+        if record.get("deleted") or record.get("thread_root_deleted"):
+            return []
         if _identifier(record.get("parent_comment_id")) or normalize_text(record.get("parent_text")):
             nested_ids.add(_identifier(record.get("comment_id")))
         else:
@@ -406,29 +426,89 @@ def _matching_replies(evidence, parent_text, candidates):
     parent_id = _identifier(parents[0].get("comment_id"))
     if parent_id and parent_id in nested_ids:
         return []  # Contradictory placement for the same observed parent.
+    return parents
+
+
+def _other_displayed_parents(evidence, intended, candidates):
+    intended_id = _identifier(intended.get("comment_id"))
+    if len(evidence.usable) != 1 or intended_id in ("", "0", "-1"):
+        return None
+    records = evidence.by_comment_id
+    if len(records.get(intended_id, ())) != 1:
+        return None
+    others = {}
+    for comment in candidates:
+        child_id = _identifier(comment.get("comment_id"))
+        direct_id = _identifier(comment.get("parent_comment_id"))
+        if (child_id in ("", "0", "-1") or direct_id in ("", "0", "-1", child_id, intended_id)
+                or len(records.get(child_id, ())) != 1 or len(records.get(direct_id, ())) != 1
+                or comment.get("deleted") or comment.get("thread_root_deleted")):
+            return None
+        other = records[direct_id][0]
+        body = _matching_text(other)
+        label = normalize_text(comment.get("parent_text"))
+        if (not body or (label and label != body) or other.get("deleted") or other.get("thread_root_deleted")
+                or _identifier(other.get("parent_comment_id")) or normalize_text(other.get("parent_text"))):
+            return None
+        others[direct_id] = {"comment_id": direct_id, "text": _observed_body(other)}
+    return list(others.values())
+
+
+def _reply_negative_capture(evidence, parent_text, candidates, expected_text):
+    if not parent_text or not evidence.complete:
+        return None
+    # A rendered card can include "回复 @用户名" in the same span as the
+    # message. A suffix is too weak for success but prevents claiming absence.
+    if any(body.endswith(expected_text) and body != expected_text for body in evidence.addressed_texts):
+        return None
+    for parent in _observed_roots(evidence, parent_text):
+        source = evidence.source(parent)
+        if (source["platform"] == "xiaohongshu" and source.get("capture_complete") is True
+                and source.get("capture_complete_source") == "visible_comment_list_end"
+                and source.get("image_detection_complete") is True and not _legacy_xhs(source)):
+            capture = {**_capture_details(parent, source), "capture_complete_source": "visible_comment_list_end",
+                       "parent_text": _observed_body(parent)}
+            if not candidates:
+                return "not_found", "reply_text_absent_after_visible_end", capture
+            others = _other_displayed_parents(evidence, parent, candidates)
+            if others:
+                capture.update(parent_comment_id=parent["comment_id"], observed_parents=others)
+                return "mismatch", "reply_confirmed_under_other_parent", capture
+    return None
+
+
+def _matching_replies(evidence, parent_text, candidates):
+    if not parent_text or not candidates:
+        return []
+    parents = _observed_roots(evidence, parent_text)
+    if not parents:
+        return []
+    parent_id = _identifier(parents[0].get("comment_id"))
     parent_records = {id(p) for p in parents}
     captures_with_parent = {id(evidence.source(p)) for p in parents}
     replies = []
+    contradicted = set()
     for comment in candidates:
         source = evidence.source(comment)
-        if id(source) not in captures_with_parent or id(comment) in parent_records:
-            continue
         direct_id = _identifier(comment.get("parent_comment_id"))
         direct_text = normalize_text(comment.get("parent_text"))
+        child_id = _identifier(comment.get("comment_id"))
+        if ((direct_id and direct_id != parent_id) or (direct_text and direct_text != parent_text)
+                or ("parent_comment_id" in comment and not direct_id) or comment.get("deleted")
+                or comment.get("thread_root_deleted")):
+            if child_id not in ("", "0", "-1"):
+                contradicted.add(child_id)
+            continue
+        if id(source) not in captures_with_parent or id(comment) in parent_records:
+            continue
         if comment.get("parent_evidence") == "single_visible_reply_under_root":
             if source.get("capture_complete") is not True or not direct_text or comment.get("thread_root_deleted") is True:
                 continue  # Page grouping requires a complete view and an intact, identified root.
-        if "parent_comment_id" in comment and not direct_id:
-            continue  # Explicitly top-level, or unusable identifier.
-        if direct_id and direct_id != parent_id:
-            continue
-        if direct_text and direct_text != parent_text:
-            continue
         if parent_id and _identifier(comment.get("comment_id")) == parent_id:
             continue
         if (direct_id and direct_id == parent_id) or (direct_text and direct_text == parent_text):
             replies.append(comment)
-    return replies
+    return [c for c in replies if _identifier(c.get("comment_id")) not in contradicted] if contradicted else replies
 
 
 class _TargetEvidence:
@@ -483,6 +563,18 @@ class _TargetEvidence:
         for text, comment in zip(self.normalized_texts, self.comments):
             by_text.setdefault(text, []).append(comment)
         return by_text
+
+    @cached_property
+    def addressed_texts(self):
+        return [text for text, comment in zip(self.normalized_texts, self.comments)
+                if str(_observed_body(comment)).lstrip().startswith(("回复", "回覆", "@", "＠"))]
+
+    @cached_property
+    def by_comment_id(self):
+        records = {}
+        for comment in self.comments:
+            records.setdefault(_identifier(comment.get("comment_id")), []).append(comment)
+        return records
 
     @cached_property
     def by_type(self):
@@ -607,13 +699,17 @@ def compare(
         by_target[key].captures.append(item)
 
     combo_rows_by_target: Dict[Tuple[str, str], int] = {}
+    expected_signals = []
     for index, row in enumerate(expected_rows):
         key = (platform_key(row), target_key(row))
         evidence = by_target.get(key)
         if evidence is not None:
             evidence.row_count += 1
             evidence.last_row_index = index
-        if infer_type({**row, "comment_text": row.get("comment_text", "")}) == "text+image":
+        text = normalize_text(row.get("comment_text", ""))
+        expected_type = infer_type(row, text_present=bool(text))
+        expected_signals.append((text, expected_type))
+        if expected_type == "text+image":
             combo_rows_by_target[key] = combo_rows_by_target.get(key, 0) + 1
 
     results: List[Dict[str, Any]] = []
@@ -639,8 +735,7 @@ def compare(
         for provenance_key in ("source_file", "source_sheet", "source_row"):
             if provenance_key in expected:
                 result[provenance_key] = expected[provenance_key]
-        expected_text = normalize_text(expected.get("comment_text", ""))
-        expected_type = infer_type({**expected, "comment_text": expected.get("comment_text", "")})
+        expected_text, expected_type = expected_signals[index]
         if expected_type == "text" and not expected_text:
             expected_type = None
         result["expected_type"] = expected_type
@@ -691,7 +786,12 @@ def compare(
             if not same_text and expected_type == "text+image":
                 reply_images = _matching_replies(evidence, parent_text, evidence.image_only)
             if not same_text and not reply_images:
-                result["reason_codes"].append("reply_parent_unconfirmed" if parent_text else "reply_source_parent_ambiguous")
+                decision = _reply_negative_capture(evidence, parent_text, possible, expected_text) if expected_type == "text" else None
+                if decision:
+                    status, reason, capture = decision
+                    result.update(status=status, reason_codes=[reason], capture=capture)
+                else:
+                    result["reason_codes"].append("reply_parent_unconfirmed" if parent_text else "reply_source_parent_ambiguous")
                 if possible:
                     result["candidates"] = [compact_comment(c) for c in possible]
                 results.append(result)

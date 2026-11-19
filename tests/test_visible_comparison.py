@@ -70,12 +70,13 @@ class VisibleComparisonTests(unittest.TestCase):
         self.assertIsNone(r["approved_amount"])
 
     def test_older_xhs_capture_can_prove_presence_not_absence(self):
-        legacy = "xhs-replies-20261118-v4"
-        original = self.cap([], parser_revision=legacy)
-        r = self.outcome(original)
-        self.assertEqual(r["triage"], "待人审")
-        self.assertIn("legacy_xhs_visible_recheck_required", r["reason_codes"])
-        self.assertEqual(self.outcome(dict(original, comments=[self.seen]))["status"], "verified")
-        self.assertEqual(self.outcome(original, self.cap([]))["status"], "not_found")
-        dy = dict(original, platform="douyin")
-        self.assertEqual(self.outcome(dy, row=dict(self.row, platform="douyin"))["status"], "not_found")
+        for legacy in ("xhs-replies-20261118-v4", "xhs-visible-end-v5"):
+            with self.subTest(legacy=legacy):
+                original = self.cap([], parser_revision=legacy)
+                r = self.outcome(original)
+                self.assertEqual(r["triage"], "待人审")
+                self.assertIn("legacy_xhs_visible_recheck_required", r["reason_codes"])
+                self.assertEqual(self.outcome(dict(original, comments=[self.seen]))["status"], "verified")
+                self.assertEqual(self.outcome(original, self.cap([]))["status"], "not_found")
+                dy = dict(original, platform="douyin")
+                self.assertEqual(self.outcome(dy, row=dict(self.row, platform="douyin"))["status"], "not_found")

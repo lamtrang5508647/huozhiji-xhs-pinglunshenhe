@@ -12,7 +12,12 @@ def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) 
             or len(set(actual_ids)) != len(actual_ids) or set(expected_ids) != set(actual_ids)):
         raise RuntimeError("report_row_identity_mismatch")
     payout = Decimal("0")
+    sources = {row["case_id"]: row for row in rows}
     for item in results:
+        source = sources[item["case_id"]]
+        for field in ("source_file", "source_sheet", "source_row"):
+            if field in item and field in source and item[field] != source[field]:
+                raise RuntimeError("report_source_location_mismatch")
         triage, category = item.get("triage"), item.get("result_category")
         if triage not in ("成功", "失败", "待人审") or category not in ("成功", "失败", "待人审", "图字成功", "文字成功", "图片成功"):
             raise RuntimeError("report_category_missing_or_invalid")

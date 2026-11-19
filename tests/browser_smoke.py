@@ -15,6 +15,8 @@ from xhs_cli.client import XhsClient
 from xhs_visible_login import load_xhs_modules as login_modules
 from xhs_batch_capture import expand_dom_comments, load_xhs_modules as capture_modules
 from test_xhs_batch_capture import exercise_real_reply_recheck, exercise_visible_comments
+import xhs_batch_capture
+from deferred_comments import exercise_deferred_comments
 
 assert login_modules()[-1] is XhsClient
 assert capture_modules()[2] is XhsClient
@@ -54,6 +56,7 @@ with tempfile.TemporaryDirectory(prefix="audit-browser-") as directory:
                 if iteration == 0:
                     exercise_real_reply_recheck(page)
                     exercise_visible_comments(page)
+                    exercise_deferred_comments(page, xhs_batch_capture)
                 context.close()
     # Exercise the actual supported XHS client interface with our Chrome wrapper.
     client = persistent_client(XhsClient, {}, str(Path(directory) / "xhs 测试"),

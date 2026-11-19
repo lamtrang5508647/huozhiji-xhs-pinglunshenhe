@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
+try:
+    from .review_comments import canonical_type
+except ImportError:
+    from review_comments import canonical_type
+
 
 FIELD_ALIASES = {
     "case_id": ["case_id", "caseid", "订单号", "编号", "案例id", "id"],
@@ -27,7 +32,7 @@ FIELD_ALIASES = {
     "comment_text": ["comment_text", "commenttext", "评论文字需求", "评论内容", "评论", "文字"],
     "comment_type": ["comment_type", "commenttype", "评论类型", "类型", "形式"],
     "expected_amount": ["expected_amount", "expectedamount", "金额", "返现金额", "核对金额", "amount"],
-    "reply_text": ["reply_text", "replytext", "需要回复评论内容左边填写回第几条", "回复内容"],
+    "reply_text": ["reply_text", "replytext", "需要回复评论内容左边填写回第几条", "需要回复评论内容", "回复评论内容", "回复内容"],
     "image_requirement": ["image_requirement", "imagerequirement", "评论图片需求", "图片需求"],
     "product_name": ["product_name", "productname", "产品名", "产品"],
     "group_leader": ["group_leader", "groupleader", "团长", "团"],
@@ -82,10 +87,13 @@ def xlsx_text(cell: ET.Element, shared_strings: List[str]) -> str:
         return "".join(item.text or "" for item in inline.iter() if local_name(item.tag) == "t") if inline is not None else ""
     value = child(cell, "v")
     raw = "" if value is None or value.text is None else value.text
-    if not raw:
+    if not raw or cell_type == "e":
         formula = child(cell, "f")
         if formula is not None and formula.text:
-            return "=" + formula.text
+            if re.match(r"^(?:_xlfn\.)?DISPIMG\s*\(", formula.text, re.IGNORECASE):
+                return "embedded-image.png"
+            if not raw:
+                return "=" + formula.text
     if cell_type == "s" and raw:
         return shared_strings[int(raw)]
     if cell_type == "b":
@@ -128,17 +136,23 @@ def resolve_xlsx_target(source_member: str, target: str) -> str:
     return posixpath.normpath(posixpath.join(posixpath.dirname(source_member), normalized))
 
 
-def worksheet_image_cells(archive: zipfile.ZipFile, worksheet_member: str) -> List[Tuple[int, int]]:
-    """Return zero-based worksheet cells containing floating drawing pictures."""
+def worksheet_relationships(archive: zipfile.ZipFile, worksheet_member: str):
     rels_member = posixpath.join(
         posixpath.dirname(worksheet_member),
         "_rels",
         posixpath.basename(worksheet_member) + ".rels",
     )
-    if rels_member not in archive.namelist():
+    try:
+        raw = archive.read(rels_member)
+    except KeyError:
         return []
+    return ET.fromstring(raw)
 
-    relationships = ET.fromstring(archive.read(rels_member))
+
+def worksheet_image_cells(archive: zipfile.ZipFile, worksheet_member: str, relationships=None) -> List[Tuple[int, int]]:
+    """Return zero-based worksheet cells containing floating drawing pictures."""
+    if relationships is None:
+        relationships = worksheet_relationships(archive, worksheet_member)
     drawing_members = []
     for relationship in relationships:
         if local_name(relationship.tag) != "Relationship":
@@ -197,7 +211,7 @@ def xlsx_shared_strings(archive: zipfile.ZipFile) -> List[str]:
     return ["".join(item.text or "" for item in si.iter() if local_name(item.tag) == "t") for si in root]
 
 
-def read_xlsx(path: Path, sheet_name: Optional[str] = None) -> List[Dict[str, Any]]:
+def read_xlsx(path: Path, sheet_name: Optional[str] = None, *, target_url_header: Optional[str] = None) -> List[Dict[str, Any]]:
     with zipfile.ZipFile(path) as archive:
         sheets = xlsx_sheet_members(archive)
         if not sheets:
@@ -205,12 +219,14 @@ def read_xlsx(path: Path, sheet_name: Optional[str] = None) -> List[Dict[str, An
         selected = sheet_name or next(iter(sheets))
         if selected not in sheets:
             raise ValueError(f"Worksheet not found: {selected}")
-        return read_worksheet(archive, sheets[selected], xlsx_shared_strings(archive))
+        return read_worksheet(archive, sheets[selected], xlsx_shared_strings(archive), target_url_header=target_url_header)
 
 
-def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[str]) -> List[Dict[str, Any]]:
+def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[str], *,
+                   target_url_header: Optional[str] = None) -> List[Dict[str, Any]]:
     root = ET.fromstring(archive.read(member))
-    image_cells = worksheet_image_cells(archive, member)
+    relationships = worksheet_relationships(archive, member)
+    image_cells = worksheet_image_cells(archive, member, relationships)
     merged_ranges = [
         item.attrib.get("ref", "")
         for item in root.iter()
@@ -236,6 +252,26 @@ def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[s
             matrix.append({})
         if not matrix[row_index].get(column_index, ""):
             matrix[row_index][column_index] = "embedded-image.png"
+    hyperlinks = child(root, "hyperlinks")
+    if matrix and hyperlinks is not None:
+        link_header = target_url_header or resolve_mapping(matrix[0].values(), {}).get("target_url")
+        link_columns = {index for index, name in matrix[0].items() if name and name == link_header}
+        destinations = {rel.get("Id"): rel.get("Target", "") for rel in relationships
+                        if rel.get("Type", "").endswith("/hyperlink") and rel.get("TargetMode") == "External"}
+        rel_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        for link in hyperlinks:
+            target = destinations.get(link.get(rel_id), "")
+            if not target.lower().startswith(("https://", "http://")):
+                continue
+            bounds = link.get("ref", "").split(":")
+            if not all(re.fullmatch(r"[A-Za-z]+[1-9]\d*", ref) for ref in bounds):
+                continue
+            left, top = cell_reference(bounds[0])
+            right, bottom = cell_reference(bounds[-1])
+            for col in link_columns:
+                if left <= col <= right:
+                    for row_index in range(max(top, 1), min(bottom + 1, len(matrix))):
+                        matrix[row_index][col] = target
     for merged in merged_ranges:
         if ":" not in merged:
             continue
@@ -259,14 +295,14 @@ def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[s
     return [{headers[index]: row.get(index, "") for index in range(max_col + 1) if headers[index]} for row in matrix[1:]]
 
 
-def read_rows(path: Path, sheet_name: Optional[str]) -> List[Dict[str, Any]]:
+def read_rows(path: Path, sheet_name: Optional[str], *, target_url_header: Optional[str] = None) -> List[Dict[str, Any]]:
     suffix = path.suffix.casefold()
     if suffix == ".json":
         return read_json(path)
     if suffix in {".csv", ".tsv"}:
         return read_delimited(path)
     if suffix == ".xlsx":
-        return read_xlsx(path, sheet_name)
+        return read_xlsx(path, sheet_name, target_url_header=target_url_header)
     raise ValueError("Supported table formats: .csv, .tsv, .json, .xlsx")
 
 
@@ -397,7 +433,13 @@ def convert(
 ) -> List[Dict[str, Any]]:
     if not rows:
         return []
-    mapping = resolve_mapping(rows[0].keys(), explicit)
+    # CSV and XLSX have rectangular headers. Sparse JSON may introduce the
+    # reply or image field on a later row.
+    headers = dict.fromkeys(key for row in rows for key in row) if source_name.lower().endswith(".json") else rows[0].keys()
+    for field, header in explicit.items():
+        if header not in headers:
+            raise ValueError(f"Mapped column not found in {source_sheet or source_name}: {field}={header}")
+    mapping = resolve_mapping(headers, explicit)
     if "group_leader" in mapping and norm_header(mapping["group_leader"]) == norm_header("负责人"):
         raise ValueError("group_leader must use the 团长/团 field; 负责人 abbreviations are not allowed")
     if "expected_amount" in mapping:
@@ -408,8 +450,12 @@ def convert(
     missing = []
     if "target_key" not in mapping and "target_url" not in mapping:
         missing.append("target_key or target_url")
+    if not {"comment_text", "reply_text", "image_requirement"}.intersection(mapping):
+        type_header = mapping.get("comment_type")
+        if not type_header or not any(str(row.get(type_header) or "").strip() for row in rows):
+            missing.append("comment_text, reply_text, image_requirement or populated comment_type")
     if missing:
-        raise ValueError("Missing required column mapping: " + ", ".join(missing))
+        raise ValueError(f"Missing required column mapping in {source_sheet or source_name}: " + ", ".join(missing))
     output = []
     previous_target_url = ""
     previous_target_key = ""
@@ -508,7 +554,8 @@ def convert(
             item["comment_text"] = ""
         if str(image_value).strip():
             item["image_requirement"] = str(image_value).strip()
-        item["has_image"] = looks_like_image_requirement(image_value)
+        explicit_type = canonical_type(item.get("comment_type"))
+        item["has_image"] = looks_like_image_requirement(image_value) or explicit_type in ("image", "text+image")
         if "comment_type" not in item or not str(item["comment_type"]).strip():
             if item["comment_text"] and item["has_image"]:
                 item["comment_type"] = "text+image"
@@ -518,13 +565,14 @@ def convert(
                 item["comment_type"] = "image"
         # A URL-only placeholder row is not an audit task. Excluding it avoids
         # inflating human-review counts with rows that contain no requirement.
-        if not item["comment_text"] and not item["has_image"]:
+        if not item["comment_text"] and not item["has_image"] and not str(item.get("comment_type", "")).strip():
             continue
+        rate_type = explicit_type or item.get("comment_type", "")
         if "expected_amount" not in item or not str(item["expected_amount"]).strip():
-            rule = resolved_amount_rules.get(str(item.get("comment_type", "")).strip())
+            rule = resolved_amount_rules.get(rate_type)
             if rule is not None:
                 item["expected_amount"] = rule
-        if item.get("comment_type") == "text+image":
+        if rate_type == "text+image":
             if resolved_amount_rules.get("text") is not None:
                 item["partial_text_amount"] = resolved_amount_rules["text"]
             if resolved_amount_rules.get("image") is not None:
@@ -542,7 +590,7 @@ def convert_xlsx_sheets(path: Path, explicit: Dict[str, str], amount_rules: Opti
         for name, member in sheets.items():
             if skip_summary and name == "审核汇总":
                 continue
-            rows = read_worksheet(archive, member, strings)
+            rows = read_worksheet(archive, member, strings, target_url_header=explicit.get("target_url"))
             converted.extend(convert(rows, explicit, path.name, name, amount_rules))
     return converted
 
@@ -564,7 +612,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             converted = convert_xlsx_sheets(source, explicit, rules)
         else:
             sheet_name = args.sheet if source.suffix.casefold() == ".xlsx" else None
-            converted = convert(read_rows(source, sheet_name), explicit, source.name, sheet_name, rules)
+            converted = convert(read_rows(source, sheet_name, target_url_header=explicit.get("target_url")),
+                                explicit, source.name, sheet_name, rules)
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({"rows": converted}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

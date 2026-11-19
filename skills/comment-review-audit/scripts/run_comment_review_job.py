@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import zipfile
 from decimal import Decimal
 from hashlib import sha256
@@ -22,7 +23,7 @@ from profile_lock import default_profile
 from review_comments import compare, unwrap_rows
 from runtime_environment import child_environment, configure_stdio
 from table_to_expected import convert_xlsx_sheets, parse_amount_rules, parse_maps
-from xhs_batch_capture import group_reply_requirements, needs_reply_recheck, plan_targets, targets_from_workbooks
+from xhs_batch_capture import group_reply_requirements, needs_reply_recheck, plan_targets
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -76,15 +77,85 @@ def has_healthy_capture(observations: list[dict[str, Any]], target_key: str) -> 
     return reusable_capture(last, "xiaohongshu", target_key)
 
 
-def checkpoint_covers_workbook(source, checkpoint, requirements):
+def checkpoint_covers_workbook(rows, checkpoint, requirements):
     if checkpoint.get("stopped"):
         return False
     captures = unwrap_rows(checkpoint, "observations")
     if not captures:
         return False
     existing = {str(item.get("target_key")): item for item in captures if item.get("platform") == "xiaohongshu"}
-    targets = targets_from_workbooks([str(source)])
+    keys = dict.fromkeys(str(row["target_key"]) for row in rows
+                         if row.get("platform") == "xiaohongshu" and row.get("target_key"))
+    targets = [{"note_id": key} for key in keys]
     return bool(targets) and not plan_targets(targets, existing, requirements)
+
+
+def capture_progress(rows, checkpoint):
+    """Inventory attempts, including blocked notes. Counts are not publication verdicts."""
+    attempted = {(item.get("platform"), str(item.get("target_key")))
+                 for item in unwrap_rows(checkpoint, "observations")}
+    tasks = [(row.get("platform"), str(row.get("target_key"))) for row in rows]
+    return {"task_rows": len(tasks), "unique_targets": len(set(tasks)),
+            "rows_with_capture_record": sum(key in attempted for key in tasks),
+            "rows_without_capture_record": sum(key not in attempted for key in tasks)}
+
+
+def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, already_retried):
+    """One additional visit per unresolved note, retaining stronger first-pass evidence."""
+    captures = unwrap_rows(checkpoint, "observations")
+    current = {str(item["target_key"]): item for item in captures if item.get("platform") == "xiaohongshu"}
+    retry = {}
+    for result in report["results"]:
+        key = result["target_key"]
+        if result["platform"] != "xiaohongshu" or result["triage"] != "待人审" or key in already_retried:
+            continue
+        record = current.get(key, {})
+        if record.get("capture_status") in ("captcha", "session_expired", "risk_control", "network_changed"):
+            continue
+        if record.get("capture_complete") is True and record.get("image_detection_complete") is not False:
+            continue
+        if result["status"] == "blocked" or set(result["reason_codes"]).intersection(
+                {"reply_parent_unconfirmed", "comment_image_presence_unknown"}):
+            retry[key] = []
+    if not retry:
+        return checkpoint, report
+    for row in rows:
+        if row.get("platform") == "xiaohongshu" and row.get("target_key") in retry:
+            retry[row["target_key"]].append(row)
+    settled = {key: set() for key in retry}
+    for result in report["results"]:
+        if result["platform"] == "xiaohongshu" and result["target_key"] in retry and result["triage"] == "成功":
+            settled[result["target_key"]].add(result["case_id"])
+    with tempfile.TemporaryDirectory(dir=path.parent, prefix="capture-recheck-") as directory:
+        fresh_path = Path(directory) / "observations.json"
+        command = capture_command.copy()
+        command[command.index("--output") + 1] = str(fresh_path)
+        for key in retry:
+            command.extend(["--only-note-id", key])
+        try:
+            run_capture(command)
+        finally:
+            fresh = read_checkpoint(fresh_path)
+            replacements = {}
+            for item in unwrap_rows(fresh, "observations"):
+                key = str(item.get("target_key"))
+                if item.get("platform") != "xiaohongshu" or key not in retry:
+                    continue
+                if current.get(key, {}).get("capture_status") == "ok" and item.get("capture_status") != "ok":
+                    continue
+                if settled[key]:
+                    checked = compare(retry[key], [item], amount_mode="expected-only")["results"]
+                    if not settled[key].issubset(r["case_id"] for r in checked if r["triage"] == "成功"):
+                        continue
+                replacements[key] = item
+            kept = [c for c in captures if c.get("platform") != "xiaohongshu" or str(c.get("target_key")) not in replacements]
+            checkpoint = {**checkpoint, **fresh, "observations": kept + list(replacements.values())}
+            if fresh.get("stopped"):
+                stopped = next((c for c in reversed(fresh.get("observations", []))
+                                if c.get("capture_status") in ("captcha", "session_expired", "risk_control")), {})
+                checkpoint["stop_target_key"] = stopped.get("target_key")
+            write_state(path, checkpoint)
+    return checkpoint, compare(rows, checkpoint["observations"], amount_mode="expected-only")
 
 
 def discover_node_modules(explicit: str | None) -> str:
@@ -171,8 +242,11 @@ def main() -> int:
         reason = str(exc)
         if isinstance(exc, subprocess.CalledProcessError):
             reason = read_checkpoint(observations).get("stop_reason") or "subprocess_failed"
-        write_state(manifest, {"status": phase, "source": str(source), "source_sha256": source_hash,
-                               "reason": reason, "checkpoint": str(observations)})
+        state = {"status": phase, "source": str(source), "source_sha256": source_hash,
+                 "reason": reason, "checkpoint": str(observations)}
+        if phase == "blocked" and expected.exists():
+            state["coverage"] = capture_progress(unwrap_rows(read_checkpoint(expected), "rows"), read_checkpoint(observations))
+        write_state(manifest, state)
         print(f"[job] {phase}: {reason}; checkpoint retained", flush=True)
         return 3 if phase == "blocked" else 1
 
@@ -193,18 +267,23 @@ def execute_job(args, source, expected, observations, report, output, previews, 
         target = next((str(item["target_key"]) for item in reversed(captures)
                        if item.get("capture_status") in ("captcha", "session_expired", "risk_control")
                        and str(item.get("target_key")) in row_targets), target)
+        if checkpoint.get("stop_target_key") in row_targets:
+            target = checkpoint["stop_target_key"]
     capture_base = [
         sys.executable,
         str(SCRIPT_DIR / "xhs_batch_capture.py"),
         "--input", str(source), "--output", str(observations), "--verify-replies", str(expected),
-        "--profile", args.profile, "--expand-dom", "--headed",
+        "--task-targets", "--profile", args.profile, "--expand-dom", "--headed",
     ]
+    for mapping in args.maps or ():
+        capture_base.extend(["--map", mapping])
     if not args.normal_pace:
         capture_base.append("--risk-averse")
     if args.wait_for_confirmation:
         capture_base.append("--wait-for-confirmation")
     last_canary = next((item for item in reversed(captures) if item.get("platform") == "xiaohongshu"
                         and str(item.get("target_key")) == target), None)
+    already_retried = set()
     if (restoring_session or not reusable_capture(last_canary, "xiaohongshu", target)
             or needs_reply_recheck(requirements.get(target, []), last_canary)):
         canary = capture_base + ["--only-note-id", target]
@@ -212,19 +291,32 @@ def execute_job(args, source, expected, observations, report, output, previews, 
             canary.append("--refresh")
         run_capture(canary)
         checkpoint = read_checkpoint(observations)
-        if not has_healthy_capture(unwrap_rows(checkpoint, "observations"), target):
+        healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), target)
+        if not healthy and not restoring_session and not checkpoint.get("stopped"):
+            # An isolated inaccessible or incomplete post cannot establish session health.
+            # Try one other assigned note before blocking the whole workbook.
+            alternate = next((row["target_key"] for row in rows if row.get("platform") == "xiaohongshu"
+                              and row.get("target_key") and row["target_key"] != target), None)
+            if alternate:
+                already_retried.add(target)
+                run_capture(capture_base + ["--only-note-id", str(alternate), "--refresh"])
+                checkpoint = read_checkpoint(observations)
+                healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), str(alternate))
+        if not healthy:
             write_state(manifest, {"status": "blocked", "source": str(source),
                                    "source_sha256": sha256(source.read_bytes()).hexdigest(),
-                                   "reason": "canary_incomplete", "checkpoint": str(observations)})
+                                   "reason": "canary_incomplete", "checkpoint": str(observations),
+                                   "coverage": capture_progress(rows, checkpoint)})
             print("[canary] incomplete; inspect this target before batch capture", flush=True)
             return 3
     else:
         print(f"[canary] resume-skip healthy target {target}", flush=True)
-    if not checkpoint_covers_workbook(source, checkpoint, requirements):
+    if not checkpoint_covers_workbook(rows, checkpoint, requirements):
         run_capture(capture_base)
         checkpoint = read_checkpoint(observations)
 
     payload = compare(rows, unwrap_rows(checkpoint, "observations"), amount_mode="expected-only")
+    checkpoint, payload = retry_incomplete_notes(rows, checkpoint, payload, observations, capture_base, already_retried)
     write_state(report, payload)
     workbook = None
     if args.workbook_engine == "portable":
