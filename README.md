@@ -4,7 +4,7 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
-0.4.4 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
+0.4.5 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
 
 ## WorkBuddy 使用
 
@@ -71,6 +71,8 @@ huozhiji-audit run --source 评论.xlsx --work-dir /path/outputs/job-id \
 默认 Excel 引擎是独立的 Python OOXML 写入器：保留源表和媒体，检查行身份、金额、汇总公式缓存及 ZIP 完整性，Excel打开时重新计算公式。它不是通用公式计算器，也不生成图片预览。源表受保护、越界合并或无法安全重定位的汇总图片会明确报错，不会静默丢掉数据。若宿主具备 `@oai/artifact-tool`，可选 `--workbook-engine artifact` 生成图片预览及执行宿主公式扫描。
 
 ## 审核与金额
+
+Excel 的任务行已有首审结论时，WorkBuddy 自动只复核上次成功的行，包括图字成功和已确认的单项成功。上次失败、待审或空白的行保留原状。原表没有任何已识别的审核结论时，全表首审。在线再次确认会重新查看相关原帖，报告注明本次复核和沿用的行数。
 
 - 普通结果：成功、失败、待人审。
 - 图文结果：图字成功、文字成功、图片成功、失败、待人审。

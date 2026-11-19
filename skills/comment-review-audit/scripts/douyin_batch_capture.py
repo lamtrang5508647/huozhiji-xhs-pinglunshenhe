@@ -18,7 +18,8 @@ try:
 except ImportError:
     PlaywrightTimeoutError = TimeoutError  # parser-only hosts never call a live browser
 from capture_pacing import has_remaining_target, pause_seconds
-from capture_resume import pending_targets, PARSER_REVISIONS
+from capture_resume import pending_targets, recheck_scope, PARSER_REVISIONS
+from audit_pass import rows_to_review
 from profile_lock import ProfileLock, default_profile
 from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
@@ -49,10 +50,13 @@ def expected_rows(path: str) -> Iterable[Dict[str, Any]]:
     return rows
 
 
-def targets_from_expected(paths: Iterable[str]) -> List[Dict[str, Any]]:
+def capture_plan(paths: Iterable[str]):
     targets: Dict[str, Dict[str, Any]] = {}
+    all_rows = []
     for input_path in paths:
-        for row in expected_rows(input_path):
+        rows = list(expected_rows(input_path))
+        all_rows.extend(rows)
+        for row in rows_to_review(rows):
             if row.get("platform") != "douyin":
                 continue
             key = str(row.get("target_key") or "").strip()
@@ -67,7 +71,7 @@ def targets_from_expected(paths: Iterable[str]) -> List[Dict[str, Any]]:
             }
             if ref not in target["source_refs"]:
                 target["source_refs"].append(ref)
-    return list(targets.values())
+    return list(targets.values()), recheck_scope(all_rows)
 
 
 def visible_marker(page: Any, markers: Iterable[str]) -> bool:
@@ -283,25 +287,35 @@ def main() -> int:
     ):
         parser.error("invalid delay bounds")
 
-    targets = targets_from_expected(args.expected)
+    targets, scope = capture_plan(args.expected)
     if args.only_target_key:
         targets = [item for item in targets if item["target_key"] == args.only_target_key]
-        if not targets:
+        if not targets and not scope:
             parser.error("--only-target-key not found")
 
     output = Path(args.output)
+    if any(output.resolve() == Path(path).resolve() or (output.exists() and output.samefile(path))
+           for path in args.expected):
+        parser.error("--output must differ from --expected")
+    metadata = {"recheck_scope": scope} if scope else {}
     existing: Dict[str, Dict[str, Any]] = {}
     if output.exists():
         try:
             payload = json.loads(output.read_text(encoding="utf-8"))
-            existing = {str(item.get("target_key")): item for item in payload.get("observations", [])}
-        except (OSError, ValueError, json.JSONDecodeError):
-            existing = {}
+            existing_scope = payload.get("recheck_scope") if isinstance(payload, dict) else None
+            if existing_scope != scope:
+                parser.error("different audit pass: use a new --output for this recheck")
+            records = payload.get("observations", []) if isinstance(payload, dict) else payload
+            existing = {str(item["target_key"]): item for item in records}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error(f"cannot read existing capture checkpoint: {exc}")
 
     total_targets = len(targets)
     targets = pending_targets(targets, existing, "douyin", "target_key", refresh=args.refresh)
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
     if not targets:
+        if scope and not output.exists():
+            atomic_write(output, {**metadata, "observations": [], "stopped": False})
         return 0
     stop_reason = ""
     processed_count = 0
@@ -327,7 +341,7 @@ def main() -> int:
                             "comments": [], "source_refs": target["source_refs"],
                         }
                         stop_reason = "network_changed"
-                        atomic_write(output, {"observations": list(existing.values()), "stopped": True, "stop_reason": stop_reason})
+                        atomic_write(output, {**metadata, "observations": list(existing.values()), "stopped": True, "stop_reason": stop_reason})
                         print(f"[{index}/{len(targets)}] stop {key} status=network_changed", flush=True)
                         break
                     captured_at = datetime.now(timezone.utc).isoformat()
@@ -360,7 +374,7 @@ def main() -> int:
                     )
                     if status in {"session_expired", "captcha", "risk_control"}:
                         stop_reason = status
-                    atomic_write(output, {"observations": list(existing.values()), "stopped": bool(stop_reason), "stop_reason": stop_reason})
+                    atomic_write(output, {**metadata, "observations": list(existing.values()), "stopped": bool(stop_reason), "stop_reason": stop_reason})
                     if stop_reason:
                         break
                     if not has_remaining_target(index, len(targets)):

@@ -1,6 +1,10 @@
 """Shared settlement invariants for CLI, SDK and workbook writers."""
 from decimal import Decimal, InvalidOperation
 from typing import Any
+if __package__:
+    from .audit_pass import carried_result
+else:
+    from audit_pass import carried_result
 
 
 PENDING_SETTLEMENT_REASONS = {
@@ -24,6 +28,15 @@ def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) 
         for field in ("source_file", "source_sheet", "source_row"):
             if field in item and field in source and item[field] != source[field]:
                 raise RuntimeError("report_source_location_mismatch")
+        if item.get("status") == "carried_forward" or item.get("review_action") == "carried_forward":
+            if "prior_review" not in source or source["prior_review"].get("triage") == "成功":
+                raise RuntimeError("invalid_carried_forward_row")
+            retained = carried_result(source)
+            if any(item.get(k) != retained[k] for k in ("status", "review_action", "triage", "result_category", "approved_amount")):
+                raise RuntimeError("carried_forward_value_changed")
+            continue
+        if "prior_review" in source and source["prior_review"].get("triage") != "成功":
+            raise RuntimeError("missing_carried_forward_row")
         triage, category = item.get("triage"), item.get("result_category")
         if triage not in ("成功", "失败", "待人审") or category not in ("成功", "失败", "待人审", "图字成功", "文字成功", "图片成功"):
             raise RuntimeError("report_category_missing_or_invalid")

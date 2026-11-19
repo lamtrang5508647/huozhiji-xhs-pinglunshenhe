@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Portable OOXML audit writer; no Excel, Node, Codex, Feishu or third-party library.
 
-Patch only authorized G/H cells and audit summary. Preserve all source media,
+Patch reviewed rows' result and amount cells and the audit summary. Preserve all source media,
 cell-image definitions, relationships and unrelated ZIP entries verbatim.
 """
 from __future__ import annotations
@@ -19,13 +19,16 @@ from collections import Counter
 from decimal import Decimal
 from functools import partial
 from hashlib import sha256
+from itertools import groupby
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 try:
     from .audit_validation import validate_results
+    from .review_comments import parse_amount
 except ImportError:
     from audit_validation import validate_results
+    from review_comments import parse_amount
 
 S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -99,6 +102,10 @@ def sheet_cell_writer(data):
     for row in data:
         rows.setdefault(row.get("r"), row)
     return partial(set_cell, data, row_index=rows)
+
+
+def cell_signature(element):
+    return element.tag, sorted(element.attrib.items()), element.text, tuple(cell_signature(child) for child in element)
 
 
 def set_cell(data, address, value, *, style=None, formula=None, row_index=None):
@@ -225,6 +232,8 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     styles = add_styles(parts)
     rows_by_sheet = {}
     locations = set()
+    layouts = {}
+    preserved_cells = {}
     for item in rows:
         name, number = item.get("source_sheet"), item.get("source_row")
         if name not in sheet_paths or name == "审核汇总" or not isinstance(number, int) or number < 2:
@@ -236,30 +245,75 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     for name, selected in rows_by_sheet.items():
         path = sheet_paths[name]
         root = ET.fromstring(parts[path])
+        data = root.find(tag("sheetData"))
+        active_rows = {row["source_row"] for row in selected if by_id[row["case_id"]].get("status") != "carried_forward"}
+        first_prior = selected[0].get("prior_review", {})
+        category_column = first_prior.get("result_column", "G")
+        amount_column = first_prior.get("amount_column", "H")
+        if active_rows and not amount_column:
+            highest = max((col_index(c.get("r")) for c in data.iter(tag("c"))), default=0)
+            if highest >= 16384:
+                raise ValueError("no_room_for_settlement_column")
+            amount_column = column(highest + 1)
+        layouts[name] = category_column, amount_column
+        frozen = {row["source_row"] for row in selected} - active_rows
+        if frozen:
+            protected = {f"{col}{n}" for n in frozen for col in (category_column, amount_column) if col}
+            preserved_cells[name] = {c.get("r"): cell_signature(c) for c in data.iter(tag("c")) if c.get("r") in protected}
+        if not active_rows:
+            continue
+        if not category_column or category_column == amount_column:
+            raise ValueError("invalid_audit_output_columns")
         if root.find(tag("sheetProtection")) is not None:
             raise ValueError("protected_source_sheet")
-        data = root.find(tag("sheetData"))
         write_cell = sheet_cell_writer(data)
         maximum = max(item["source_row"] for item in selected)
+        audit_columns = {col_index(category_column), col_index(amount_column)}
         merges = root.find(tag("mergeCells"))
         if merges is not None:
             for merge in list(merges):
                 begin, end = (merge.get("ref", "") + ":" + merge.get("ref", "")).split(":")[:2]
                 left, right = col_index(begin), col_index(end)
                 top, bottom = int(re.search(r"\d+$", begin)[0]), int(re.search(r"\d+$", end)[0])
-                if left <= 8 and right >= 7 and top <= maximum and bottom >= 2:
-                    if left < 7 or right > 8 or top < 2 or bottom > maximum:
+                if any(left <= col <= right for col in audit_columns) and any(top <= n <= bottom for n in active_rows):
+                    if any(col not in audit_columns for col in range(left, right + 1)) or top < 2 or bottom > maximum:
                         raise ValueError("audit_merge_extends_outside_authorized_area")
                     merges.remove(merge)
+                    if frozen and any(top <= n <= bottom for n in frozen):
+                        anchor = data.find(f".//{tag('c')}[@r='{begin}']")
+                        for active, numbers in groupby(range(top, bottom + 1), key=active_rows.__contains__):
+                            if active:
+                                continue
+                            segment = list(numbers)
+                            head, tail = segment[0], segment[-1]
+                            head_ref = f"{column(left)}{head}"
+                            if head_ref != begin and anchor is not None and (cell_value(anchor, strings) != "" or anchor.find(tag("f")) is not None):
+                                # A newly exposed cell inherits the original merged value. Its quote
+                                # stays on the source sheet only, even when it looks like a payout.
+                                exposed = data.find(f".//{tag('c')}[@r='{head_ref}']")
+                                if cell_value(exposed, strings) == "" and (exposed is None or exposed.find(tag("f")) is None):
+                                    exposed = write_cell(head_ref, None)
+                                    exposed.attrib.update({k: v for k, v in anchor.attrib.items() if k != "r"})
+                                    keep_formula = cell_value(anchor, strings) == ""
+                                    exposed.extend(copy.deepcopy(child) for child in anchor if child.tag != tag("f") or keep_formula)
+                                    if head in frozen:
+                                        preserved_cells[name][head_ref] = cell_signature(exposed)
+                            if head != tail or left != right:
+                                ET.SubElement(merges, tag("mergeCell"), {"ref": f"{head_ref}:{column(right)}{tail}"})
             merges.set("count", str(len(merges)))
             if not len(merges):
                 root.remove(merges)
-        write_cell("G1", "审核结果")
+        if not first_prior:
+            write_cell("G1", "审核结果")
+        elif first_prior.get("amount_column") is None:
+            write_cell(f"{amount_column}1", "核定金额")
         for item in selected:
             result = by_id[item["case_id"]]
-            write_cell(f'G{item["source_row"]}', result["result_category"])
+            if result.get("status") == "carried_forward":
+                continue
+            write_cell(f'{category_column}{item["source_row"]}', result["result_category"])
             amount = result.get("approved_amount")
-            write_cell(f'H{item["source_row"]}', None if amount in (None, "") else Decimal(str(amount)), style=styles["money"])
+            write_cell(f'{amount_column}{item["source_row"]}', None if amount in (None, "") else Decimal(str(amount)), style=styles["money"])
         dimension = root.find(tag("dimension"))
         if dimension is not None:
             dimension.set("ref", f"A1:{column(max(8, max((col_index(c.get('r')) for c in data.iter(tag('c'))), default=8)))}{max(maximum, max((int(r.get('r', '1')) for r in data), default=1))}")
@@ -297,7 +351,7 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     end = 11 + len(rows)
     total_row = len(groups) + 2
     has_pending = any(item.get("settlement_status") in SETTLEMENT_NOTES for item in results)
-    ET.SubElement(summary, tag("dimension"), {"ref": f"A1:{'Y' if has_pending else 'X'}{max(end, total_row)}"})
+    ET.SubElement(summary, tag("dimension"), {"ref": f"A1:Z{max(end, total_row)}"})
     view = ET.SubElement(ET.SubElement(summary, tag("sheetViews")), tag("sheetView"), {"workbookViewId": "0", "showGridLines": "0"})
     ET.SubElement(view, tag("pane"), {"ySplit": "1", "topLeftCell": "A2", "activePane": "bottomLeft", "state": "frozen"})
     ET.SubElement(summary, tag("sheetFormatPr"), {"defaultRowHeight": "22"})
@@ -321,6 +375,11 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     if has_pending:
         write_cell("Y11", "结算说明", style=styles["detail"])
     counts = Counter(item["triage"] for item in results)
+    if counts["未复核"]:
+        write_cell("P7", "未复核（原结果空白或未识别）", style=styles["body"])
+        write_cell("Q7", counts["未复核"], formula=f'COUNTIF($W$12:$W${end},"未复核")', style=styles["body"])
+        write_cell("H1", "成功率（有审核结果）", style=styles["header"])
+    write_cell("Z11", "原任务报价", style=styles["header"])
     # Detail rows follow the fixed headers and their cells arrive in P:X order.
     for number, item in enumerate(rows, 12):
         result = by_id[item["case_id"]]
@@ -329,16 +388,22 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         for index, value in enumerate((item["case_id"], *key, item["source_sheet"], item["source_row"], item["comment_type"]), 16):
             detail_row.append(make_cell(f"{column(index)}{number}", value, style=styles["body"]))
         quoted = "'" + item["source_sheet"].replace("'", "''") + "'"
-        detail_row.append(make_cell(f"V{number}", result["result_category"], formula=f"{quoted}!G{item['source_row']}", style=styles["body"]))
+        cat_col, amount_col = layouts[item["source_sheet"]]
+        carried = result.get("status") == "carried_forward"
+        detail_row.append(make_cell(f"V{number}", result["result_category"], formula=None if carried else f"{quoted}!{cat_col}{item['source_row']}", style=styles["body"]))
         settlement_note = SETTLEMENT_NOTES.get(result.get("settlement_status"))
-        partial_approved = f'ISNUMBER({quoted}!H{item["source_row"]})'
+        amount_ref = f'{quoted}!{amount_col}{item["source_row"]}'
+        partial_approved = f'ISNUMBER({amount_ref})'
         if settlement_note:
             partial_approved = f'OR({partial_approved},Y{number}<>"")'
-        detail_row.append(make_cell(f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),{partial_approved})),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"]))
+        detail_row.append(make_cell(f"W{number}", result["triage"], formula=None if carried else f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),{partial_approved})),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"]))
         amount = result.get("approved_amount")
-        detail_row.append(make_cell(f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=f'IF(ISNUMBER({quoted}!H{item["source_row"]}),{quoted}!H{item["source_row"]},"")', style=styles["money"]))
+        detail_row.append(make_cell(f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=None if carried else f'IF(ISNUMBER({amount_ref}),{amount_ref},"")', style=styles["money"]))
         if settlement_note:
             detail_row.append(make_cell(f"Y{number}", settlement_note, style=styles["body"]))
+        quote = parse_amount(item.get("expected_amount"))
+        if quote is not None and quote.is_finite() and quote >= 0:
+            detail_row.append(make_cell(f"Z{number}", quote, style=styles["money"]))
     # Large group tables may reach the detail rows from the left.
     write_cell = sheet_cell_writer(data)
     new_row_numbers = {}
@@ -348,11 +413,12 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         group_counts = Counter(item["triage"] for item in selected)
         group_payout = sum((Decimal(str(item["approved_amount"])) for item in selected if item.get("approved_amount") not in (None, "")), Decimal("0"))
         source_sheets = list(dict.fromkeys(item["source_sheet"] for item in members))
-        values = [*key, len(source_sheets), len(members), group_counts["成功"], group_counts["失败"], group_counts["待人审"], group_counts["成功"] / len(members), group_payout, "、".join(source_sheets)]
+        reviewed = len(members) - group_counts["未复核"]
+        values = [*key, len(source_sheets), len(members), group_counts["成功"], group_counts["失败"], group_counts["待人审"], group_counts["成功"] / reviewed if reviewed else 0, group_payout, "、".join(source_sheets)]
         leader = f'"="&SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(A{number},"~","~~"),"*","~*"),"?","~?")'
         product = leader.replace(f"A{number}", f"B{number}")
         criteria = f'$Q$12:$Q${end},{leader},$R$12:$R${end},{product}'
-        formulas = {4: f"COUNTIFS({criteria})", 5: f'COUNTIFS({criteria},$W$12:$W${end},"成功")', 6: f'COUNTIFS({criteria},$W$12:$W${end},"失败")', 7: f'COUNTIFS({criteria},$W$12:$W${end},"待人审")', 8: f"IFERROR(E{number}/D{number},0)", 9: f"SUMIFS($X$12:$X${end},{criteria})"}
+        formulas = {4: f"COUNTIFS({criteria})", 5: f'COUNTIFS({criteria},$W$12:$W${end},"成功")', 6: f'COUNTIFS({criteria},$W$12:$W${end},"失败")', 7: f'COUNTIFS({criteria},$W$12:$W${end},"待人审")', 8: f"IFERROR(E{number}/SUM(E{number}:G{number}),0)", 9: f"SUMIFS($X$12:$X${end},{criteria})"}
         for index, value in enumerate(values, 1):
             write_cell(f"{column(index)}{number}", value, formula=formulas.get(index), style=styles["money" if index == 9 else "percent" if index == 8 else "body"])
         for index, field in enumerate(("leader_contact", "settlement_time", "settlement_voucher", "qr_code"), 11):
@@ -370,9 +436,10 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
                     cell.clear()
                     cell.attrib.update(attrs)
                     cell.extend(copy.deepcopy(list(prior)))
-    totals = ["合计", None, sum(len({item["source_sheet"] for item in members}) for members in groups.values()), len(results), counts["成功"], counts["失败"], counts["待人审"], counts["成功"] / len(results), payout]
+    reviewed = len(results) - counts["未复核"]
+    totals = ["合计", None, sum(len({item["source_sheet"] for item in members}) for members in groups.values()), len(results), counts["成功"], counts["失败"], counts["待人审"], counts["成功"] / reviewed if reviewed else 0, payout]
     for index, value in enumerate(totals, 1):
-        formula = (f"IFERROR(E{total_row}/D{total_row},0)" if index == 8 else f"SUM({column(index)}2:{column(index)}{total_row-1})") if 3 <= index <= 9 else None
+        formula = (f"IFERROR(E{total_row}/SUM(E{total_row}:G{total_row}),0)" if index == 8 else f"SUM({column(index)}2:{column(index)}{total_row-1})") if 3 <= index <= 9 else None
         write_cell(f"{column(index)}{total_row}", value, formula=formula, style=styles["total_money" if index == 9 else "total_percent" if index == 8 else "total"])
     for row in data:
         if int(row.get("r")) <= total_row:
@@ -457,11 +524,22 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
             for name, selected in rows_by_sheet.items():
                 root = ET.fromstring(archive.read(sheet_paths[name]))
                 cells = {c.get("r"): c for c in root.iter(tag("c"))}
+                category_column, amount_column = layouts[name]
                 for item in selected:
                     result = by_id[item["case_id"]]
-                    if cell_value(cells[f'G{item["source_row"]}'], strings) != result["result_category"]:
+                    if result.get("status") == "carried_forward":
+                        for col in (category_column, amount_column):
+                            if not col:
+                                continue
+                            ref = f'{col}{item["source_row"]}'
+                            original = preserved_cells[name].get(ref)
+                            saved = cell_signature(cells[ref]) if ref in cells else None
+                            if original != saved:
+                                raise RuntimeError("export_retained_row_changed")
+                        continue
+                    if cell_value(cells[f'{category_column}{item["source_row"]}'], strings) != result["result_category"]:
                         raise RuntimeError("export_row_category_mismatch")
-                    actual = cell_value(cells[f'H{item["source_row"]}'], strings)
+                    actual = cell_value(cells[f'{amount_column}{item["source_row"]}'], strings)
                     approved = result.get("approved_amount")
                     if (approved in (None, "") and actual != "") or (approved not in (None, "") and Decimal(actual) != Decimal(str(approved))):
                         raise RuntimeError("export_row_amount_mismatch")

@@ -15,8 +15,11 @@ from hashlib import sha256
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import uuid4
 from xml.etree import ElementTree as ET
 from audit_validation import validate_results
+from audit_pass import rows_to_review, merge_audit_results
+from capture_resume import recheck_scope
 from build_audited_workbook import build_workbook
 from profile_lock import default_profile
 from review_comments import compare, unwrap_rows
@@ -70,13 +73,13 @@ def first_target(rows: Iterable[dict[str, Any]], platform: str) -> str:
     return ""
 
 
-def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=()) -> bool:
+def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=(), *, context_rows=None) -> bool:
     last = next((item for item in reversed(observations) if item.get("platform") == "xiaohongshu"
                  and str(item.get("target_key")) == target_key), None)
-    return capture_covers_tasks(last, target_key, rows)
+    return capture_covers_tasks(last, target_key, rows, context_rows=context_rows)
 
 
-def checkpoint_covers_workbook(rows, checkpoint, requirements):
+def checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=None):
     if checkpoint.get("stopped"):
         return False
     captures = unwrap_rows(checkpoint, "observations")
@@ -86,7 +89,7 @@ def checkpoint_covers_workbook(rows, checkpoint, requirements):
     keys = dict.fromkeys(str(row["target_key"]) for row in rows
                          if row.get("platform") == "xiaohongshu" and row.get("target_key"))
     targets = [{"note_id": key} for key in keys]
-    return bool(targets) and not plan_targets(targets, existing, requirements)
+    return bool(targets) and not plan_targets(targets, existing, requirements, contexts=contexts)
 
 
 def capture_progress(rows, checkpoint):
@@ -99,7 +102,7 @@ def capture_progress(rows, checkpoint):
             "rows_without_capture_record": sum(key not in attempted for key in tasks)}
 
 
-def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, already_retried):
+def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, already_retried, *, context_rows=None):
     """One additional visit per unresolved note, retaining stronger first-pass evidence."""
     captures = unwrap_rows(checkpoint, "observations")
     current = {str(item["target_key"]): item for item in captures if item.get("platform") == "xiaohongshu"}
@@ -143,7 +146,8 @@ def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, alre
                 if current.get(key, {}).get("capture_status") == "ok" and item.get("capture_status") != "ok":
                     continue
                 if settled[key]:
-                    checked = compare(retry[key], [item], amount_mode="expected-only")["results"]
+                    checked = compare(retry[key], [item], amount_mode="expected-only",
+                                      reply_context_rows=context_rows)["results"]
                     if not settled[key].issubset(r["case_id"] for r in checked if r["triage"] == "成功"):
                         continue
                 replacements[key] = item
@@ -154,7 +158,7 @@ def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, alre
                                 if c.get("capture_status") in ("captcha", "session_expired", "risk_control")), {})
                 checkpoint["stop_target_key"] = stopped.get("target_key")
             write_state(path, checkpoint)
-    return checkpoint, compare(rows, checkpoint["observations"], amount_mode="expected-only")
+    return checkpoint, compare(rows, checkpoint["observations"], amount_mode="expected-only", reply_context_rows=context_rows)
 
 
 def discover_node_modules(explicit: str | None) -> str:
@@ -172,14 +176,14 @@ def discover_node_modules(explicit: str | None) -> str:
     raise RuntimeError("spreadsheet_runtime_not_found: pass --node-modules")
 
 
-def write_manifest(path: Path, source: Path, output: Path, rows, results, workbook, settlement_pending_count=0) -> None:
+def write_manifest(path: Path, source: Path, output: Path, rows, results, workbook, summary, pass_state) -> None:
     payout = validate_results(rows, results)
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("final_workbook_missing")
     counts = {label: 0 for label in ("成功", "失败", "待人审")}
     for item in results:
         triage = item.get("triage", "待人审")
-        counts[triage if triage in counts else "待人审"] += 1
+        counts[triage] = counts.get(triage, 0) + 1
     write_state(path, {
                 "status": "complete",
                 "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -189,7 +193,9 @@ def write_manifest(path: Path, source: Path, output: Path, rows, results, workbo
                 "success": counts["成功"],
                 "failure": counts["失败"],
                 "manual_review": counts["待人审"],
-                **({"settlement_pending_count": settlement_pending_count} if settlement_pending_count else {}),
+                **({"unreviewed_rows": counts["未复核"]} if counts.get("未复核") else {}),
+                **({"settlement_pending_count": summary["settlement_pending_count"]} if summary.get("settlement_pending_count") else {}),
+                "audit_pass": summary["audit_pass"], **pass_state,
                 "approved_amount": float(payout.quantize(Decimal("0.01"))),
                 "source_sha256": workbook["source_sha256"] if workbook else sha256(source.read_bytes()).hexdigest(),
                 "output_sha256": workbook["output_sha256"] if workbook else sha256(output.read_bytes()).hexdigest(),
@@ -225,17 +231,50 @@ def main() -> int:
     observations = work_dir / "observations.json"
     report = work_dir / "review-report.json"
     output = work_dir / args.output_name
+    if output.resolve() == source or (output.exists() and output.samefile(source)):
+        parser.error("use a different --output-name or a new --work-dir to preserve the input workbook")
     previews = work_dir / "previews"
     manifest = work_dir / "job-result.json"
     source_hash = sha256(source.read_bytes()).hexdigest()
-    if manifest.exists():
-        prior = json.loads(manifest.read_text(encoding="utf-8"))
-        if prior.get("source_sha256") not in (None, source_hash):
-            raise RuntimeError("source_changed: use a new job directory")
-    write_state(manifest, {"status": "in_progress", "source": str(source), "source_sha256": source_hash})
+    prior = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    if prior.get("source_sha256") not in (None, source_hash):
+        parser.error("source_changed: use a new --work-dir to preserve the earlier audit")
+    pass_state = {}
+    active = []
 
     try:
-        return execute_job(args, source, expected, observations, report, output, previews, manifest)
+        rows = convert_xlsx_sheets(source, parse_maps(args.maps or []), parse_amount_rules(args.amount_rules),
+                                   skip_summary=True)
+        if not rows:
+            raise ValueError("expected_rows_empty")
+        active = rows_to_review(rows)
+        scope = recheck_scope(rows)
+        if scope:
+            if prior.get("status") == "complete" and not prior.get("recheck_id") and output.exists():
+                parser.error("use a new --work-dir to preserve the first audit")
+            previous_id = str(prior.get("recheck_id", ""))
+            can_resume = (prior.get("status") in ("in_progress", "blocked", "error") and
+                          prior.get("recheck_scope") == scope and len(previous_id) == 32 and
+                          all(letter in "0123456789abcdef" for letter in previous_id))
+            if can_resume:
+                previous_path = work_dir / f"recheck-observations-{previous_id}.json"
+                if previous_path.exists() and read_checkpoint(previous_path).get("recheck_scope") != scope:
+                    can_resume = False
+            pass_id = previous_id if can_resume else uuid4().hex
+            observations = work_dir / f"recheck-observations-{pass_id}.json"
+            pass_state = {"recheck_scope": scope, "recheck_id": pass_id, "checkpoint": str(observations)}
+        write_state(manifest, {"status": "in_progress", "source": str(source), "source_sha256": source_hash, **pass_state})
+        write_state(expected, {"rows": rows})
+        if active:
+            selected = collect_rows(args, source, expected, observations, manifest, active, pass_state,
+                                    context_rows=rows if scope else None)
+            if selected is None:
+                return 3
+        else:
+            selected = compare([], [], amount_mode="expected-only")
+            write_state(observations, {"observations": [], "stopped": False, "recheck_scope": scope})
+        payload = merge_audit_results(rows, selected)
+        return export_job(args, source, expected, report, output, previews, manifest, rows, payload, pass_state)
     except (subprocess.CalledProcessError, RuntimeError, OSError, ValueError, KeyError,
             ArithmeticError, zipfile.BadZipFile, ET.ParseError) as exc:
         phase = "blocked" if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (2, 3) else "error"
@@ -243,24 +282,22 @@ def main() -> int:
         if isinstance(exc, subprocess.CalledProcessError):
             reason = read_checkpoint(observations).get("stop_reason") or "subprocess_failed"
         state = {"status": phase, "source": str(source), "source_sha256": source_hash,
-                 "reason": reason, "checkpoint": str(observations)}
+                 "reason": reason, "checkpoint": str(observations), **pass_state}
         if phase == "blocked" and expected.exists():
-            state["coverage"] = capture_progress(unwrap_rows(read_checkpoint(expected), "rows"), read_checkpoint(observations))
+            state["coverage"] = capture_progress(active, read_checkpoint(observations))
         write_state(manifest, state)
         print(f"[job] {phase}: {reason}; checkpoint retained", flush=True)
         return 3 if phase == "blocked" else 1
 
 
-def execute_job(args, source, expected, observations, report, output, previews, manifest) -> int:
-    rows = convert_xlsx_sheets(source, parse_maps(args.maps or []), parse_amount_rules(args.amount_rules),
-                               skip_summary=True)
-    write_state(expected, {"rows": rows})
+def collect_rows(args, source, expected, observations, manifest, rows, pass_state, *, context_rows=None):
     target = first_target(rows, "xiaohongshu")
     if not target:
         raise RuntimeError("no_xiaohongshu_target_found")
     checkpoint = read_checkpoint(observations)
     captures = unwrap_rows(checkpoint, "observations")
     requirements = group_note_requirements(rows)
+    contexts = group_note_requirements(context_rows or ())
     restoring_session = checkpoint.get("stopped") is True
     if restoring_session:
         row_targets = {str(row.get("target_key")) for row in rows}
@@ -282,13 +319,14 @@ def execute_job(args, source, expected, observations, report, output, previews, 
     if args.wait_for_confirmation:
         capture_base.append("--wait-for-confirmation")
     already_retried = set()
-    if restoring_session or not has_healthy_capture(captures, target, requirements.get(target)):
+    if restoring_session or not has_healthy_capture(captures, target, requirements.get(target), context_rows=contexts.get(target)):
         canary = capture_base + ["--only-note-id", target]
         if restoring_session:
             canary.append("--refresh")
         run_capture(canary)
         checkpoint = read_checkpoint(observations)
-        healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), target, requirements.get(target))
+        healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), target, requirements.get(target),
+                                      context_rows=contexts.get(target))
         if not healthy and not restoring_session and not checkpoint.get("stopped"):
             # An isolated inaccessible or incomplete post cannot establish session health.
             # Try one other assigned note before blocking the whole workbook.
@@ -299,22 +337,27 @@ def execute_job(args, source, expected, observations, report, output, previews, 
                 run_capture(capture_base + ["--only-note-id", str(alternate), "--refresh"])
                 checkpoint = read_checkpoint(observations)
                 healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), str(alternate),
-                                              requirements.get(str(alternate)))
+                                              requirements.get(str(alternate)), context_rows=contexts.get(str(alternate)))
         if not healthy:
             write_state(manifest, {"status": "blocked", "source": str(source),
                                    "source_sha256": sha256(source.read_bytes()).hexdigest(),
                                    "reason": "canary_incomplete", "checkpoint": str(observations),
-                                   "coverage": capture_progress(rows, checkpoint)})
+                                   "coverage": capture_progress(rows, checkpoint), **pass_state})
             print("[canary] incomplete; inspect this target before batch capture", flush=True)
-            return 3
+            return None
     else:
         print(f"[canary] resume-skip healthy target {target}", flush=True)
-    if not checkpoint_covers_workbook(rows, checkpoint, requirements):
+    if not checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=contexts):
         run_capture(capture_base)
         checkpoint = read_checkpoint(observations)
 
-    payload = compare(rows, unwrap_rows(checkpoint, "observations"), amount_mode="expected-only")
-    checkpoint, payload = retry_incomplete_notes(rows, checkpoint, payload, observations, capture_base, already_retried)
+    payload = compare(rows, unwrap_rows(checkpoint, "observations"), amount_mode="expected-only", reply_context_rows=context_rows)
+    checkpoint, payload = retry_incomplete_notes(rows, checkpoint, payload, observations, capture_base, already_retried,
+                                                context_rows=context_rows)
+    return payload
+
+
+def export_job(args, source, expected, report, output, previews, manifest, rows, payload, pass_state):
     write_state(report, payload)
     workbook = None
     if args.workbook_engine == "portable":
@@ -329,7 +372,7 @@ def execute_job(args, source, expected, observations, report, output, previews, 
             "--report", str(report), "--output", str(output),
             "--preview-dir", str(previews),
         ], env=env)
-    write_manifest(manifest, source, output, rows, payload["results"], workbook, payload["summary"].get("settlement_pending_count", 0))
+    write_manifest(manifest, source, output, rows, payload["results"], workbook, payload["summary"], pass_state)
     print(manifest.read_text(encoding="utf-8"), end="")
     return 0
 

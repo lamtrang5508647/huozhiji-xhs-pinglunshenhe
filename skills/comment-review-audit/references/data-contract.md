@@ -112,6 +112,8 @@ For optional direct-parent checks, `task_ordinal` can identify the source task f
 
 ## Internal statuses
 
+An Excel workbook with recorded first-pass outcomes carries `prior_review` on its task rows. A second pass evaluates previously successful rows against the new observations. The other rows keep their original result and amount cells. These records have `status=carried_forward` and do not establish current visibility. The report includes the selected and carried row counts in `summary.audit_pass`. A workbook with no recognized recorded outcome goes through a full first audit.
+
 | Status | Meaning |
 |---|---|
 | `verified` | Evidence establishes the requested visibility. A separate settlement status can defer payment. |

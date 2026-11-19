@@ -1,8 +1,17 @@
 """Reuse only fresh, complete evidence from the same parser and target."""
 from datetime import datetime, timezone
+import hashlib
+import json
 
 # Bump the relevant revision when comment extraction or completeness changes.
 PARSER_REVISIONS = {'xiaohongshu':'xhs-confirmed-expansion-v6', 'douyin':'dy-body-20260930-v2'}
+
+def recheck_scope(rows):
+    """Identify a success-only capture, including changes to the incoming first-pass results."""
+    if not any("prior_review" in row for row in rows):
+        return None
+    encoded = json.dumps(rows, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 def fresh_capture(item, platform, key, *, now=None):
     if not isinstance(item, dict):

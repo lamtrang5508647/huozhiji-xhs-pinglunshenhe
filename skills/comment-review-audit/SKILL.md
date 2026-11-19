@@ -40,6 +40,8 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
    ```
 
    If cells are blank but the header defines rates, the converter derives amounts from the comment type. Supply `--amount-rules text=1.5,text+image=2,image=1.5` only when the workbook does not carry usable rules.
+
+   If any task has a recognized previous verdict, recheck only tasks previously marked 成功, 图字成功, 文字成功 or 图片成功. Keep the other rows and their original result and amount cells. Use evidence from this pass for the selected tasks. A fresh workbook with empty verdicts receives a full first audit.
 3. Establish the persistent desktop environment before opening batch targets:
    - Only for live capture. Offline comparison of supplied evidence does not require a browser/account.
    - Find ordinary Chrome automatically or set `COMMENT_AUDIT_CHROME`; do not assume a workstation-specific path exists.
@@ -67,7 +69,7 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
      --output /path/review-report.json
    ```
 
-7. Inspect every `失败` and `待人审` row plus all `文字成功`/`图片成功` rows. The required user-facing classifications are:
+7. Inspect `失败`, `待人审`, `文字成功` and `图片成功` decisions made in the current pass. The required user-facing classifications are:
    - General triage: `成功`, `失败`, `待人审`.
    - Text+image detail: `图字成功`, `文字成功`, `图片成功`, `失败`, `待人审`.
    - `文字成功` and `图片成功` identify the verified component. Use the explicit component rate for payment. Leave an unresolved payment blank and report the settlement reason. Confirmed failures receive `0.00`.

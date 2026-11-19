@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ._engine import review_comments, table_to_expected
+from ._engine.audit_pass import compare_audit_rows
 from ._engine.audit_validation import validate_results
 
 
@@ -13,14 +14,14 @@ def convert_table(source: str | Path, *, mapping: dict[str, str] | None = None,
     """Read XLSX (all product sheets by default), CSV, TSV or JSON requirements."""
     path = Path(source)
     is_xlsx = path.suffix.lower() == ".xlsx"
-    if is_xlsx and not sheet:
-        rows = table_to_expected.convert_xlsx_sheets(path, mapping or {}, amount_rules, skip_summary=True)
-    else:
-        name = sheet if is_xlsx else None
-        if name == "审核汇总":
+    if is_xlsx:
+        if sheet == "审核汇总":
             raise ValueError("expected_rows_empty")
-        data = table_to_expected.read_rows(path, name, target_url_header=(mapping or {}).get("target_url"))
-        rows = table_to_expected.convert(data, mapping or {}, path.name, name, amount_rules)
+        rows = table_to_expected.convert_xlsx_sheets(path, mapping or {}, amount_rules,
+                                                     skip_summary=True, sheet_name=sheet)
+    else:
+        data = table_to_expected.read_rows(path, None)
+        rows = table_to_expected.convert(data, mapping or {}, path.name, None, amount_rules)
     if not rows:
         raise ValueError("expected_rows_empty")
     ids = [row.get("case_id") for row in rows]
@@ -36,8 +37,7 @@ def review(expected: list[dict] | dict, observations: list[dict] | dict, *,
     captures = review_comments.unwrap_rows(observations, "observations")
     if not rows:
         raise ValueError("expected_rows_empty")
-    report = review_comments.compare(rows, captures, amount_mode="expected-only", allow_duplicates=False,
-                                     require_reply_parent=require_reply_parent)
+    report = compare_audit_rows(rows, captures, require_reply_parent=require_reply_parent)
     total = validate_results(rows, report["results"])
     report["schema_version"] = "1.0"
     report["summary"]["approved_amount"] = format(total, ".2f")

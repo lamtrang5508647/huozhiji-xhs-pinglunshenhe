@@ -724,6 +724,7 @@ def compare(
     amount_mode: str = "observed",
     allow_duplicates: bool = False,
     require_reply_parent: bool = False,
+    reply_context_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     expected_rows = list(expected_rows)
     note_presence = not require_reply_parent and amount_mode == "expected-only"
@@ -751,11 +752,25 @@ def compare(
         expected_signals.append((text, expected_type))
         if expected_type == "text+image":
             combo_rows_by_target[key] = combo_rows_by_target.get(key, 0) + 1
+    if reply_context_rows is not None and combo_rows_by_target:
+        # A bare image on a mixed note still has all the original combo tasks as possible owners.
+        for source in reply_context_rows:
+            key = (platform_key(source), target_key(source))
+            if key not in combo_rows_by_target or source["case_id"] in expected_by_case:
+                continue
+            if infer_type(source, text_present=bool(normalize_text(source.get("comment_text", "")))) == "text+image":
+                combo_rows_by_target[key] += 1
 
     results: List[Dict[str, Any]] = []
     settlement_claims = {}
     legacy_absence_targets = set()
-    reply_parents = _reply_parents(expected_rows) if require_reply_parent else {}
+    reply_parents = {}
+    if require_reply_parent and reply_context_rows is not None:
+        # A carried-forward row can still identify the source parent of an active reply.
+        by_case = {reply_context_rows[i]["case_id"]: parent for i, parent in _reply_parents(reply_context_rows).items()}
+        reply_parents = {i: by_case[row["case_id"]] for i, row in enumerate(expected_rows) if row["case_id"] in by_case}
+    elif require_reply_parent:
+        reply_parents = _reply_parents(expected_rows)
     reply_checks = {}
     for index, expected in enumerate(expected_rows):
         key = (platform_key(expected), target_key(expected))
@@ -1091,13 +1106,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         expected = unwrap_rows(load_json(args.expected), "rows")
         observations = unwrap_rows(load_json(args.observations), "observations")
-        report = compare(
-            expected,
-            observations,
-            amount_mode=args.amount_mode,
-            allow_duplicates=args.allow_duplicates,
-            require_reply_parent=args.require_reply_parent,
-        )
+        if any("prior_review" in r for r in expected):
+            if __package__:
+                from .audit_pass import compare_audit_rows
+            else:
+                from audit_pass import compare_audit_rows
+            report = compare_audit_rows(expected, observations, require_reply_parent=args.require_reply_parent,
+                                        amount_mode=args.amount_mode, allow_duplicates=args.allow_duplicates)
+        else:
+            report = compare(expected, observations, amount_mode=args.amount_mode,
+                             allow_duplicates=args.allow_duplicates, require_reply_parent=args.require_reply_parent)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"input_error: {exc}", file=sys.stderr)
         return 1
@@ -1109,7 +1127,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_path.write_text(encoded + "\n", encoding="utf-8")
     else:
         print(encoded)
-    if args.strict and report["summary"]["counts"]["verified"] != report["summary"]["total"]:
+    reviewed = report["summary"].get("audit_pass", {}).get("reviewed_rows", report["summary"]["total"])
+    if args.strict and report["summary"]["counts"]["verified"] != reviewed:
         return 2
     return 0
 

@@ -22,14 +22,15 @@ from xml.etree import ElementTree as ET
 
 from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, deleted_placeholder, flatten_comments, has_more, normalize_comment, normalized_comments
 from capture_pacing import has_remaining_target, pause_seconds
-from capture_resume import fresh_capture, PARSER_REVISIONS
+from capture_resume import fresh_capture, recheck_scope, PARSER_REVISIONS
+from audit_pass import rows_to_review
 from review_comments import compare, platform_key, target_key, unwrap_rows
 from xhs_persistent import persistent_client
 from profile_lock import default_profile
 from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
 from xhs_visible_login import verification_status, wait_for_owner_confirmation
-from table_to_expected import extract_url, parse_maps, read_worksheet, resolve_mapping, xlsx_shared_strings, xlsx_sheet_members
+from table_to_expected import convert_xlsx_sheets, extract_url, parse_maps, read_worksheet, resolve_mapping, xlsx_shared_strings, xlsx_sheet_members
 
 
 NOTE_PATTERNS = (
@@ -160,7 +161,25 @@ def task_link_cells(path, assigned, mapping):
                     yield sheet, number, url
 
 
-def targets_from_workbooks(paths: Iterable[str], *, task_rows=None, mapping=None) -> List[Dict[str, Any]]:
+def capture_task_groups(paths, expected_paths, mapping):
+    groups = [unwrap_rows(json.loads(Path(path).read_text(encoding="utf-8")), "rows") for path in expected_paths]
+    known = {r.get("source_file") for group in groups for r in group if "prior_review" in r}
+    discovered = {}
+    for path in map(Path, paths):
+        if path.name not in known:
+            rows = convert_xlsx_sheets(path, mapping, None, skip_summary=True, skip_non_task_sheets=True)
+            if rows and "prior_review" in rows[0]:
+                discovered[path.name] = rows
+    if discovered:
+        # First-pass JSON can predate the spreadsheet's results or a file rename.
+        # In that case the workbook defines this pass and its physical source rows.
+        remaining = {Path(path).name for path in paths} - discovered.keys()
+        groups = [[r for r in group if r.get("source_file") in remaining] for group in groups]
+        groups.extend(discovered.values())
+    return groups
+
+
+def targets_from_workbooks(paths: Iterable[str], *, task_rows=None, mapping=None, unfiltered_paths=()) -> List[Dict[str, Any]]:
     targets: Dict[str, Dict[str, Any]] = {}
     seen_sources: set[tuple[str, str, str, int]] = set()
     assigned = defaultdict(dict)
@@ -171,7 +190,7 @@ def targets_from_workbooks(paths: Iterable[str], *, task_rows=None, mapping=None
     for input_path in paths:
         source_file = Path(input_path).name
         current_url_by_sheet: Dict[str, str] = {}
-        cells = (workbook_column_a(input_path) if task_rows is None
+        cells = (workbook_column_a(input_path) if task_rows is None or input_path in unfiltered_paths
                  else task_link_cells(input_path, assigned, mapping or {}))
         for sheet_name, row_number, value in cells:
             current_url = current_url_by_sheet.get(sheet_name, "")
@@ -193,7 +212,8 @@ def targets_from_workbooks(paths: Iterable[str], *, task_rows=None, mapping=None
             if source_key not in seen_sources:
                 seen_sources.add(source_key)
                 target["sources"].append({"file": source_file, "sheet": sheet_name, "row": row_number})
-    if task_rows is not None and len(seen_sources) != sum(map(len, assigned.values())):
+    scoped_sources = sum(1 for _, file, sheet, row in seen_sources if row in assigned.get((file, sheet), ()))
+    if task_rows is not None and scoped_sources != sum(map(len, assigned.values())):
         raise ValueError("capture_plan_source_rows_missing")
     return list(targets.values())
 
@@ -528,59 +548,61 @@ def group_note_requirements(rows):
     return groups
 
 
-def reply_signature(rows):
-    return hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+def reply_signature(rows, context_rows=None):
+    signature_data = rows if context_rows is None else {"tasks": rows, "context": context_rows}
+    return hashlib.sha256(json.dumps(signature_data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def unconfirmed_replies(rows, observation):
+def unconfirmed_replies(rows, observation, context_rows=None):
     if not rows:
         return 0
-    results = compare(rows, [observation], amount_mode="expected-only", require_reply_parent=True)["results"]
+    results = compare(rows, [observation], amount_mode="expected-only", require_reply_parent=True,
+                      reply_context_rows=context_rows)["results"]
     reasons = {"reply_parent_unconfirmed", "reply_source_parent_ambiguous"}
     return sum(bool(reasons.intersection(row["reason_codes"])) for row in results)
 
 
-def needs_reply_recheck(rows, observation):
+def needs_reply_recheck(rows, observation, context_rows=None):
     """Decide whether a fresh checkpoint still needs a same-page check for these source rows."""
     if not rows:
         return False
     if not observation or observation.get("capture_status") != "ok":
         return True
     check = observation.get("reply_verification") or {}
-    if check.get("page_attempted") and check.get("requirements_sha256") == reply_signature(rows):
+    if check.get("page_attempted") and check.get("requirements_sha256") == reply_signature(rows, context_rows):
         if check.get("panel_available") or check.get("attempt_count", 1) >= 2:
             return False
-    return bool(unconfirmed_replies(rows, observation))
+    return bool(unconfirmed_replies(rows, observation, context_rows))
 
 
-def capture_covers_tasks(observation, key, rows, *, require_reply_parent=False):
+def capture_covers_tasks(observation, key, rows, *, require_reply_parent=False, context_rows=None):
     if not fresh_capture(observation, "xiaohongshu", key):
         return False
     if observation.get("capture_complete") is True:
         if require_reply_parent:
-            return not needs_reply_recheck(rows, observation)
+            return not needs_reply_recheck(rows, observation, context_rows)
         if (rows and observation.get("reply_label_reader") != "dom-markers-v1"
                 and any(str(c.get("text", c.get("comment_text", ""))).lstrip().startswith(("回复", "回覆", "@", "＠"))
                         for c in observation["comments"])):
             # Older readers could include an explicitly labelled recipient in the body.
             # Only reopen when it actually leaves a task unresolved on this note.
-            results = compare(rows, [observation], amount_mode="expected-only")["results"]
+            results = compare(rows, [observation], amount_mode="expected-only", reply_context_rows=context_rows)["results"]
             return not any("reply_body_prefix_unconfirmed" in result["reason_codes"] for result in results)
         return True
     if not rows or require_reply_parent or observation.get("capture_complete") is not False:
         return False
     # An unfinished list can prove individual appearances. It cannot prove an
     # absence, missing image, partial payment, or visibility on another note.
-    results = compare(rows, [observation], amount_mode="expected-only")["results"]
+    results = compare(rows, [observation], amount_mode="expected-only", reply_context_rows=context_rows)["results"]
     return all(result["status"] == "verified" for result in results)
 
 
-def plan_targets(targets, existing, requirements, refresh=False, *, require_reply_parent=False):
+def plan_targets(targets, existing, requirements, refresh=False, *, require_reply_parent=False, contexts=None):
     if refresh:
         return list(targets)
     return [target for target in targets if not capture_covers_tasks(
         existing.get(target["note_id"]), target["note_id"], requirements.get(target["note_id"]),
-        require_reply_parent=require_reply_parent)]
+        require_reply_parent=require_reply_parent, context_rows=(contexts or {}).get(target["note_id"]))]
 
 
 def saved_observations(original, previous, existing):
@@ -785,12 +807,13 @@ def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tupl
     return rendered, terminal, parsed
 
 
-def check_note_comments(page, key, raw_comments, declared, requirements, args, *, structured_ok=True, prior=None):
+def check_note_comments(page, key, raw_comments, declared, requirements, args, *, structured_ok=True, prior=None,
+                        context_rows=None):
     captured = normalized_comments(raw_comments, root_list=True)
     observation = {"target_key": key, "platform": "xiaohongshu", "capture_status": "ok",
                    "capture_complete": False, "comments": captured}
     strict = getattr(args, "require_reply_parent", False)
-    missing = unconfirmed_replies(requirements, observation) if strict else 0
+    missing = unconfirmed_replies(requirements, observation, context_rows) if strict else 0
     page_needed = bool(missing or not structured_ok)
     expand = bool(page_needed or args.expand_dom or (requirements and not strict))
     terminal, parse_failed = False, False
@@ -824,8 +847,8 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     if strict and requirements:
         after = missing
         if expand and observation["capture_status"] == "ok":
-            after = unconfirmed_replies(requirements, observation)
-        signature = reply_signature(requirements)
+            after = unconfirmed_replies(requirements, observation, context_rows)
+        signature = reply_signature(requirements, context_rows)
         previous = (prior or {}).get("reply_verification", {})
         attempts = previous.get("attempt_count", int(bool(previous.get("page_attempted")))) if previous.get("requirements_sha256") == signature else 0
         if not page_needed:
@@ -842,7 +865,8 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     return observation, terminal, parse_failed
 
 
-def collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error, prior=None):
+def collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error, prior=None,
+                          *, context_rows=None):
     def check_note_identity(check=None):
         active_note = target_from_url(str(client._page.url))
         if not active_note or active_note["note_id"] != note_id:
@@ -875,7 +899,8 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
         if blocker:
             raise login_error(blocker)
     evidence, terminal, parse_failed = check_note_comments(
-        client._page, source_key, raw, declared, requirements, args, structured_ok=structured_ok, prior=prior)
+        client._page, source_key, raw, declared, requirements, args, structured_ok=structured_ok, prior=prior,
+        context_rows=context_rows)
     check = evidence.get("reply_verification", {})
     if check.get("page_attempted") or args.expand_dom or requirements:
         blocker = reply_page_blocker(client)
@@ -945,20 +970,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         parser.error("invalid delay bounds")
 
-    task_rows = [row for path in args.expected
-                 for row in unwrap_rows(json.loads(Path(path).read_text(encoding="utf-8")), "rows")]
+    mapping = parse_maps(args.map)
+    groups = capture_task_groups(args.input, args.expected, mapping)
+    task_rows = [row for group in groups for row in group]
     if (args.task_targets or args.require_reply_parent) and not task_rows:
         parser.error("task targets and reply-parent diagnostics need task rows in --expected")
-    targets = targets_from_workbooks(args.input, task_rows=task_rows if args.task_targets else None,
-                                     mapping=parse_maps(args.map))
+    scope = recheck_scope(task_rows)
+    contexts = group_note_requirements(task_rows) if scope else {}
+    if scope:
+        distinct_paths = {Path(path).resolve() for path in args.input}
+        if len({path.name for path in distinct_paths}) < len(distinct_paths):
+            parser.error("success-only capture requires distinct input workbook names")
+        task_rows = [row for group in groups for row in rows_to_review(group)]
+    scoped_files = {row.get("source_file") for group in groups for row in group}
+    unfiltered = {path for path in args.input if not args.task_targets and Path(path).name not in scoped_files}
+    targets = targets_from_workbooks(args.input, task_rows=task_rows if args.task_targets or scope else None,
+                                     mapping=mapping, unfiltered_paths=unfiltered)
     if args.only_note_id:
         targets = [target for target in targets if target["note_id"] in set(args.only_note_id)]
-        if not targets:
+        if not targets and not scope:
             parser.error("--only-note-id was not found in the input workbooks")
     if args.limit is not None:
         targets = targets[: max(0, args.limit)]
     output_path = Path(args.output)
-    original = unwrap_rows(json.loads(output_path.read_text(encoding="utf-8")), "observations") if output_path.exists() else []
+    if any(output_path.resolve() == Path(path).resolve() or (output_path.exists() and Path(path).exists() and output_path.samefile(path))
+           for path in (*args.expected, *args.input)):
+        parser.error("--output must differ from --expected and --input")
+    checkpoint = json.loads(output_path.read_text(encoding="utf-8")) if output_path.exists() else {}
+    prior_scope = checkpoint.get("recheck_scope") if isinstance(checkpoint, dict) else None
+    if output_path.exists() and prior_scope != scope:
+        parser.error("capture_scope_changed: use a new --output path for a success-only recheck")
+    original = unwrap_rows(checkpoint, "observations") if checkpoint else []
+    scope_meta = {"recheck_scope": scope} if scope else {}
     previous = {target_key(item): item for item in original if platform_key(item) == "xiaohongshu"}
     existing = previous.copy()
 
@@ -966,9 +1009,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     requirements = group_note_requirements(task_rows)
     if args.require_reply_parent:
         requirements = {key: rows for key, rows in requirements.items() if any(row.get("reply_to") for row in rows)}
-    targets = plan_targets(targets, existing, requirements, args.refresh, require_reply_parent=args.require_reply_parent)
+    targets = plan_targets(targets, existing, requirements, args.refresh, require_reply_parent=args.require_reply_parent,
+                           contexts=contexts)
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
     if not targets:
+        if scope and not output_path.exists():
+            atomic_write(output_path, {**scope_meta, "observations": [], "stopped": False})
         return 0
     cookie_str_to_dict, get_cookie_string, XhsClient, DataFetchError, LoginError = load_xhs_modules()
     cookie = get_cookie_string()
@@ -984,7 +1030,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise LoginError("login required: visible login gate")
         except LoginError as exc:
             stop_reason = verification_status(client, exc)
-            atomic_write(output_path, {"observations": saved_observations(original, previous, existing), "stopped": True,
+            atomic_write(output_path, {**scope_meta, "observations": saved_observations(original, previous, existing), "stopped": True,
                                        "stop_reason": stop_reason, "stop_phase": "startup"})
             print(f"[startup] stop status={stop_reason}", flush=True)
             confirmed = args.wait_for_confirmation and hold_verification(client)
@@ -1004,7 +1050,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "comments": [], "source_refs": target["sources"],
                 }
                 stop_reason = "network_changed"
-                atomic_write(output_path, {"observations": saved_observations(original, previous, existing), "stopped": True, "stop_reason": stop_reason})
+                atomic_write(output_path, {**scope_meta, "observations": saved_observations(original, previous, existing), "stopped": True, "stop_reason": stop_reason})
                 print(f"[{index}/{len(targets)}] stop {note_id} status=network_changed", flush=True)
                 break
             captured_at = datetime.now(timezone.utc).isoformat()
@@ -1028,7 +1074,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 client.use_source_note(resolved_note_id, source_url)
                 evidence, dom_terminal, dom_parse_failed, declared = collect_note_evidence(
                     client, note_id, resolved_note_id, token, requirements.get(note_id), args, LoginError, DataFetchError,
-                    None if args.refresh else existing.get(note_id))
+                    None if args.refresh else existing.get(note_id), context_rows=contexts.get(note_id))
                 captured = evidence["comments"]
                 incomplete = not evidence["capture_complete"]
                 observation = {
@@ -1082,7 +1128,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if consecutive_errors >= 2:
                     stop_reason = "repeated_navigation_failure"
             existing[note_id]["capture_duration_ms"] = round((time.monotonic() - target_started) * 1000)
-            atomic_write(output_path, {"observations": saved_observations(original, previous, existing), "stopped": bool(stop_reason), "stop_reason": stop_reason})
+            atomic_write(output_path, {**scope_meta, "observations": saved_observations(original, previous, existing), "stopped": bool(stop_reason), "stop_reason": stop_reason})
             if stop_reason:
                 if args.wait_for_confirmation and stop_reason in ("captcha", "session_expired", "risk_control"):
                     if hold_verification(client):

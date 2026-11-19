@@ -31,7 +31,9 @@ FIELD_ALIASES = {
     "target_url": ["target_url", "targeturl", "文章链接", "作品链接", "笔记链接", "视频链接", "链接"],
     "comment_text": ["comment_text", "commenttext", "评论文字需求", "评论内容", "评论", "文字"],
     "comment_type": ["comment_type", "commenttype", "评论类型", "类型", "形式"],
-    "expected_amount": ["expected_amount", "expectedamount", "金额", "返现金额", "核对金额", "amount"],
+    "expected_amount": ["expected_amount", "expectedamount", "任务单价", "单价", "原始报价", "报价", "金额", "返现金额", "核对金额", "amount"],
+    "prior_result": ["审核结果", "核验结果", "初审结果", "首审结果", "审核状态", "核验状态", "结果分类"],
+    "prior_amount": ["核定金额", "结算金额", "审核金额", "核验金额", "复核金额", "审定金额"],
     "reply_text": ["reply_text", "replytext", "需要回复评论内容左边填写回第几条", "需要回复评论内容", "回复评论内容", "回复内容"],
     "image_requirement": ["image_requirement", "imagerequirement", "评论图片需求", "图片需求"],
     "product_name": ["product_name", "productname", "产品名", "产品"],
@@ -41,6 +43,35 @@ FIELD_ALIASES = {
     "settlement_voucher": ["settlement_voucher", "settlementvoucher", "结算凭证", "转账明细"],
     "qr_code": ["qr_code", "qrcode", "二维码", "收款码"],
 }
+
+PRIOR_CATEGORIES = {
+    "成功": "成功", "通过": "成功", "审核通过": "成功", "审核成功": "成功",
+    "初审成功": "成功", "首审成功": "成功", "核验成功": "成功",
+    "图字成功": "图字成功", "图文成功": "图字成功", "文字成功": "文字成功",
+    "图片成功": "图片成功", "失败": "失败", "未通过": "失败", "审核失败": "失败",
+    "初审失败": "失败", "首审失败": "失败", "审核未通过": "失败", "审核不通过": "失败",
+    "核验失败": "失败", "待人审": "待人审", "需人审": "待人审", "待人工复核": "待人审",
+}
+
+
+class WorksheetRows(list):
+    """Worksheet records together with the physical columns of their headers."""
+    def __init__(self, rows, columns):
+        super().__init__(rows)
+        self.columns = columns
+
+
+class MissingTaskColumns(ValueError):
+    """A sheet does not contain the columns needed to describe a comment task."""
+
+
+def column_letters(zero_index):
+    number = zero_index + 1
+    label = ""
+    while number:
+        number, offset = divmod(number - 1, 26)
+        label = chr(65 + offset) + label
+    return label
 
 
 def norm_header(value: Any) -> str:
@@ -292,7 +323,9 @@ def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[s
         return []
     max_col = max((max(row.keys()) for row in matrix if row), default=-1)
     headers = [matrix[0].get(index, "") for index in range(max_col + 1)]
-    return [{headers[index]: row.get(index, "") for index in range(max_col + 1) if headers[index]} for row in matrix[1:]]
+    columns = {header: column_letters(index) for index, header in enumerate(headers) if header}
+    return WorksheetRows(({header: row.get(index, "") for index, header in enumerate(headers) if header}
+                          for row in matrix[1:]), columns)
 
 
 def read_rows(path: Path, sheet_name: Optional[str], *, target_url_header: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -416,7 +449,7 @@ def resolve_mapping(headers: Iterable[str], explicit: Dict[str, str]) -> Dict[st
             if norm_header(alias) in by_norm:
                 result[destination] = by_norm[norm_header(alias)]
                 break
-        if destination not in result and destination in {"target_url", "expected_amount", "reply_text"}:
+        if destination not in result and destination in {"target_url", "expected_amount", "reply_text", "prior_result", "prior_amount"}:
             for header_norm, header in by_norm.items():
                 if any(header_norm.startswith(norm_header(alias)) for alias in aliases if norm_header(alias)):
                     result[destination] = header
@@ -430,6 +463,8 @@ def convert(
     source_name: str,
     source_sheet: Optional[str] = None,
     amount_rules: Optional[Dict[str, str]] = None,
+    *,
+    detect_prior_in_workbook: bool = False,
 ) -> List[Dict[str, Any]]:
     if not rows:
         return []
@@ -440,6 +475,17 @@ def convert(
         if header not in headers:
             raise ValueError(f"Mapped column not found in {source_sheet or source_name}: {field}={header}")
     mapping = resolve_mapping(headers, explicit)
+    result_header = mapping.pop("prior_result", None)
+    settled_header = mapping.pop("prior_amount", None)
+    price_header = mapping.get("expected_amount")
+    if settled_header is None:
+        # Older templates use the same amount column for the original unit
+        # price and the later approved amount. A dedicated quotation is distinct.
+        generic = resolve_mapping([h for h in headers if norm_header(h).startswith(
+            ("金额", "返现金额", "核对金额", "amount"))], {}).get("expected_amount")
+        settled_header = generic
+    is_xlsx = source_name.lower().endswith(".xlsx")
+    columns = getattr(rows, "columns", {})
     if "group_leader" in mapping and norm_header(mapping["group_leader"]) == norm_header("负责人"):
         raise ValueError("group_leader must use the 团长/团 field; 负责人 abbreviations are not allowed")
     if "expected_amount" in mapping:
@@ -455,7 +501,7 @@ def convert(
         if not type_header or not any(str(row.get(type_header) or "").strip() for row in rows):
             missing.append("comment_text, reply_text, image_requirement or populated comment_type")
     if missing:
-        raise ValueError(f"Missing required column mapping in {source_sheet or source_name}: " + ", ".join(missing))
+        raise MissingTaskColumns(f"Missing required column mapping in {source_sheet or source_name}: " + ", ".join(missing))
     output = []
     previous_target_url = ""
     previous_target_key = ""
@@ -568,6 +614,19 @@ def convert(
         if not item["comment_text"] and not item["has_image"] and not str(item.get("comment_type", "")).strip():
             continue
         rate_type = explicit_type or item.get("comment_type", "")
+        if is_xlsx:
+            raw = str(row.get(result_header) or "")
+            category = PRIOR_CATEGORIES.get(unicodedata.normalize("NFKC", raw).strip(), "")
+            amount = row.get(settled_header)
+            item["prior_review"] = {
+                "category": category, "raw_category": raw,
+                "triage": category if category in ("", "失败", "待人审") else "成功",
+                "amount": None if amount in (None, "") else amount,
+                "result_column": columns.get(result_header), "amount_column": columns.get(settled_header),
+            }
+            if category in ("失败", "待人审", "文字成功", "图片成功") and price_header == settled_header:
+                # A failure zero or an approved component is never a full-task quote.
+                item.pop("expected_amount", None)
         if "expected_amount" not in item or not str(item["expected_amount"]).strip():
             rule = resolved_amount_rules.get(rate_type)
             if rule is not None:
@@ -577,22 +636,111 @@ def convert(
                 item["partial_text_amount"] = resolved_amount_rules["text"]
             if resolved_amount_rules.get("image") is not None:
                 item["partial_image_amount"] = resolved_amount_rules["image"]
+            if is_xlsx and category in ("文字成功", "图片成功") and amount not in (None, ""):
+                rate = "partial_text_amount" if category == "文字成功" else "partial_image_amount"
+                item.setdefault(rate, amount)
         output.append(item)
+    if is_xlsx and not detect_prior_in_workbook:
+        discard_unused_prior(output)
     return output
 
 
+def discard_unused_prior(rows):
+    """An empty result column or template placeholders do not make this a recheck."""
+    if not any(row["prior_review"]["category"] for row in rows):
+        for row in rows:
+            row.pop("prior_review")
+
+
+def summary_task_quotes(archive, member, strings):
+    """Read the writer's own detail grid, independent of workbook or file renames."""
+    if not member:
+        return False, {}
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    data = ET.fromstring(archive.read(member)).find(ns + "sheetData")
+    if data is None:
+        return False, {}
+    header = data.find(f"{ns}row[@r='11']")
+    if header is None:
+        return False, {}
+    cells = {cell.get("r"): xlsx_text(cell, strings) for cell in header.findall(ns + "c")}
+    if any(cells.get(col) != value for col, value in
+           (("P11", "案例ID"), ("S11", "工作表"), ("T11", "原行"), ("X11", "核定金额"))):
+        return False, {}
+    if cells.get("Z11") != "原任务报价":
+        return True, {}
+    quotes = {}
+    for row in data.findall(ns + "row"):
+        num = row.get("r", "0")
+        if not num.isdigit() or int(num) <= 11:
+            continue
+        fields = {c.get("r"): xlsx_text(c, strings) for c in row.findall(ns + "c")
+                  if c.get("r") in (f"S{num}", f"T{num}", f"Z{num}")}
+        name, position = fields.get(f"S{num}", ""), fields.get(f"T{num}", "")
+        price = fields.get(f"Z{num}", "")
+        if not name or not position.isdigit() or int(position) < 2 or not price:
+            continue
+        try:
+            amount = Decimal(price)
+        except InvalidOperation:
+            continue
+        if not amount.is_finite() or amount < 0:
+            continue
+        key = (name, int(position))
+        if key in quotes:
+            raise ValueError(f"Duplicate source quotation for {name} row {position}")
+        quotes[key] = str(amount)
+    return True, quotes
+
+
 def convert_xlsx_sheets(path: Path, explicit: Dict[str, str], amount_rules: Optional[Dict[str, str]],
-                        *, skip_summary: bool = False) -> List[Dict[str, Any]]:
+                        *, skip_summary: bool = False, sheet_name: Optional[str] = None,
+                        skip_non_task_sheets: bool = False) -> List[Dict[str, Any]]:
     converted = []
     with zipfile.ZipFile(path) as archive:
         sheets = xlsx_sheet_members(archive)
+        if sheet_name and sheet_name not in sheets:
+            raise ValueError(f"Worksheet not found: {sheet_name}")
         strings = xlsx_shared_strings(archive)
         for name, member in sheets.items():
-            if skip_summary and name == "审核汇总":
+            if (skip_summary or sheet_name) and name == "审核汇总":
                 continue
             rows = read_worksheet(archive, member, strings, target_url_header=explicit.get("target_url"))
-            converted.extend(convert(rows, explicit, path.name, name, amount_rules))
-    return converted
+            if sheet_name and name != sheet_name:
+                # Optional sheets may be ledgers with a different schema. Only
+                # a recognized status on a convertible task can activate a recheck.
+                try:
+                    available = {k: v for k, v in explicit.items() if rows and v in rows[0]}
+                    converted.extend(convert(rows, available, path.name, name, amount_rules, detect_prior_in_workbook=True))
+                except ValueError:
+                    continue
+            else:
+                try:
+                    converted.extend(convert(rows, explicit, path.name, name, amount_rules, detect_prior_in_workbook=True))
+                except MissingTaskColumns:
+                    if not skip_non_task_sheets:
+                        raise
+        discard_unused_prior(converted)
+        if converted and "prior_review" in converted[0] and "审核汇总" in sheets:
+            generated, quotes = summary_task_quotes(archive, sheets["审核汇总"], strings)
+            fallback = {}
+            for row in converted:
+                sheet, number = row["source_sheet"], row["source_row"]
+                prior = row["prior_review"]
+                if generated and prior["amount_column"] is None and prior["result_column"] == "G":
+                    # Older writers used H even if the source lacked a rate header.
+                    if sheet not in fallback:
+                        xml = ET.fromstring(archive.read(sheets[sheet]))
+                        fallback[sheet] = {cell.get("r"): xlsx_text(cell, strings) for cell in xml.iter()
+                                           if local_name(cell.tag) == "c" and re.fullmatch(r"H\d+", cell.get("r", ""))}
+                    if not fallback[sheet].get("H1"):
+                        amount = fallback[sheet].get(f"H{number}") or None
+                        prior.update(amount=amount, amount_column="H")
+                        if prior["category"] in ("图字成功", "成功") and amount is not None:
+                            row.setdefault("expected_amount", amount)
+                if (sheet, number) in quotes:
+                    row["expected_amount"] = quotes[sheet, number]
+    return [r for r in converted if r["source_sheet"] == sheet_name] if sheet_name else converted
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -608,8 +756,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         source = Path(args.input)
         explicit = parse_maps(args.map)
         rules = parse_amount_rules(args.amount_rules)
-        if source.suffix.casefold() == ".xlsx" and args.all_sheets:
-            converted = convert_xlsx_sheets(source, explicit, rules)
+        if source.suffix.casefold() == ".xlsx":
+            selected = None if args.all_sheets else (args.sheet or next(iter(list_xlsx_sheets(source)), None))
+            converted = convert_xlsx_sheets(source, explicit, rules, skip_summary=True, sheet_name=selected)
         else:
             sheet_name = args.sheet if source.suffix.casefold() == ".xlsx" else None
             converted = convert(read_rows(source, sheet_name, target_url_header=explicit.get("target_url")),

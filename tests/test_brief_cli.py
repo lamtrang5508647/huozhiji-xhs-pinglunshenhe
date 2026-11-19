@@ -58,6 +58,20 @@ class BriefCliTests(unittest.TestCase):
                     expected_brief["output"] = str(self.audited.resolve())
                 self.assertEqual(brief, expected_brief)
 
+    def test_strict_recheck_exits_on_current_decisions_only(self):
+        self.invoke("audit", "--source", self.source, "--observations", self.observations,
+                    "--output", self.audited, "--report", self.review)
+        second = self.root / "二审.xlsx"
+        args = ["audit", "--source", self.audited, "--observations", self.observations,
+                "--output", second, "--report", self.review, "--brief", "--strict"]
+        summary = self.invoke(*args)["summary"]
+        self.assertEqual(summary["triage_counts"], {"成功": 4, "失败": 1, "待人审": 1})
+        self.assertEqual(summary["audit_pass"]["reviewed_triage_counts"], {"成功": 4, "失败": 0, "待人审": 0})
+        evidence = json.loads(self.observations.read_text(encoding="utf-8"))
+        evidence["observations"][0]["comments"] = []
+        self.observations.write_text(json.dumps(evidence), encoding="utf-8")
+        self.assertEqual(self.invoke(*args, code=2)["summary"]["audit_pass"]["reviewed_triage_counts"]["失败"], 1)
+
     def test_brief_requires_full_evidence_destination_before_processing(self):
         for args, flag in ((["convert", "--source", self.source], "--output"),
                            (["review", "--expected", self.expected, "--observations", self.observations], "--output"),

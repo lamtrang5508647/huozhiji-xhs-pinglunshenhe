@@ -288,6 +288,10 @@ def test_reply_resume():
     assert satisfied["reply_verification"]["page_attempted"] is False
     assert not satisfied["capture_complete"]
     assert not strict_plan(targets, {key: {**fresh, "comments":satisfied["comments"]}}, requirements, False)
+    # Only the reply succeeded on the first pass. Its original parent still resolves its row ordinal.
+    confirmed = {**fresh, "comments": satisfied["comments"]}
+    assert strict_plan(targets, {key: confirmed}, {key: rows[1:]}) == targets
+    assert not strict_plan(targets, {key: confirmed}, {key: rows[1:]}, contexts={key: rows})
 
 
 def main() -> None:

@@ -30,12 +30,14 @@ def main():
     with tempfile.TemporaryDirectory() as temp:
         checkpoint=Path(temp)/'observations.json'
         checkpoint.write_text(json.dumps({'observations':[good]}))
-        with patch.object(dy,'targets_from_expected',return_value=targets[:1]), \
-             patch.object(dy,'sync_playwright',side_effect=AssertionError('browser should not open')), \
-             patch('sys.argv',['capture','--expected','fixture.json','--output',str(checkpoint)]):
+        source=Path(temp)/'fixture.json'
+        source.write_text(json.dumps({"rows":[dict(platform="douyin",target_key="a",target_url="https://www.douyin.com/video/a")]}))
+        with patch.object(dy,'sync_playwright',side_effect=AssertionError('browser should not open')), \
+             patch('sys.argv',['capture','--expected',str(source),'--output',str(checkpoint)]):
             assert dy.main()==0
         xhs_good={**good,'platform':'xiaohongshu','parser_revision':PARSER_REVISIONS['xiaohongshu']}
-        with patch.object(xhs,'targets_from_workbooks',return_value=[{'note_id':'a'}]), \
+        with patch.object(xhs,'capture_task_groups',return_value=[]), \
+             patch.object(xhs,'targets_from_workbooks',return_value=[{'note_id':'a'}]), \
              patch.object(xhs,'load_xhs_modules',side_effect=AssertionError('browser should not open')):
             for original in ({'observations':[xhs_good]}, [good, xhs_good]):
                 checkpoint.write_text(json.dumps(original))

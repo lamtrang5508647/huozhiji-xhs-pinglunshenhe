@@ -16,6 +16,10 @@
 
 ## CLI
 
+成功项复核时，`--strict` 依据本轮实际重判的结果和未结算金额决定退出码。只沿用首审失败、而本轮复核项全部确认成功时，返回 0。
+
+已审核的 Excel 经 `convert` 后保留逐行 `prior_review`。`review`、`audit` 和在线 `run` 依此选择上次判成功的行。本次复核和沿用上次结果的行均在最终报告中保留，`summary.audit_pass` 给出审核范围和数量。离线接口按调用方传入的证据判断；再次确认当前可见性时应提供新证据。
+
 核心 CLI 以 JSON 输出结果。退出码 0 表示处理完成，1 表示输入或运行错误。`review` 和 `audit` 指定 `--strict` 后，遇到失败、待审或未结算金额会输出报告并返回 2。以 `summary.triage_counts` 查看可见性结果，`summary.settlement_pending_count` 表示可见结果中仍待核定金额的行数。只有业务明确要求核对直接回复对象时，才在离线审核中传 `--require-reply-parent`。
 
 在线 `run` 的进度和验证提示输出到stderr、完成清单输出到stdout，遇到未解决的验证返回3；已解决的验证子进程返回4，由runner恢复断点。依赖未安装或内部错误不会被描述成“审核成功”。`maintain` 输出其原生JSON计划。

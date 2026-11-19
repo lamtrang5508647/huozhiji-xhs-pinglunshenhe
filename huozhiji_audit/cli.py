@@ -109,7 +109,7 @@ def main(argv=None):
     audit.add_argument("--report", help="Optional JSON report destination")
     for command in (compare, audit):
         command.add_argument("--strict", action="store_true",
-                             help="Return 2 when a task failed, is inconclusive, or has unsettled payment")
+                             help="Return 2 when a task reviewed in this pass failed, is inconclusive, or has unsettled payment")
         command.add_argument("--require-reply-parent", action="store_true",
                              help="Require direct parent attribution for numbered replies (default: same-post presence)")
     for command, flag in ((convert, "--output"), (compare, "--output"), (audit, "--report")):
@@ -180,12 +180,16 @@ def main(argv=None):
         if args.brief:
             brief = {"status": "complete", "report": destination,
                      "summary": {key: result["summary"][key] for key in ("total", "triage_counts", "approved_amount")}}
+            audit_pass = result["summary"].get("audit_pass", {})
+            if audit_pass.get("mode") == "success_recheck":
+                brief["summary"]["audit_pass"] = audit_pass
             if result["summary"].get("settlement_pending_count"):
                 brief["summary"]["settlement_pending_count"] = result["summary"]["settlement_pending_count"]
             if args.command == "audit":
                 brief["output"] = result["workbook"]["output"]
         emit(result, report_path, brief=brief)
-        counts = result["summary"]["triage_counts"]
+        audit_pass = result["summary"].get("audit_pass", {})
+        counts = audit_pass.get("reviewed_triage_counts", result["summary"]["triage_counts"])
         return 2 if args.strict and (counts["失败"] or counts["待人审"] or result["summary"].get("settlement_pending_count")) else 0
     except (OSError, ValueError, RuntimeError, KeyError, zipfile.BadZipFile, ET.ParseError, ArithmeticError) as exc:
         emit({"status": "error", "error": str(exc)})
