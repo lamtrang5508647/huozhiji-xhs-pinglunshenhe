@@ -4,11 +4,11 @@ from datetime import datetime, timezone
 # Bump the relevant revision when comment extraction or completeness changes.
 PARSER_REVISIONS = {'xiaohongshu':'xhs-confirmed-expansion-v6', 'douyin':'dy-body-20260930-v2'}
 
-def reusable_capture(item, platform, key, *, now=None):
+def fresh_capture(item, platform, key, *, now=None):
     if not isinstance(item, dict):
         return False
     if (item.get('platform') != platform or str(item.get('target_key')) != str(key)
-            or item.get('capture_status') != 'ok' or item.get('capture_complete') is not True
+            or item.get('capture_status') != 'ok'
             or item.get('image_detection_complete') is False
             or item.get('parser_revision') != PARSER_REVISIONS.get(platform)):
         return False
@@ -22,6 +22,9 @@ def reusable_capture(item, platform, key, *, now=None):
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
     return 0 <= age <= 24 * 3600
+
+def reusable_capture(item, platform, key, *, now=None):
+    return fresh_capture(item, platform, key, now=now) and item.get('capture_complete') is True
 
 def pending_targets(targets, existing, platform, key_field, *, refresh=False):
     return [t for t in targets if refresh or not reusable_capture(

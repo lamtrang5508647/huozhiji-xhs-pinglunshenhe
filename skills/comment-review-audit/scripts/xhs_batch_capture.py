@@ -22,7 +22,7 @@ from xml.etree import ElementTree as ET
 
 from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, deleted_placeholder, flatten_comments, has_more, normalize_comment, normalized_comments
 from capture_pacing import has_remaining_target, pause_seconds
-from capture_resume import pending_targets, PARSER_REVISIONS
+from capture_resume import fresh_capture, PARSER_REVISIONS
 from review_comments import compare, platform_key, target_key, unwrap_rows
 from xhs_persistent import persistent_client
 from profile_lock import default_profile
@@ -258,13 +258,15 @@ DOM_COMMENT_FIELDS = r"""item => {
         node => node.closest('.comment-item') === element);
     const commentId = element => element.getAttribute('data-comment-id') ||
         /^comment-([0-9a-f]{24})$/i.exec(element.id || '')?.[1] || null;
+    const recipientLabel = '.reply-to, [data-reply-recipient-label]';
     const bodyText = element => {
         const emojis = [...element.querySelectorAll('img[alt]')].filter(img =>
             img.matches('.emoji, .emoji-img, .emoji-icon, [data-emoji]') ||
             /^\[[^\[\]]{1,24}\]$/.test(img.alt));
-        if (!emojis.length) return element.innerText;
+        if (!emojis.length && !element.querySelector(recipientLabel)) return element.innerText;
         const parts = [];
         const walk = node => {
+            if (node instanceof Element && node.matches(recipientLabel)) return;
             if (node.nodeType === Node.TEXT_NODE) parts.push(node.textContent);
             else if (emojis.includes(node)) parts.push(node.alt);
             else if (node instanceof Element && getComputedStyle(node).display !== 'none') {
@@ -321,6 +323,8 @@ DOM_COMMENT_FIELDS = r"""item => {
     return {
         text: ownText ? bodyText(bodies[0]) : item.innerText,
         own_text: ownText,
+        reply_label_removed: ownText && content.some(node => node.contains(bodies[0]) &&
+            [...node.querySelectorAll(recipientLabel)].some(label => label.closest('.comment-item') === item)),
         has_image: own(item, '.comment-picture img').length > 0,
         comment_id: commentId(item),
         parent_comment_id: parentId,
@@ -335,6 +339,8 @@ DOM_COMMENT_FIELDS = r"""item => {
 
 def dom_comment_record(fields: Dict[str, Any]) -> Dict[str, Any]:
     result = {"text": fields["text"].strip(), "has_image": fields["has_image"]}
+    if fields.get("reply_label_removed"):
+        result["reply_label_removed"] = True
     identifier = clean_comment_id(fields.get("comment_id"))
     if identifier:
         result["comment_id"] = identifier
@@ -513,13 +519,13 @@ def visible_terminal(container: Any) -> bool:
             and container.get_by_text(empty).and_(outside_comments).count() > 0)
 
 
-def group_reply_requirements(rows):
-    """Group complete expected-row blocks; their source order resolves reply directives."""
+def group_note_requirements(rows):
+    """Check all assigned rows before reusing a partial observation for positive evidence."""
     groups = {}
     for row in rows:
         if platform_key(row) == "xiaohongshu":
             groups.setdefault(target_key(row), []).append(row)
-    return {key: rows for key, rows in groups.items() if any(row.get("reply_to") for row in rows)}
+    return groups
 
 
 def reply_signature(rows):
@@ -529,7 +535,7 @@ def reply_signature(rows):
 def unconfirmed_replies(rows, observation):
     if not rows:
         return 0
-    results = compare(rows, [observation], amount_mode="expected-only")["results"]
+    results = compare(rows, [observation], amount_mode="expected-only", require_reply_parent=True)["results"]
     reasons = {"reply_parent_unconfirmed", "reply_source_parent_ambiguous"}
     return sum(bool(reasons.intersection(row["reason_codes"])) for row in results)
 
@@ -547,16 +553,34 @@ def needs_reply_recheck(rows, observation):
     return bool(unconfirmed_replies(rows, observation))
 
 
-def plan_targets(targets, existing, requirements, refresh=False):
-    pending = {t["note_id"] for t in pending_targets(targets, existing, "xiaohongshu", "note_id", refresh=refresh)}
-    for target in targets:
-        key = target["note_id"]
-        rows = requirements.get(key)
-        if key in pending or not rows:
-            continue
-        if needs_reply_recheck(rows, existing[key]):
-            pending.add(key)
-    return [t for t in targets if t["note_id"] in pending]
+def capture_covers_tasks(observation, key, rows, *, require_reply_parent=False):
+    if not fresh_capture(observation, "xiaohongshu", key):
+        return False
+    if observation.get("capture_complete") is True:
+        if require_reply_parent:
+            return not needs_reply_recheck(rows, observation)
+        if (rows and observation.get("reply_label_reader") != "dom-markers-v1"
+                and any(str(c.get("text", c.get("comment_text", ""))).lstrip().startswith(("回复", "回覆", "@", "＠"))
+                        for c in observation["comments"])):
+            # Older readers could include an explicitly labelled recipient in the body.
+            # Only reopen when it actually leaves a task unresolved on this note.
+            results = compare(rows, [observation], amount_mode="expected-only")["results"]
+            return not any("reply_body_prefix_unconfirmed" in result["reason_codes"] for result in results)
+        return True
+    if not rows or require_reply_parent or observation.get("capture_complete") is not False:
+        return False
+    # An unfinished list can prove individual appearances. It cannot prove an
+    # absence, missing image, partial payment, or visibility on another note.
+    results = compare(rows, [observation], amount_mode="expected-only")["results"]
+    return all(result["status"] == "verified" for result in results)
+
+
+def plan_targets(targets, existing, requirements, refresh=False, *, require_reply_parent=False):
+    if refresh:
+        return list(targets)
+    return [target for target in targets if not capture_covers_tasks(
+        existing.get(target["note_id"]), target["note_id"], requirements.get(target["note_id"]),
+        require_reply_parent=require_reply_parent)]
 
 
 def saved_observations(original, previous, existing):
@@ -765,9 +789,10 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     captured = normalized_comments(raw_comments, root_list=True)
     observation = {"target_key": key, "platform": "xiaohongshu", "capture_status": "ok",
                    "capture_complete": False, "comments": captured}
-    missing = unconfirmed_replies(requirements, observation)
+    strict = getattr(args, "require_reply_parent", False)
+    missing = unconfirmed_replies(requirements, observation) if strict else 0
     page_needed = bool(missing or not structured_ok)
-    expand = bool(page_needed or args.expand_dom)
+    expand = bool(page_needed or args.expand_dom or (requirements and not strict))
     terminal, parse_failed = False, False
     panel = open_comments_panel(page) if expand else None
     if panel:
@@ -787,6 +812,8 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     elif expand:
         observation["warnings"] = ["comments_panel_unavailable"]
     observation["capture_complete"] = bool(panel and terminal and not parse_failed and not has_more(raw_comments))
+    if panel and not parse_failed:
+        observation["reply_label_reader"] = "dom-markers-v1"
     apply_displayed_parents(captured, raw_comments, observation["capture_complete"])
     if observation["capture_complete"]:
         observation["capture_complete_source"] = "visible_comment_list_end"
@@ -794,7 +821,7 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     observation["image_detection_complete"] = not parse_failed
     if not structured_ok and (not panel or (not captured and not terminal)):
         observation.update(capture_status="inaccessible", capture_complete=False, image_detection_complete=False)
-    if requirements:
+    if strict and requirements:
         after = missing
         if expand and observation["capture_status"] == "ok":
             after = unconfirmed_replies(requirements, observation)
@@ -843,14 +870,14 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
     if login_gate_visible(client):
         raise login_error("login required: visible login gate")
     check_note_identity()
-    if not structured_ok or args.expand_dom:
+    if not structured_ok or args.expand_dom or requirements:
         blocker = reply_page_blocker(client)
         if blocker:
             raise login_error(blocker)
     evidence, terminal, parse_failed = check_note_comments(
         client._page, source_key, raw, declared, requirements, args, structured_ok=structured_ok, prior=prior)
     check = evidence.get("reply_verification", {})
-    if check.get("page_attempted") or args.expand_dom:
+    if check.get("page_attempted") or args.expand_dom or requirements:
         blocker = reply_page_blocker(client)
         if blocker:
             error = login_error(blocker)
@@ -865,10 +892,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", required=True, help="Source XLSX; repeat for multiple files")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--verify-replies", action="append", default=[], metavar="EXPECTED_JSON",
-                        help="Check unresolved required reply threads on the same note page")
+    parser.add_argument("--expected", "--verify-replies", action="append", default=[], metavar="EXPECTED_JSON",
+                        help="Source task rows to check against comments anywhere on the same note")
+    parser.add_argument("--require-reply-parent", action="store_true",
+                        help="Also collect direct-parent evidence for explicit thread-attribution diagnostics")
     parser.add_argument("--task-targets", action="store_true",
-                        help="Use only source rows in --verify-replies and their mapped original note links")
+                        help="Use only source rows in --expected and their mapped original note links")
     parser.add_argument("--map", action="append", default=[], help="Source column mapping for --task-targets")
     parser.add_argument("--headed", action="store_true", help="Use a visible browser window")
     parser.add_argument("--wait-for-confirmation", action="store_true",
@@ -916,10 +945,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         parser.error("invalid delay bounds")
 
-    task_rows = [row for path in args.verify_replies
+    task_rows = [row for path in args.expected
                  for row in unwrap_rows(json.loads(Path(path).read_text(encoding="utf-8")), "rows")]
-    if args.task_targets and not task_rows:
-        parser.error("--task-targets needs the converted task rows in --verify-replies")
+    if (args.task_targets or args.require_reply_parent) and not task_rows:
+        parser.error("task targets and reply-parent diagnostics need task rows in --expected")
     targets = targets_from_workbooks(args.input, task_rows=task_rows if args.task_targets else None,
                                      mapping=parse_maps(args.map))
     if args.only_note_id:
@@ -934,8 +963,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     existing = previous.copy()
 
     total_targets = len(targets)
-    requirements = group_reply_requirements(task_rows)
-    targets = plan_targets(targets, existing, requirements, args.refresh)
+    requirements = group_note_requirements(task_rows)
+    if args.require_reply_parent:
+        requirements = {key: rows for key, rows in requirements.items() if any(row.get("reply_to") for row in rows)}
+    targets = plan_targets(targets, existing, requirements, args.refresh, require_reply_parent=args.require_reply_parent)
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
     if not targets:
         return 0

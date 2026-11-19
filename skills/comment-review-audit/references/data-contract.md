@@ -29,7 +29,7 @@ The workflow separates source requirements, platform observations, and determini
 
 Required identity fields are `case_id`, `platform`, and `target_key` or `target_url`. Required review fields are `comment_type` and `expected_amount`; `comment_text` is required for `text` and `text+image`.
 
-For `text+image` rows, the converter also records `partial_text_amount` and `partial_image_amount` when the amount header defines component rates. A verified text-only or image-only component is then settled at its component rate; without an explicit component rate it remains `待人审` with a blank amount.
+For `text+image` rows, the converter records `partial_text_amount` and `partial_image_amount` when the amount header defines component rates. The default audit records the component that was verified and uses its explicit rate for settlement. When this rate is missing, the approved amount stays blank.
 
 Optional settlement metadata is `product_name`, `group_leader`, `leader_contact`, `settlement_time`, `settlement_voucher`, and `qr_code`. The standard Chinese aliases are `产品/产品名`, `团长/团`, `团长联系方式`, `跟团长结算时间`, `结算凭证/转账明细`, and `二维码/收款码`. `group_leader` must come directly from the product sheet's `团长` (or legacy `团`) field and preserve its complete value; mapping `负责人` into `group_leader` is invalid. The workbook builder groups summary rows by `group_leader + product_name` and preserves manual settlement cells across rebuilds.
 
@@ -94,13 +94,13 @@ Comment fields:
 - `parent_comment_id`: ID of the directly replied-to comment when supplied by the platform. Explicit null denotes a known top-level comment. Omit the field when the relationship is unknown.
 - `parent_text`: optional direct-parent text from a trusted capture. The matcher checks its consistency with identifiers and the uniquely observed parent in the same capture.
 
-For a numbered reply directive (such as `回复第2条`), resolve the intended parent within the same source sheet and target. Some sheets count all rows and others count only primary comments. A source reference with no unique supported reading gets `reply_source_parent_ambiguous`. When the parent is identifiable but its direct relationship to the observed reply is unconfirmed, use `reply_parent_unconfirmed`. Both leave the amount blank. Pending reply rows expose target-level `reply_verification` information, including whether a page check was recorded and whether the comments panel was available. A matching text under a deleted parent or within the same thread alone cannot establish the required direct relationship.
+By default, one visible occurrence of the requested body anywhere on the assigned platform and post satisfies a text task. This includes top-level comments, nested replies, and a visible child of a deleted root. A numbered directive identifies the source reply body. Only the optional offline `--require-reply-parent` mode additionally requires direct-parent attribution.
 
-A candidate with `thread_root_deleted: true` was visible in a group whose root displayed a deletion notice. Pending rows with such a matching candidate retain the fact `reply_thread_root_deleted`. This observation does not reconstruct the original text of the deleted root.
+In optional direct-parent mode, `reply_source_parent_ambiguous`, `reply_parent_unconfirmed`, and `reply_thread_root_deleted` distinguish missing evidence about placement.
 
 `parent_evidence: "single_visible_reply_under_root"` records a relationship inferred from the fully displayed page. The standard reply group contained one intact root and one visible reply, with no competing addressee, pending expansion or conflicting relationship. The report preserves the displayed root text. A platform-supplied direct parent ID, when available, is a separate piece of evidence.
 
-Use the optional positive integer `task_ordinal` for a template that explicitly numbers its tasks or comments. Localized headers include `任务序号` and `评论序号`. If the owner defines another column as that numbering, pass e.g. `--map task_ordinal=账号`. The target number must identify a unique top-level task in the same contiguous source block. The published reply still needs corresponding platform evidence.
+For optional direct-parent checks, `task_ordinal` can identify the source task from `任务序号` or `评论序号`. When explicitly defined by the owner, `--map task_ordinal=账号` uses that column.
 
 `image_detection_complete: false` means at least one comment image state could not be established. Image-dependent expectations become `待人审`, not a negative match.
 
@@ -108,13 +108,13 @@ Use the optional positive integer `task_ordinal` for a template that explicitly 
 
 `pacing_profile` is optional and records `standard` or `risk-averse` for capture evidence. It contains no account, cookie, or network information.
 
-`parser_revision` identifies the extraction/completeness implementation that generated evidence. Automatic same-job resume requires an exact current revision and an aware `captured_at` within the past 24 hours, healthy complete capture, and known image state for every captured comment. Legacy records remain evidence but are not automatically trusted for a new live resume. Do not retrospectively label them as current-parser output.
+`parser_revision` identifies the extraction and completeness rules. Live checkpoint reuse checks the revision, the target, the capture status and its timestamp. A fresh partial view may confirm already visible tasks, while a missing target comment still requires complete evidence.
 
 ## Internal statuses
 
 | Status | Meaning |
 |---|---|
-| `verified` | Healthy evidence fully matches text/type and the configured amount rule. |
+| `verified` | Evidence establishes the requested visibility. A separate settlement status can defer payment. |
 | `not_found` | Healthy complete capture contains neither the required match nor a qualifying component. |
 | `mismatch` | A candidate exists but a required type/amount conflicts. |
 | `partial_text` | A text+image task has the required text but definitively no attached image. |
@@ -122,7 +122,7 @@ Use the optional positive integer `task_ordinal` for a template that explicitly 
 | `needs_review` | Duplicate/ambiguous candidate, unknown image state, or contradictory metadata. |
 | `blocked` | Login, CAPTCHA, risk control, network change, inaccessible target, or incomplete capture prevents a conclusion. |
 
-Within a review, a comment used as settlement evidence for multiple task rows on the same platform and target can result in `evidence_claimed_by_multiple_rows`. Conflicting rows need manual review and have a blank approved amount. A text-only requirement whose body is empty after normalization also needs review.
+On default audits, repeated appearances satisfy one text requirement. Multiple source rows may each confirm visibility from the same occurrence. Settlement requires separate evidence for each payment. Overlapping claims carry `pending_duplicate_claim` and an empty approved amount. A source price that cannot be determined carries `pending_source_amount`.
 
 Automatic checks use the presence of an attached image. Verification that it depicts a particular reference image requires the source image and the actual attachment. Claim reconciliation covers the rows and observations supplied to the current review.
 
@@ -136,13 +136,13 @@ Every row has both `result_category` and `triage`.
 | Verified text+image task | `图字成功` | `成功` | Approved |
 | Text component only with explicit component rate | `文字成功` | `成功` | Text component rate |
 | Image component only with explicit component rate | `图片成功` | `成功` | Image component rate |
-| Text/image component only without explicit component rate | `文字成功` / `图片成功` | `待人审` | Blank |
+| Confirmed text/image component without an explicit component rate (default) | `文字成功` / `图片成功` | `成功` | Blank |
 | Complete capture, neither required component / conflicting type or amount | `失败` | `失败` | `0.00` |
 | Any blocker or ambiguity | `待人审` | `待人审` | Blank |
 
 `失败` for a text+image task means neither required component was established in a healthy complete capture. A partial component remains distinct and is paid only when its component rate is explicitly defined by the source table.
 
-Every report row also carries `approved_amount`: the table-defined amount for `成功`/`图字成功`, the explicit component rate for settled partial results, `0.00` for `失败`, and `null` for `待人审` or partial results without a component rate. This prevents a confirmed failure from looking like an unreviewed blank in the settlement column.
+`approved_amount` is the source-defined full or component price, `0.00` for a confirmed failure, or `null` when unsettled. Reports explain why an amount remains blank.
 
 The report preserves `source_file`, `source_sheet`, `source_row`, `reason_codes`, compact candidate metadata, and capture evidence whenever available.
 

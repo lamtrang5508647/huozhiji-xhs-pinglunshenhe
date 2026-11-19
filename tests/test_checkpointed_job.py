@@ -41,7 +41,7 @@ class CheckpointedJobTests(unittest.TestCase):
                 self.assertFalse(runner.has_healthy_capture(latest, captures[0]["target_key"]))
                 self.assertFalse(runner.checkpoint_covers_workbook(self.rows, {"observations": latest}, {}))
 
-    def test_live_job_rechecks_missing_parent_even_on_a_complete_checkpoint(self):
+    def test_live_job_reuses_visible_reply_without_parent_even_when_only_positives_were_captured(self):
         captures = self.checkpoint["observations"]
         root = dict(platform="xiaohongshu", target_key="n1", source_sheet="S", source_row=2,
                     case_id="root", comment_text="parent", expected_amount="1.00")
@@ -50,27 +50,24 @@ class CheckpointedJobTests(unittest.TestCase):
         comments = [dict(text="parent", comment_id="r", parent_comment_id=None, has_image=False),
                     dict(text="child", comment_id="c", has_image=False)]
         captures[0]["comments"] = comments
-        requirements = runner.group_reply_requirements(rows)
-        self.assertFalse(runner.checkpoint_covers_workbook(rows, self.checkpoint, requirements))
         checkpoint = self.job / "observations.json"
-        runner.write_state(checkpoint, self.checkpoint)
-
-        def simulate_page_recheck(args):
-            self.assertIn("--only-note-id", args)
-            source_requirements = Path(args[args.index("--verify-replies") + 1])
-            self.assertEqual(json.loads(source_requirements.read_text(encoding="utf-8"))["rows"], rows)
-            comments[1]["parent_comment_id"] = "r"
-            runner.write_state(checkpoint, self.checkpoint)
-
         argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
-        with patch.object(sys, "argv", argv), patch.object(runner, "convert_xlsx_sheets", return_value=rows), \
-             patch.object(runner, "run_capture", side_effect=simulate_page_recheck) as capture, \
-             patch.object(runner, "build_workbook"), patch.object(runner, "write_manifest"):
-            self.assertEqual(runner.main(), 0)
-            capture.assert_called_once()
-        results = json.loads((self.job / "review-report.json").read_text(encoding="utf-8"))["results"]
-        self.assertEqual(results[1]["triage"], "成功")
-        self.assertTrue(runner.checkpoint_covers_workbook(rows, self.checkpoint, requirements))
+        for complete in (True, False):
+            captures[0]["capture_complete"] = complete
+            runner.write_state(checkpoint, self.checkpoint)
+            with self.subTest(complete=complete), patch.object(sys, "argv", argv), \
+                 patch.object(runner, "convert_xlsx_sheets", return_value=rows), \
+                 patch.object(runner, "run_capture", side_effect=AssertionError("already visible")), \
+                 patch.object(runner, "build_workbook"), patch.object(runner, "write_manifest"):
+                self.assertEqual(runner.main(), 0)
+                results = json.loads((self.job / "review-report.json").read_text(encoding="utf-8"))["results"]
+                self.assertEqual([item["triage"] for item in results], ["成功", "成功"])
+
+        for change in ({"comments": comments[:1]}, {"target_key": "another"}, {"parser_revision": "old"},
+                       {"captured_at": (self.now - timedelta(days=2)).isoformat()}, {"capture_status": "captcha"}):
+            with self.subTest(change=change):
+                checkpoint_data = {"observations": [{**captures[0], **change}]}
+                self.assertFalse(runner.checkpoint_covers_workbook(rows, checkpoint_data, {"n1": rows}))
 
     def test_incomplete_first_note_recovers_and_reviews_every_row(self):
         observations = self.checkpoint["observations"]
@@ -81,7 +78,7 @@ class CheckpointedJobTests(unittest.TestCase):
             if key is None:
                 captures = observations
             else:
-                captures = [{**observations[0], "capture_complete": False}]
+                captures = [{**observations[0], "capture_complete": False, "comments": []}]
                 if key == "n2":
                     captures.append(observations[1])
             runner.write_state(self.job / "observations.json", {"observations": captures})
@@ -141,6 +138,19 @@ class CheckpointedJobTests(unittest.TestCase):
                 rows, first, report, self.job / "checkpoint.json", ["capture", "--output", "initial.json"], set())
         self.assertEqual(checkpoint["observations"], [prior])
         self.assertEqual([r["triage"] for r in checked["results"]], ["成功", "待人审"])
+
+    def test_manifest_accounts_for_visible_tasks_with_overlapping_payment_claims(self):
+        rows = [self.rows[0], {**self.rows[0], "source_row": 3, "case_id": "duplicate-task"}]
+        captures = self.checkpoint["observations"][:1]
+        runner.write_state(self.job / "observations.json", {"observations": captures})
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        with patch.object(sys, "argv", argv), patch.object(runner, "convert_xlsx_sheets", return_value=rows), \
+             patch.object(runner, "run_capture", side_effect=AssertionError("already visible")):
+            self.assertEqual(runner.main(), 0)
+        manifest = json.loads((self.job / "job-result.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["success"], manifest["manual_review"], manifest["settlement_pending_count"]),
+                         (2, 0, 2))
+        self.assertEqual(manifest["approved_amount"], 0)
 
     def test_completed_checkpoint_uses_source_rates_and_writes_all_outputs(self):
         with zipfile.ZipFile(self.source) as archive:

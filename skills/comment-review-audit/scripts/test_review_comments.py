@@ -28,16 +28,16 @@ def test_shared_evidence():
         for i, mode in enumerate(["exact", "contains"] * 10)
     ]
     with patch.object(review_comments, "normalize_text", wraps=normalize_text) as normalize:
-        results = compare(rows, captures, amount_mode="expected-only")["results"]
+        results = compare(rows, captures, amount_mode="expected-only", require_reply_parent=True)["results"]
     for i, result in enumerate(results):
         assert result["reason_codes"] == ["duplicate_matching_comments"]
         assert [c["comment_id"] for c in result["candidates"]] == (["0", "1", "2"] if i % 2 else ["0", "2"])
     # A nonmatching evidence string is normalized once even across many rows/modes.
     assert sum(args[0] == texts[-1] for args, _ in normalize.call_args_list) == 1
-    first = compare(rows[:1], captures, amount_mode="expected-only", allow_duplicates=True)["results"][0]
+    first = compare(rows[:1], captures, amount_mode="expected-only", allow_duplicates=True, require_reply_parent=True)["results"][0]
     assert first["matched_comment"]["comment_id"] == "0"
     assert first["capture"] == dict(captured_at="first", evidence_path="first.json", capture_complete=False)
-    later = compare([dict(rows[0], comment_text=texts[-1])], captures, amount_mode="expected-only")["results"][0]
+    later = compare([dict(rows[0], comment_text=texts[-1])], captures, amount_mode="expected-only", require_reply_parent=True)["results"][0]
     assert later["capture"] == dict(captured_at="second", evidence_path="second.json", capture_complete=True)
 
 
@@ -53,20 +53,20 @@ def test_shared_settlement():
         for mode in ("observed", "expected-only"):
             for allow in (False, True):
                 for rows in ([exact, contains], [contains, exact], [exact, dict(exact, case_id="copy")]):
-                    results = compare(rows, source, amount_mode=mode, allow_duplicates=allow)["results"]
+                    results = compare(rows, source, amount_mode=mode, allow_duplicates=allow, require_reply_parent=True)["results"]
                     assert all(r["status"] == "needs_review" and r["approved_amount"] is None
                                and r["reason_codes"] == [code] for r in results), results
     second = dict(comment, text="已经收到另一件", comment_id="b", evidence_path="b.png")
     first = dict(comment, comment_id="a")
     # The broad match can use b, leaving a for the narrow match.
     result = compare([contains, exact], [{**capture, "comments": [first, second]}],
-                     allow_duplicates=True)["results"]
+                     allow_duplicates=True, require_reply_parent=True)["results"]
     assert [r["matched_comment"]["comment_id"] for r in result] == ["b", "a"]
     assert result[0]["capture"]["evidence_path"] == "b.png"
     sources = [{**capture, "captured_at": "a-time", "evidence_path": "a.json", "comments": [first]},
                {**capture, "captured_at": "b-time", "evidence_path": "b.json", "capture_complete": False,
                 "comments": [{k: v for k, v in second.items() if k != "evidence_path"}]}]
-    result = compare([contains, exact], sources, allow_duplicates=True)["results"]
+    result = compare([contains, exact], sources, allow_duplicates=True, require_reply_parent=True)["results"]
     assert [r["capture"] for r in result] == [
         dict(captured_at="b-time", evidence_path="b.json", capture_complete=False),
         dict(captured_at="a-time", evidence_path="a.json", capture_complete=True),
@@ -74,38 +74,38 @@ def test_shared_settlement():
     # An alternate that fails the observed amount check cannot release the conflict.
     second["observed_amount"] = "3"
     result = compare([contains, exact], [{**capture, "comments": [first, second]}],
-                     allow_duplicates=True)["results"]
+                     allow_duplicates=True, require_reply_parent=True)["results"]
     assert all(r["reason_codes"] == [code] for r in result)
     for ids, status in (([17, "17"], "needs_review"), (["a", "b"], "verified"), ([None, None], "verified")):
         # Distinct captures can have the same index; only an explicit shared ID links their records.
         observations = [{**capture, "comments": [{**comment, "comment_id": cid, "dom_index": 0, "text": text}]}
                         for cid, text in zip(ids, ("已收", "收到"))]
         results = compare([dict(exact, comment_text="已收"), dict(contains, text_match="exact")],
-                          observations, amount_mode="expected-only")["results"]
+                          observations, amount_mode="expected-only", require_reply_parent=True)["results"]
         assert [r["status"] for r in results] == [status, status]
     # An explicitly priced partial and a full row cannot spend the same evidence twice.
     partial = dict(exact, case_id="mixed", comment_type="text+image", partial_text_amount="1.50")
     two_texts = [{**capture, "comments": [dict(comment, comment_id="a"), dict(comment, comment_id="b")]}]
-    duplicate = compare([partial], two_texts, amount_mode="expected-only")["results"][0]
+    duplicate = compare([partial], two_texts, amount_mode="expected-only", require_reply_parent=True)["results"][0]
     assert duplicate["reason_codes"] == ["duplicate_matching_comments"] and duplicate["approved_amount"] is None
-    permissive = compare([partial], two_texts, amount_mode="expected-only", allow_duplicates=True)["results"][0]
+    permissive = compare([partial], two_texts, amount_mode="expected-only", allow_duplicates=True, require_reply_parent=True)["results"][0]
     assert permissive["status"] == "partial_text" and permissive["approved_amount"] == "1.50"
     source = [{**capture, "comments": [comment]}]
-    result = compare([exact, partial], source, amount_mode="expected-only")["results"]
+    result = compare([exact, partial], source, amount_mode="expected-only", require_reply_parent=True)["results"]
     assert all(r["reason_codes"] == [code] for r in result)
-    result = compare([exact, {**partial, "partial_text_amount": None}], source, amount_mode="expected-only")["results"]
+    result = compare([exact, {**partial, "partial_text_amount": None}], source, amount_mode="expected-only", require_reply_parent=True)["results"]
     assert [(r["status"], r["approved_amount"]) for r in result] == [("verified", "2.00"), ("partial_text", None)]
     pic = dict(comment, text="", has_image=True)
     result = compare([dict(exact, comment_type="image", comment_text=""), dict(partial, partial_image_amount="1.00")],
-                     [{**capture, "comments": [pic]}], amount_mode="expected-only")["results"]
+                     [{**capture, "comments": [pic]}], amount_mode="expected-only", require_reply_parent=True)["results"]
     assert all(r["reason_codes"] == [code] for r in result)
     # A shared comment ID on a different platform or target remains independent.
     places = [("xhs", "n"), ("xhs", "m"), ("douyin", "n")]
     rows = [dict(exact, case_id=f"{p}-{t}", platform=p, target_key=t) for p,t in places]
     source = [dict(capture, platform=p, target_key=t, comments=[first]) for p,t in places]
-    assert all(r["status"] == "verified" for r in compare(rows, source)["results"])
+    assert all(r["status"] == "verified" for r in compare(rows, source, require_reply_parent=True)["results"])
     blank = [dict(exact, case_id=str(i), comment_text=body) for i, body in enumerate(["", "！", "[笑R]"])]
-    result = compare(blank + [exact], [{**capture, "comments": [first]}], amount_mode="expected-only")["results"]
+    result = compare(blank + [exact], [{**capture, "comments": [first]}], amount_mode="expected-only", require_reply_parent=True)["results"]
     assert all(r["reason_codes"] == ["invalid_or_contradictory_comment_type"] for r in result[:-1])
     assert result[-1]["approved_amount"] == "2.00"
 

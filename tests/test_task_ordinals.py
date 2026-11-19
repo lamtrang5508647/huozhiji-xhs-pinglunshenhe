@@ -55,7 +55,7 @@ class TaskOrdinalTests(unittest.TestCase):
                 "capture_complete": True, "image_detection_complete": True}
         root = {"comment_id": "p", "text": "third", "has_image": False}
         message = {"comment_id": "c", "text": "answer", "has_image": False}
-        wrong = review(rows, [{**base, "comments": [root, message]}])["results"][2]
+        wrong = review(rows, [{**base, "comments": [root, message]}], require_reply_parent=True)["results"][2]
         self.assertEqual((wrong["triage"], wrong["approved_amount"]), ("待人审", None))
-        correct = review(rows, [{**base, "comments": [root, {**message, "parent_comment_id": "p"}]}])["results"][2]
+        correct = review(rows, [{**base, "comments": [root, {**message, "parent_comment_id": "p"}]}], require_reply_parent=True)["results"][2]
         self.assertEqual((correct["triage"], correct["approved_amount"]), ("成功", "2.00"))

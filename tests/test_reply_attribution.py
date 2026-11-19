@@ -15,7 +15,7 @@ def comment(comment_id, text, **fields):
 def audit(rows, comments):
     capture = dict(platform="xiaohongshu", target_key="note", capture_complete=True,
                    capture_status="ok", image_detection_complete=True, comments=comments)
-    return {r["case_id"]: r for r in review(rows, [capture])["results"]}
+    return {r["case_id"]: r for r in review(rows, [capture], require_reply_parent=True)["results"]}
 
 
 class ReplyAttributionTests(unittest.TestCase):
@@ -59,16 +59,16 @@ class ReplyAttributionTests(unittest.TestCase):
             self.assertEqual(row["candidates"][0]["parent_evidence"], basis)
         base = dict(platform="xiaohongshu", target_key="note", capture_complete=False, capture_status="ok")
         partial = dict(base, comments=[self.parent, displayed])
-        row = review(rows, [partial])["results"][1]
+        row = review(rows, [partial], require_reply_parent=True)["results"][1]
         self.assertIn("reply_parent_unconfirmed", row["reason_codes"])
         direct = dict(base, comments=[self.parent, comment("c", "reply text", parent_comment_id="root")])
-        row = review(rows, [direct])["results"][1]
+        row = review(rows, [direct], require_reply_parent=True)["results"][1]
         self.assertEqual(row["status"], "verified")
         self.assertNotIn("parent_evidence", row["matched_comment"])
         earlier = dict(base, capture_complete=True, comments=[
             dict(self.parent), comment("c", "reply text", parent_text="root text")])
         later = dict(base, capture_complete=True, comments=[dict(self.parent), displayed])
-        row = review(rows, [earlier, later])["results"][1]
+        row = review(rows, [earlier, later], require_reply_parent=True)["results"][1]
         self.assertEqual(row["matched_comment"]["parent_evidence"], basis)
 
     def test_missing_or_ambiguous_parent_is_manual(self):
@@ -86,7 +86,7 @@ class ReplyAttributionTests(unittest.TestCase):
         base = dict(platform="xiaohongshu", target_key="note", capture_status="ok", capture_complete=True)
         pair = [dict(base, comments=[self.parent]),
                 dict(base, comments=[comment("root", "different body"), comment("c", "reply text", parent_comment_id="root")])]
-        r = review([self.root, self.reply], pair)["results"][1]
+        r = review([self.root, self.reply], pair, require_reply_parent=True)["results"][1]
         self.assertIn("reply_parent_unconfirmed", r["reason_codes"])
 
     def test_referenced_parent_level_and_identifier_must_be_consistent(self):
@@ -139,7 +139,7 @@ class ReplyAttributionTests(unittest.TestCase):
                                          ({"page_attempted": True, "panel_available": False}, True, False),
                                          ({"page_attempted": True, "panel_available": True}, True, True)):
             marked = dict(capture, reply_verification=source) if source else capture
-            results = review([self.root, self.reply], [marked])["results"]
+            results = review([self.root, self.reply], [marked], require_reply_parent=True)["results"]
             self.assertNotIn("reply_verification", results[0])
             check = results[1]["reply_verification"]
             self.assertEqual(check["page_attempted"], attempted)
@@ -147,13 +147,13 @@ class ReplyAttributionTests(unittest.TestCase):
             self.assertEqual(check["scope"], "target")
             self.assertEqual(check["reason"], "reply_parent_unconfirmed")
             self.assertEqual(results[1]["candidates"][0]["comment_id"], "top")
-        r = review([self.reply], [capture])["results"][0]
+        r = review([self.reply], [capture], require_reply_parent=True)["results"][0]
         self.assertIn("reply_source_parent_ambiguous", r["reason_codes"])
         self.assertIsNone(r["approved_amount"])
         attempted = dict(capture, captured_at="2026-01-01T12:00:00Z", reply_verification={
             "page_attempted": True, "panel_available": True, "attempt_count": 1,
             "unconfirmed_before": 1, "unconfirmed_after": 1, "status": "checked_unresolved"})
-        check = review([self.root, self.reply], [attempted, capture])["results"][1]["reply_verification"]
+        check = review([self.root, self.reply], [attempted, capture], require_reply_parent=True)["results"][1]["reply_verification"]
         self.assertEqual((check["captured_at"], check["attempt_count"], check["unconfirmed_after"], check["status"]),
                          ("2026-01-01T12:00:00Z", 1, 1, "checked_unresolved"))
 
@@ -185,6 +185,6 @@ class ReplyAttributionTests(unittest.TestCase):
         unknown = audit([self.root, self.reply], [self.parent, unrelated, other])["a"]
         self.assertNotIn("reply_thread_root_deleted", unknown["reason_codes"])
         # The source is itself ambiguous even if there are also no platform observations.
-        missing = review([self.reply], [])["results"][0]
+        missing = review([self.reply], [], require_reply_parent=True)["results"][0]
         self.assertIn("no_observation_for_target", missing["reason_codes"])
         self.assertEqual(missing["reply_verification"]["reason"], "reply_source_parent_ambiguous")

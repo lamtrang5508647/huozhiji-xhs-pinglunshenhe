@@ -10,6 +10,42 @@ from test_portable_api import fixture
 
 
 class WorkbookWriterTests(unittest.TestCase):
+    def test_visible_rows_with_unsettled_payments_show_success_and_empty_amounts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.xlsx"
+            output = Path(folder) / "result.xlsx"
+            fixture(source)
+            rows = [{"case_id": str(i), "source_row": i, "source_sheet": "品牌A",
+                     "comment_type": "text" if i != 4 else "text+image"} for i in range(2, 6)]
+            results = []
+            for row in rows:
+                results.append({"case_id": row["case_id"], "triage": "成功", "result_category": "成功",
+                                "approved_amount": None, "settlement_status": "pending_duplicate_claim",
+                                "reason_codes": ["evidence_claimed_by_multiple_rows"]})
+            results[2].update(result_category="文字成功", settlement_status="pending_source_amount",
+                              reason_codes=["missing_component_amount"])
+            results[3] = {"case_id": "5", "triage": "成功", "result_category": "成功", "approved_amount": "1.50"}
+            summary = build_workbook(source, rows, results, output)
+            self.assertEqual(summary["approved_amount"], "1.50")
+            with zipfile.ZipFile(output) as archive:
+                def sheet(name):
+                    root = ET.fromstring(archive.read(f"xl/worksheets/{name}.xml"))
+                    return {c.get("r"): c for c in root.iter(tag("c"))}
+                product, totals = sheet("sheet1"), sheet("sheet2")
+                for n in (2, 3, 4):
+                    self.assertEqual(cell_value(product[f"G{n}"], []), results[n - 2]["result_category"])
+                    self.assertEqual(cell_value(product[f"H{n}"], []), "")
+                    self.assertIn("暂缓核定", cell_value(totals[f"Y{n + 10}"], []))
+                self.assertIn('Y14<>""', totals["W14"].findtext(tag("f")))
+                self.assertEqual(cell_value(totals["E3"], []), "4")
+                self.assertEqual(cell_value(totals["I3"], []), "1.50")
+            results[0]["approved_amount"] = "1.50"
+            with self.assertRaisesRegex(RuntimeError, "invalid_pending_settlement"):
+                build_workbook(source, rows, results, output)
+            results[0].update(approved_amount=None, reason_codes=[])
+            with self.assertRaisesRegex(RuntimeError, "invalid_pending_settlement"):
+                build_workbook(source, rows, results, output)
+
     def test_out_of_order_rows_and_overlapping_summary_sections(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "source.xlsx"

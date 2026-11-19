@@ -32,6 +32,10 @@ R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 P = "http://schemas.openxmlformats.org/package/2006/relationships"
 CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 HEADERS = ["团长", "产品名", "涉及工作表数", "总条数", "成功数", "失败数", "需人审数", "成功率", "报销金额", "涉及工作表", "团长联系方式", "跟团长结算时间", "结算凭证", "二维码"]
+SETTLEMENT_NOTES = {
+    "pending_duplicate_claim": "多行共用评论证据，金额暂缓核定",
+    "pending_source_amount": "原表缺少可用报价，金额暂缓核定",
+}
 
 
 def tag(name):
@@ -292,13 +296,16 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     summary = ET.Element(tag("worksheet"))
     end = 11 + len(rows)
     total_row = len(groups) + 2
-    ET.SubElement(summary, tag("dimension"), {"ref": f"A1:X{max(end, total_row)}"})
+    has_pending = any(item.get("settlement_status") in SETTLEMENT_NOTES for item in results)
+    ET.SubElement(summary, tag("dimension"), {"ref": f"A1:{'Y' if has_pending else 'X'}{max(end, total_row)}"})
     view = ET.SubElement(ET.SubElement(summary, tag("sheetViews")), tag("sheetView"), {"workbookViewId": "0", "showGridLines": "0"})
     ET.SubElement(view, tag("pane"), {"ySplit": "1", "topLeftCell": "A2", "activePane": "bottomLeft", "state": "frozen"})
     ET.SubElement(summary, tag("sheetFormatPr"), {"defaultRowHeight": "22"})
     cols = ET.SubElement(summary, tag("cols"))
     for index, width in enumerate((13, 15, 14, 9, 9, 9, 11, 10, 12, 38, 16, 18, 16, 18), 1):
         ET.SubElement(cols, tag("col"), {"min": str(index), "max": str(index), "width": str(width), "customWidth": "1"})
+    if has_pending:
+        ET.SubElement(cols, tag("col"), {"min": "25", "max": "25", "width": "42", "customWidth": "1"})
     data = ET.SubElement(summary, tag("sheetData"))
     write_cell = sheet_cell_writer(data)
     for index, header in enumerate(HEADERS, 1):
@@ -311,6 +318,8 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         write_cell(f"Q{number}", count, formula=f'COUNTIFS($U$12:$U${end},"text+image",$V$12:$V${end},P{number})', style=styles["body"])
     for index, header in enumerate(("案例ID", "团长", "产品名", "工作表", "原行", "要求类型", "结果分类", "分流", "核定金额"), 16):
         write_cell(f"{column(index)}11", header, style=styles["detail"])
+    if has_pending:
+        write_cell("Y11", "结算说明", style=styles["detail"])
     counts = Counter(item["triage"] for item in results)
     # Detail rows follow the fixed headers and their cells arrive in P:X order.
     for number, item in enumerate(rows, 12):
@@ -321,9 +330,15 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
             detail_row.append(make_cell(f"{column(index)}{number}", value, style=styles["body"]))
         quoted = "'" + item["source_sheet"].replace("'", "''") + "'"
         detail_row.append(make_cell(f"V{number}", result["result_category"], formula=f"{quoted}!G{item['source_row']}", style=styles["body"]))
-        detail_row.append(make_cell(f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),ISNUMBER({quoted}!H{item["source_row"]}))),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"]))
+        settlement_note = SETTLEMENT_NOTES.get(result.get("settlement_status"))
+        partial_approved = f'ISNUMBER({quoted}!H{item["source_row"]})'
+        if settlement_note:
+            partial_approved = f'OR({partial_approved},Y{number}<>"")'
+        detail_row.append(make_cell(f"W{number}", result["triage"], formula=f'IF(OR(V{number}="成功",V{number}="图字成功",AND(OR(V{number}="文字成功",V{number}="图片成功"),{partial_approved})),"成功",IF(V{number}="失败","失败","待人审"))', style=styles["body"]))
         amount = result.get("approved_amount")
         detail_row.append(make_cell(f"X{number}", None if amount in (None, "") else Decimal(str(amount)), formula=f'IF(ISNUMBER({quoted}!H{item["source_row"]}),{quoted}!H{item["source_row"]},"")', style=styles["money"]))
+        if settlement_note:
+            detail_row.append(make_cell(f"Y{number}", settlement_note, style=styles["body"]))
     # Large group tables may reach the detail rows from the left.
     write_cell = sheet_cell_writer(data)
     new_row_numbers = {}

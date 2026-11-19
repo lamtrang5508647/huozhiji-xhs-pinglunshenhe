@@ -39,6 +39,10 @@ PUNCTUATION = re.compile(
 )
 XHS_EMOJI_TOKEN = re.compile(r"\[[^\[\]]+R\]", flags=re.IGNORECASE)
 DISPLAY_FORMAT = re.compile("[\u200b\u2060\ufeff\ufe0e\ufe0f]")
+POSSIBLE_REPLY_LABEL = re.compile(
+    r"^(?:(?:(?:回复|回覆)\s*)?[@＠]\s*[^@＠\s:：]{1,64}(?:\s*[:：]\s*|\s+)"
+    r"|(?:回复|回覆)\s*[^@＠\s:：]{1,64}\s*[:：]\s*)(?=\S)"
+)
 LEGACY_XHS_REVISIONS = {"xhs-replies-20261118-v4", "xhs-visible-end-v5"}
 AMOUNT_TOKEN = re.compile(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)(?:\s*)(万|千|百)?(?![\d.])")
 
@@ -208,7 +212,7 @@ def prepare_observation(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def compact_comment(comment: Dict[str, Any]) -> Dict[str, Any]:
     keys = ("comment_id", "dom_index", "text", "comment_type", "has_image", "observed_amount", "amount_source",
-            "evidence_path", "parent_comment_id", "parent_text", "parent_evidence")
+            "evidence_path", "parent_comment_id", "parent_text", "parent_evidence", "reply_label_removed")
     record = {key: comment[key] for key in keys if key in comment}
     if "text" not in record and "comment_text" in comment:
         record["text"] = comment["comment_text"]
@@ -570,6 +574,20 @@ class _TargetEvidence:
                 if str(_observed_body(comment)).lstrip().startswith(("回复", "回覆", "@", "＠"))]
 
     @cached_property
+    def possible_reply_bodies(self):
+        # A combined text node does not say whether the label is interface
+        # text or part of the author's message. Keep the unmodified evidence.
+        candidates = {}
+        for comment in self.comments:
+            if comment.get("deleted") is True or comment.get("reply_label_removed") is True:
+                continue
+            body = str(_observed_body(comment)).strip()
+            if prefix := POSSIBLE_REPLY_LABEL.match(body):
+                text = normalize_text(body[prefix.end():])
+                candidates.setdefault(text, []).append(comment)
+        return candidates
+
+    @cached_property
     def by_comment_id(self):
         records = {}
         for comment in self.comments:
@@ -638,14 +656,25 @@ def _assign_distinct_comment(row, choices, owners, assigned):
     return set(previous)
 
 
-def _check_settlement_claims(results, claims, amount_mode, allow_duplicates):
+def _check_settlement_claims(results, claims, amount_mode, allow_duplicates, note_presence=False):
     owners, assigned, choices = {}, {}, {}
     disputed = set()
+    # An unidentified card can be the same card seen in a different snapshot.
+    # Share one settlement identity for its body across such views, preferring
+    # an available stable ID. This never blocks the visibility verdict.
+    anonymous_keys = {}
+    if note_presence:
+        for index, (comments, _) in claims.items():
+            result = results[index]
+            for comment in comments:
+                if _identifier(comment.get("comment_id")) not in ("", "0", "-1"):
+                    body = (result["platform"], result["target_key"], _matching_text(comment))
+                    anonymous_keys.setdefault(body, _claim_key(result, comment))
     for index, (comments, _) in claims.items():
         result = results[index]
         if result["triage"] != "成功":
             continue
-        if not allow_duplicates:
+        if not allow_duplicates and not note_presence:
             for comment in comments:
                 owner = owners.setdefault(_claim_key(result, comment), index)
                 if owner != index:
@@ -659,7 +688,11 @@ def _check_settlement_claims(results, claims, amount_mode, allow_duplicates):
                 amount, _ = observed_amount(comment)
                 if amount != required_amount:
                     continue
-            eligible.setdefault(_claim_key(result, comment), comment)
+            key = _claim_key(result, comment)
+            if note_presence and _identifier(comment.get("comment_id")) in ("", "0", "-1"):
+                body = (result["platform"], result["target_key"], _matching_text(comment))
+                key = anonymous_keys.get(body, (body[0], body[1], "unidentified_body", body[2]))
+            eligible.setdefault(key, comment)
         choices[index] = eligible
         disputed.update(_assign_distinct_comment(index, choices, owners, assigned))
 
@@ -672,6 +705,11 @@ def _check_settlement_claims(results, claims, amount_mode, allow_duplicates):
             result["capture"] = _capture_details(chosen, sources[id(chosen)])
     for index in disputed:
         result = results[index]
+        if note_presence:
+            result["settlement_status"] = "pending_duplicate_claim"
+            result["approved_amount"] = None
+            result["reason_codes"].append("evidence_claimed_by_multiple_rows")
+            continue
         if "matched_comment" in result:
             result["candidates"] = [compact_comment(c) for c in claims[index][0]]
             del result["matched_comment"]
@@ -685,8 +723,10 @@ def compare(
     *,
     amount_mode: str = "observed",
     allow_duplicates: bool = False,
+    require_reply_parent: bool = False,
 ) -> Dict[str, Any]:
     expected_rows = list(expected_rows)
+    note_presence = not require_reply_parent and amount_mode == "expected-only"
     expected_by_case = {}
     for row in expected_rows:
         expected_by_case.setdefault(row.get("case_id"), row)
@@ -715,7 +755,7 @@ def compare(
     results: List[Dict[str, Any]] = []
     settlement_claims = {}
     legacy_absence_targets = set()
-    reply_parents = _reply_parents(expected_rows)
+    reply_parents = _reply_parents(expected_rows) if require_reply_parent else {}
     reply_checks = {}
     for index, expected in enumerate(expected_rows):
         key = (platform_key(expected), target_key(expected))
@@ -746,7 +786,9 @@ def compare(
             continue
         if expected_type is None:
             result["reason_codes"].append("invalid_or_contradictory_comment_type")
-        if expected_amount is None:
+        if note_presence and expected_amount is not None and (not expected_amount.is_finite() or expected_amount < 0):
+            expected_amount = None
+        if expected_amount is None and not note_presence:
             result["reason_codes"].append("invalid_expected_amount")
         if result["reason_codes"]:
             results.append(result)
@@ -777,6 +819,16 @@ def compare(
         image_detection_incomplete = evidence.image_detection_incomplete
         match_mode = str(expected.get("text_match", "exact")).strip().casefold()
         same_text = evidence.matching(expected_text, match_mode)
+        if not require_reply_parent:
+            same_text = [c for c in same_text if c.get("deleted") is not True]
+        if note_presence and expected_text and not same_text and match_mode == "exact":
+            ambiguous = evidence.possible_reply_bodies.get(expected_text)
+            if ambiguous:
+                result["reason_codes"].append("reply_body_prefix_unconfirmed")
+                result["candidates"] = [compact_comment(c) for c in ambiguous]
+                results.append(result)
+                continue
+        allow_text_alternatives = allow_duplicates or (note_presence and bool(expected_text))
         constrained_reply = index in reply_parents
         reply_images = []
         if constrained_reply:
@@ -812,7 +864,7 @@ def compare(
                     result["candidates"] = [compact_comment(comment) for comment in same_text]
                     results.append(result)
                     continue
-                if len(same_text) > 1 and not allow_duplicates:
+                if len(same_text) > 1 and not allow_text_alternatives:
                     result["reason_codes"].append("duplicate_matching_comments")
                     result["candidates"] = [compact_comment(comment) for comment in same_text]
                     results.append(result)
@@ -822,12 +874,13 @@ def compare(
                 result["candidates"] = [compact_comment(comment) for comment in same_text]
                 result["expected_amount"] = format_amount(expected_amount)
                 if evidence.row_count > 1:
-                    sources = evidence.capture_by_record if allow_duplicates and len(same_text) > 1 else None
+                    sources = evidence.capture_by_record if len(same_text) > 1 else None
                     settlement_claims[index] = same_text, sources
                 results.append(result)
                 continue
             if not same_text:
-                image_only = _distinct_matches(reply_images if constrained_reply else evidence.image_only)
+                image_only = _distinct_matches(reply_images if constrained_reply else
+                                               [c for c in evidence.image_only if c.get("deleted") is not True])
                 combo_count = combo_rows_by_target.get(key, 0)
                 if len(image_only) == 1 and combo_count == 1:
                     if not complete:
@@ -857,10 +910,12 @@ def compare(
                     result["reason_codes"].append("comment_image_presence_unknown")
                     results.append(result)
                     continue
-        if expected_text or constrained_reply:
+        if note_presence and expected_type == "text":
+            same_type = same_text
+        elif expected_text or constrained_reply:
             same_type = [comment for comment in same_text if _observed_type(comment) == expected_type]
         else:
-            same_type = evidence.by_type.get(expected_type, [])
+            same_type = [c for c in evidence.by_type.get(expected_type, []) if c.get("deleted") is not True]
         if not same_text:
             if complete:
                 result["status"] = "not_found"
@@ -883,7 +938,7 @@ def compare(
             results.append(result)
             continue
         same_type = _distinct_matches(same_type)
-        if len(same_type) > 1 and not allow_duplicates:
+        if len(same_type) > 1 and not allow_text_alternatives:
             result["status"] = "needs_review"
             result["reason_codes"].append("duplicate_matching_comments")
             result["candidates"] = [compact_comment(comment) for comment in same_type]
@@ -892,12 +947,12 @@ def compare(
 
         match = same_type[0]
         if evidence.row_count > 1:
-            sources = evidence.capture_by_record if allow_duplicates and len(same_type) > 1 else None
+            sources = evidence.capture_by_record if len(same_type) > 1 else None
             settlement_claims[index] = same_type, sources
         if amount_mode == "expected-only":
             result["matched_comment"] = compact_comment(match)
             result["status"] = "verified"
-            result["reason_codes"].append("comment_match_amount_from_table")
+            result["reason_codes"].append("comment_match_amount_from_table" if expected_amount is not None else "invalid_expected_amount")
             result["expected_amount"] = format_amount(expected_amount)
             result["capture"] = _capture_details(match, evidence.source(match))
             results.append(result)
@@ -947,6 +1002,14 @@ def compare(
         if result["status"] == "verified":
             result["triage"] = "成功"
             result["approved_amount"] = result.get("expected_amount")
+            if note_presence and result["approved_amount"] is None:
+                result["settlement_status"] = "pending_source_amount"
+        elif note_presence and result["status"] in ("partial_text", "partial_image") and (
+                component_amount is None or not component_amount.is_finite() or component_amount < 0):
+            result["triage"] = "成功"
+            result["approved_amount"] = None
+            result["settlement_status"] = "pending_source_amount"
+            result["reason_codes"].append("missing_component_amount")
         elif component_amount is not None:
             result["triage"] = "成功"
             result["approved_amount"] = format_amount(component_amount)
@@ -958,7 +1021,7 @@ def compare(
             result["triage"] = "待人审"
             result["approved_amount"] = None
 
-    _check_settlement_claims(results, settlement_claims, amount_mode, allow_duplicates)
+    _check_settlement_claims(results, settlement_claims, amount_mode, allow_duplicates, note_presence)
     for index, parent in reply_parents.items():
         result = results[index]
         if result["triage"] == "待人审":
@@ -995,6 +1058,7 @@ def compare(
     return {
         "summary": {
             "total": len(results),
+            "settlement_pending_count": sum(bool(r.get("settlement_status")) for r in results),
             "counts": counts,
             "triage_counts": triage_counts,
             "result_category_counts": result_category_counts,
@@ -1009,6 +1073,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--observations", required=True, help="Platform observation JSON")
     parser.add_argument("--output", help="Write report JSON to this path")
     parser.add_argument("--strict", action="store_true", help="Exit 2 if any row is not verified")
+    parser.add_argument("--require-reply-parent", action="store_true",
+                        help="Also verify the directly requested parent comment for numbered reply tasks")
     parser.add_argument(
         "--amount-mode",
         choices=("observed", "expected-only"),
@@ -1030,6 +1096,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             observations,
             amount_mode=args.amount_mode,
             allow_duplicates=args.allow_duplicates,
+            require_reply_parent=args.require_reply_parent,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"input_error: {exc}", file=sys.stderr)

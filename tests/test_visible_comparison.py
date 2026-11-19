@@ -34,9 +34,9 @@ class VisibleComparisonTests(unittest.TestCase):
         second = self.cap([dict(self.seen, evidence_path="b.png", dom_index=8)])
         self.assertEqual(self.outcome(first, second)["status"], "verified")
         other = self.cap([dict(self.seen, comment_id="different")])
-        self.assertIn("duplicate_matching_comments", self.outcome(first, other)["reason_codes"])
+        self.assertEqual(self.outcome(first, other)["triage"], "成功")
         no_id = self.cap([dict(self.seen, comment_id=None), dict(self.seen, comment_id=None)])
-        self.assertIn("duplicate_matching_comments", self.outcome(no_id)["reason_codes"])
+        self.assertEqual(self.outcome(no_id)["triage"], "成功")
         row = dict(self.row, comment_type="text+image", partial_text_amount="1.00")
         self.assertEqual(self.outcome(first, second, row=row)["approved_amount"], "1.00")
         img = dict(self.seen, text="", has_image=True)
@@ -61,9 +61,9 @@ class VisibleComparisonTests(unittest.TestCase):
 
     def test_incomplete_wrong_type_or_amount_is_not_a_definite_failure(self):
         wrong_type = self.cap([dict(self.seen, has_image=True)], capture_complete=False)
-        self.assertEqual(self.outcome(wrong_type)["triage"], "待人审")
+        self.assertEqual(self.outcome(wrong_type)["triage"], "成功")
         full = dict(wrong_type, capture_complete=True)
-        self.assertEqual(self.outcome(full)["triage"], "失败")
+        self.assertEqual(self.outcome(full)["triage"], "成功")
         wrong_amount = self.cap([dict(self.seen, observed_amount="3")], capture_complete=False)
         r = compare([self.row], [wrong_amount])["results"][0]
         self.assertEqual(r["triage"], "待人审")

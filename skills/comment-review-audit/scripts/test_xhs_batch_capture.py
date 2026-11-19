@@ -106,7 +106,7 @@ def exercise_real_reply_recheck(page):
       </div><span>没有更多评论</span></div>
       <template id="child"><div class="comment-item" data-comment-id="c2">
         <div class="content"><span class="note-text">Reply</span></div></div></template>""")
-    args = Namespace(expand_dom=True, dom_max_rounds=1, incomplete_dom_retry_rounds=0)
+    args = Namespace(expand_dom=True, dom_max_rounds=1, incomplete_dom_retry_rounds=0, require_reply_parent=True)
     evidence, terminal, failed = check_note_comments(page, "note", comments, 2, rows, args)
     check = evidence["reply_verification"]
     assert terminal and not failed and check["page_attempted"] and check["panel_available"]
@@ -161,7 +161,26 @@ def exercise_real_reply_recheck(page):
     assert reply["thread_root_deleted"] and "parent_comment_id" not in reply and "parent_text" not in reply
     assert "thread_root_deleted" not in other
     assert evidence["reply_verification"]["status"] == "checked_unresolved"
-    assert compare(rows, [evidence], amount_mode="expected-only")["results"][1]["triage"] == "待人审"
+    assert compare(rows, [evidence], amount_mode="expected-only", require_reply_parent=True)["results"][1]["triage"] == "待人审"
+    args.require_reply_parent = False
+    evidence, _, _ = check_note_comments(page, "note", [], 0, rows, args)
+    assert "reply_verification" not in evidence
+    assert compare(rows, [evidence], amount_mode="expected-only")["results"][1]["triage"] == "成功"
+
+    # A supplied task list also requests a normal DOM pass for a folded reply.
+    # The structured view has no reply, and the displayed parent is unrelated.
+    args.expand_dom = False
+    args.dom_max_rounds = 1
+    page.set_content("""<div class="comments-container"><div class="parent-comment">
+      <div class="comment-item" data-comment-id="unrelated"><div class="content">Other</div></div>
+      <div id="thread"></div>
+      <button onclick="thread.append(t.content.cloneNode(true)); this.remove()">展开1条回复</button>
+      </div><span>没有更多评论</span></div><template id="t">
+      <div class="comment-item" data-comment-id="c2"><div class="content">
+      <span class="reply-to">回复其他人：</span><span class="note-text">Reply</span></div></div></template>""")
+    evidence, _, _ = check_note_comments(page, "note", [], 0, rows, args)
+    assert evidence["capture_complete"] and "reply_verification" not in evidence
+    assert compare(rows, [evidence], amount_mode="expected-only")["results"][1]["triage"] == "成功"
 
 
 def exercise_visible_comments(page):
@@ -174,6 +193,17 @@ def exercise_visible_comments(page):
     end = '<span>没有更多评论</span>'
     assert observe(item("shown") + end)["comments"][0]["text"] == "shown"
     assert observe(item('A<img class="emoji" alt="[笑]">B') + end)["comments"][0]["text"] == "A[笑]B"
+    for markup, body, removed in (
+        ('<span class="reply-to">回复 @小明：</span>Reply', "Reply", True),
+        ('回复 @小明：Reply', "回复 @小明：Reply", False),
+        ('<span class="reply-to">回复 @平台：</span>回复 @小明：Reply', "回复 @小明：Reply", True),
+        ('<span class="reply-to">回复 @小明：</span><a class="mention">@好友</a> Reply<img class="emoji" alt="[笑]">',
+         "@好友 Reply[笑]", True),
+    ):
+        capture = observe(item('<span class="note-text">' + markup + '</span>') + end)
+        assert capture["reply_label_reader"] == "dom-markers-v1"
+        comment = capture["comments"][0]
+        assert (comment["text"], bool(comment.get("reply_label_removed"))) == (body, removed)
     assert not observe(item("没有更多评论"), declared=1)["capture_complete"]
     assert not observe(item("shown") + end + '<button>展开2条回复</button>', declared=1)["capture_complete"]
     assert not observe(item("shown"), [{"id":"v","text":"shown"}], 1)["capture_complete"]
@@ -219,11 +249,12 @@ def exercise_visible_comments(page):
             (thread(reply="回复 @某人 Reply") + end, []), (thread() + end, [{"id":"c2","text":"Reply"}])]:
         evidence = observe(body, structured)
         assert "parent_evidence" not in evidence["comments"][1]
-        assert compare(rows, [evidence], amount_mode="expected-only")["results"][1]["triage"] == "待人审"
+        assert compare(rows, [evidence], amount_mode="expected-only", require_reply_parent=True)["results"][1]["triage"] == "待人审"
 
 
 def test_reply_resume():
     from datetime import datetime, timezone
+    from functools import partial
     from xhs_capture import normalized_comments
     rows, comments = reply_case()
     key = "note"
@@ -232,23 +263,31 @@ def test_reply_resume():
              "comments": normalized_comments(comments, root_list=True)}
     targets = [{"note_id": key}]
     requirements = {key: rows}
+    strict_plan = partial(plan_targets, require_reply_parent=True)
+    assert not plan_targets(targets, {key: fresh}, requirements)
+    prefixed = {**fresh, "comments": [fresh["comments"][0], {"text":"回复 @小明：Reply", "has_image":False}]}
+    assert plan_targets(targets, {key: prefixed}, requirements) == targets
+    assert not plan_targets(targets, {key: {**prefixed, "reply_label_reader":"dom-markers-v1"}}, requirements)
+    assert not plan_targets(targets, {key: prefixed}, {key:[rows[0]]})
+    assert not plan_targets(targets, {key: prefixed}, {key:[{**rows[1], "comment_text":"Other"}]})
+    assert not plan_targets(targets, {key: {**fresh, "capture_complete": False}}, requirements)
     assert unconfirmed_replies(rows, fresh) == 1
-    assert plan_targets(targets, {key: fresh}, requirements, False) == targets
+    assert strict_plan(targets, {key: fresh}, requirements, False) == targets
     check = {"page_attempted": True, "panel_available": True, "requirements_sha256": reply_signature(rows)}
-    assert not plan_targets(targets, {key: {**fresh, "reply_verification": check}}, requirements, False)
-    assert plan_targets(targets, {key: {**fresh, "reply_verification": {**check, "panel_available": False}}},
+    assert not strict_plan(targets, {key: {**fresh, "reply_verification": check}}, requirements, False)
+    assert strict_plan(targets, {key: {**fresh, "reply_verification": {**check, "panel_available": False}}},
                         requirements, False) == targets
     capped = {**fresh, "reply_verification": {**check, "panel_available": False, "attempt_count": 2}}
-    assert not plan_targets(targets, {key: capped}, requirements)
-    assert plan_targets(targets, {key: capped}, requirements, refresh=True) == targets
+    assert not strict_plan(targets, {key: capped}, requirements)
+    assert strict_plan(targets, {key: capped}, requirements, refresh=True) == targets
     altered = {key: [*rows[:1], {**rows[1], "comment_text": "Other"}]}
-    assert plan_targets(targets, {key: {**fresh, "reply_verification": check}}, altered, False) == targets
+    assert strict_plan(targets, {key: {**fresh, "reply_verification": check}}, altered, False) == targets
     comments[0]["subComments"][0]["target_comment_id"] = "c1"
-    args = Namespace(expand_dom=False, dom_max_rounds=1, incomplete_dom_retry_rounds=0)
+    args = Namespace(expand_dom=False, dom_max_rounds=1, incomplete_dom_retry_rounds=0, require_reply_parent=True)
     satisfied, _, _ = check_note_comments(None, key, comments, 2, rows, args)
     assert satisfied["reply_verification"]["page_attempted"] is False
     assert not satisfied["capture_complete"]
-    assert not plan_targets(targets, {key: {**fresh, "comments":satisfied["comments"]}}, requirements, False)
+    assert not strict_plan(targets, {key: {**fresh, "comments":satisfied["comments"]}}, requirements, False)
 
 
 def main() -> None:

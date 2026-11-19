@@ -43,7 +43,18 @@ function derivedTriage(result) {
   return "待人审";
 }
 
+const settlementNotes = new Map([
+  ["pending_duplicate_claim", "多行共用评论证据，金额暂缓核定"],
+  ["pending_source_amount", "原表缺少可用报价，金额暂缓核定"],
+]);
+
 function approvedAmount(result) {
+  if (settlementNotes.has(result.settlement_status)) {
+    if (derivedTriage(result) !== "成功" || (result.approved_amount != null && result.approved_amount !== "")) {
+      throw new Error("Invalid pending settlement");
+    }
+    return null;
+  }
   if (result.approved_amount !== undefined && result.approved_amount !== null && result.approved_amount !== "") {
     return Number(result.approved_amount);
   }
@@ -150,6 +161,9 @@ if (sourceSheetNames.has("审核汇总")) {
   }
   summarySheet.getRange("A1:X1000").unmerge();
   summarySheet.getRange("A1:X1000").clear({ applyTo: "all" });
+  if (summarySheet.getRange("Y11").values?.[0]?.[0] === "结算说明") {
+    summarySheet.getRange("Y:Y").clear({ applyTo: "contents" });
+  }
   summarySheet.deleteAllDrawings();
 } else {
   summarySheet = workbook.worksheets.add("审核汇总");
@@ -206,8 +220,15 @@ summarySheet.getRange(`J${groupStartRow}:N${groupEndRow}`).values = groups.map((
 summarySheet.getRange("P1:Q1").values = [["图文组合结果", "数量"]];
 summarySheet.getRange("P2:P6").values = [["图字成功"], ["文字成功"], ["图片成功"], ["失败"], ["待人审"]];
 summarySheet.getRange("P8:X9").merge();
-summarySheet.getRange("P8").values = [["口径：成功 / 图字成功按整项金额结算；文字成功 / 图片成功在源表明确分项价格时按分项金额结算，否则进入需人审。原始中间证据保留14天，压缩归档再保留14天。"]];
+summarySheet.getRange("P8").values = [["成功 / 图字成功按原表整项报价结算，文字成功 / 图片成功按明确的分项报价结算。共用证据或缺少报价的成功行可在明细中查看结算说明。原始中间证据保留14天，压缩归档再保留14天。"]];
 summarySheet.getRange("P11:X11").values = [["案例ID", "团长", "产品名", "工作表", "原行", "要求类型", "结果分类", "分流", "核定金额"]];
+if (results.some((result) => settlementNotes.has(result.settlement_status))) {
+  summarySheet.getRange("Y11").values = [["结算说明"]];
+  summarySheet.getRange(`Y${detailStartRow}:Y${detailEndRow}`).values = expectedRows.map((expected) => [
+    settlementNotes.get(byCase.get(expected.case_id).settlement_status) ?? null,
+  ]);
+  summarySheet.getRange("Y11").format.columnWidth = 42;
+}
 summarySheet.getRange(`P${detailStartRow}:U${detailEndRow}`).values = expectedRows.map((expected) => [
   expected.case_id,
   clean(expected.group_leader, "未填写"),
@@ -220,10 +241,14 @@ summarySheet.getRange(`V${detailStartRow}:X${detailEndRow}`).formulas = expected
   const detailRow = detailStartRow + index;
   const sourceSheet = quotedSheetName(expected.source_sheet);
   const sourceRow = Number(expected.source_row);
+  const priceCell = `${sourceSheet}!H${sourceRow}`;
+  const hasPrice = `ISNUMBER(${priceCell})`;
+  const partialApproved = settlementNotes.has(byCase.get(expected.case_id).settlement_status)
+    ? `OR(${hasPrice},Y${detailRow}<>"")` : hasPrice;
   return [
     `=${sourceSheet}!G${sourceRow}`,
-    `=IF(OR(V${detailRow}=\"成功\",V${detailRow}=\"图字成功\",AND(OR(V${detailRow}=\"文字成功\",V${detailRow}=\"图片成功\"),X${detailRow}>0)),\"成功\",IF(V${detailRow}=\"失败\",\"失败\",\"待人审\"))`,
-    `=${sourceSheet}!H${sourceRow}`,
+    `=IF(OR(V${detailRow}="成功",V${detailRow}="图字成功",AND(OR(V${detailRow}="文字成功",V${detailRow}="图片成功"),${partialApproved})),"成功",IF(V${detailRow}="失败","失败","待人审"))`,
+    `=IF(${hasPrice},${priceCell},"")`,
   ];
 });
 

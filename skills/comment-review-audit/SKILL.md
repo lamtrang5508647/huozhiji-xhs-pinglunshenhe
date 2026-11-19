@@ -49,15 +49,15 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
    - Use the visible login helpers and allow the user enough time to scan. Do not repeatedly open login windows.
    - Persisted Chrome cookies take precedence over older CLI cookie files. After owner verification, use the same profile; do not overwrite its refreshed session.
 4. Run exactly one canary target first. Continue only when it returns `capture_status: ok`, the target identity is correct, comments are visible, and the completeness/image signals are credible.
-   - Xiaohongshu: `xhs_batch_capture.py --headed --expand-dom --verify-replies /path/expected.json --only-note-id ...`. The one-command XLSX runner supplies the requirements automatically.
+   - Xiaohongshu: `xhs_batch_capture.py --input /path/source.xlsx --output /path/observations.json --headed --expand-dom --expected /path/expected.json --task-targets --only-note-id ...`. The one-command XLSX runner supplies the requirements automatically.
    - Douyin: `douyin_batch_capture.py --only-target-key ...`
 5. Capture the remaining unique targets serially. The standard runner uses its low-risk profile by default: a quiet session-settle wait, three slow warm-up targets, 12–18 second target intervals, at least 4 seconds of rest, 60–90 second breaks every eight targets, and one extra same-page DOM expansion for an incomplete first pass. It is designed to reduce risk controls and incomplete captures without changing accounts, networks, or login state. `--normal-pace` is an explicit legacy opt-out only when the owner approves the trade-off.
    - Xiaohongshu legacy target interval: 6–10 seconds; 25–45 second break every 12 processed targets. Use `--risk-averse` for the default low-risk profile described above.
    - Douyin target interval: 5–8 seconds; 20–35 second break every 10 processed targets.
    - A scheduled long break replaces the ordinary target pause, and the final target never sleeps after checkpointing. Use `--pace-mode fixed` only when slower legacy pacing is required.
-   - Both adapters checkpoint after every target and automatically resume only complete, healthy evidence from the same parser revision captured within 24 hours. Incomplete captures and unknown image states are never skipped by `--skip-existing-ok` (now a compatibility flag). Use a separate work directory for a new audit, or `--refresh` for an explicit fresh recheck. If every selected target is reusable, return without opening Chrome; filtering completed targets before pacing also avoids idle waits at the tail.
-6. For a live Xiaohongshu audit, collect same-note evidence for unresolved numbered replies, even if the initial comment count was complete. Expand visible replies, then inspect the direct-parent match and the recorded page-check outcome. If a task remains pending, report whether its source numbering or its platform evidence is unresolved.
-   Merge observations and run the deterministic comparator. For table-defined payout amounts, use `--amount-mode expected-only`. Do not enable `--allow-duplicates` by default; duplicate exact candidates require review.
+   - Both adapters checkpoint every target. Reuse fresh evidence for the same platform, target and parser revision. An incomplete Xiaohongshu capture can establish a positive result when every assigned task already has sufficient evidence. A missing task still needs a complete page read.
+6. Check the assigned post for the requested comment body. A match anywhere in the post's comments or replies establishes text visibility, including under a different or deleted parent. Expand replies as needed before deciding absence.
+   Merge observations and run the comparator with `--amount-mode expected-only` for table-defined payouts. Multiple appearances confirm visibility. Claim reconciliation handles overlapping settlement evidence.
 
    ```bash
    python3 scripts/review_comments.py \
@@ -70,7 +70,7 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
 7. Inspect every `失败` and `待人审` row plus all `文字成功`/`图片成功` rows. The required user-facing classifications are:
    - General triage: `成功`, `失败`, `待人审`.
    - Text+image detail: `图字成功`, `文字成功`, `图片成功`, `失败`, `待人审`.
-   - `文字成功` and `图片成功` use the source table's explicit text/image component rate and count in general triage `成功`. If the table does not define a component rate, they remain `待人审` with a blank amount. Full success receives the combined table amount, confirmed failure receives `0.00`, and unresolved `待人审` remains blank.
+   - `文字成功` and `图片成功` identify the verified component. Use the explicit component rate for payment. Leave an unresolved payment blank and report the settlement reason. Confirmed failures receive `0.00`.
 8. Build the audited workbook. Preserve the original sheets and embedded images, write the row category to column G and the approved amount to column H, and add/refresh `审核汇总` in the required settlement template: `团长 / 产品名 / 涉及工作表数 / 总条数 / 成功数 / 失败数 / 需人审数 / 成功率 / 报销金额 / 涉及工作表 / 团长联系方式 / 跟团长结算时间 / 结算凭证 / 二维码`. The summary `团长` must directly use the complete value from the product sheet's `团长` field (legacy `团` is accepted); never substitute the `负责人` abbreviation. Group rows by source `团长` + `产品`; preserve previously entered values in the last four manual columns when rebuilding.
 
    Standalone hosts use `python3 scripts/build_audited_workbook.py --source ... --expected ... --report ... --output ...`. It checks row backfill, Decimal totals, formula caches, source-media preservation and ZIP integrity. It does not render previews or recalculate arbitrary Excel formulas. Unsupported protected/merged/drawing layouts produce an error rather than silently deleting data.

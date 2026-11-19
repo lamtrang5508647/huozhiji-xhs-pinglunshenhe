@@ -14,7 +14,7 @@ class AutomaticReplyDecisionTests(unittest.TestCase):
                         comments=[self.parent])
 
     def outcome(self, *captures, row=None):
-        return review([self.root, row or self.reply], list(captures))["results"][1]
+        return review([self.root, row or self.reply], list(captures), require_reply_parent=True)["results"][1]
 
     def test_exhaustive_visible_list_with_the_required_parent_proves_missing_text_reply(self):
         result = self.outcome(self.cap)

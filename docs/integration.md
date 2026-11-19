@@ -7,8 +7,8 @@
 | Python函数 | 输入 | 输出/副作用 |
 |---|---|---|
 | `convert_table(source, mapping=None, amount_rules=None, sheet=None)` | XLSX/CSV/TSV/JSON文件路径 | `{"rows": [...]}`；只读源文件，XLSX默认读所有产品sheet |
-| `review(expected, observations)` | 数组或协议对象 | `{"schema_version":"1.0","summary":...,"results":[...]}`；不写文件 |
-| `audit_workbook(source, observations, output, mapping=None, amount_rules=None)` | 原始XLSX、已有证据、不同的输出路径 | 报告加 `workbook` 元数据；保留源文件，原子写入输出XLSX |
+| `review(expected, observations, require_reply_parent=False)` | 任务和采集证据 | 返回逐行结论和汇总 |
+| `audit_workbook(source, observations, output, mapping=None, amount_rules=None, require_reply_parent=False)` | 原始 XLSX、证据和输出路径 | 写出审核版 Excel，返回报告 |
 
 可选参数是关键字参数。金额在SDK/报告中为两位小数字符串，待人审为 `null`；写Excel时为数值或空白。不要用二进制浮点累计金额。
 
@@ -16,7 +16,7 @@
 
 ## CLI
 
-核心CLI标准输出只有一个JSON对象，退出码：0为处理完成，1为输入/运行错误，2仅表示 `review`/`audit --strict` 存在失败或待人审。0不代表所有评论成功，应读取 `summary.triage_counts`。
+核心 CLI 以 JSON 输出结果。退出码 0 表示处理完成，1 表示输入或运行错误。`review` 和 `audit` 指定 `--strict` 后，遇到失败、待审或未结算金额会输出报告并返回 2。以 `summary.triage_counts` 查看可见性结果，`summary.settlement_pending_count` 表示可见结果中仍待核定金额的行数。只有业务明确要求核对直接回复对象时，才在离线审核中传 `--require-reply-parent`。
 
 在线 `run` 的进度和验证提示输出到stderr、完成清单输出到stdout，遇到未解决的验证返回3；已解决的验证子进程返回4，由runner恢复断点。依赖未安装或内部错误不会被描述成“审核成功”。`maintain` 输出其原生JSON计划。
 

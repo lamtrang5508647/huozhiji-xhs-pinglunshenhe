@@ -29,13 +29,15 @@ def convert_table(source: str | Path, *, mapping: dict[str, str] | None = None,
     return {"rows": rows}
 
 
-def review(expected: list[dict] | dict, observations: list[dict] | dict) -> dict[str, Any]:
-    """Compare supplied evidence. Never navigate, relax duplicates, or invent evidence."""
+def review(expected: list[dict] | dict, observations: list[dict] | dict, *,
+           require_reply_parent: bool = False) -> dict[str, Any]:
+    """Check presence on the assigned post. Direct reply attribution is optional."""
     rows = review_comments.unwrap_rows(expected, "rows")
     captures = review_comments.unwrap_rows(observations, "observations")
     if not rows:
         raise ValueError("expected_rows_empty")
-    report = review_comments.compare(rows, captures, amount_mode="expected-only", allow_duplicates=False)
+    report = review_comments.compare(rows, captures, amount_mode="expected-only", allow_duplicates=False,
+                                     require_reply_parent=require_reply_parent)
     total = validate_results(rows, report["results"])
     report["schema_version"] = "1.0"
     report["summary"]["approved_amount"] = format(total, ".2f")
@@ -44,11 +46,12 @@ def review(expected: list[dict] | dict, observations: list[dict] | dict) -> dict
 
 def audit_workbook(source: str | Path, observations: list[dict] | dict, output: str | Path,
                    *, mapping: dict[str, str] | None = None,
-                   amount_rules: dict[str, str] | None = None) -> dict[str, Any]:
+                   amount_rules: dict[str, str] | None = None,
+                   require_reply_parent: bool = False) -> dict[str, Any]:
     """Convert + compare supplied observations + export; not a live platform capture."""
     from ._engine.build_audited_workbook import build_workbook
 
     expected = convert_table(source, mapping=mapping, amount_rules=amount_rules)
-    report = review(expected, observations)
+    report = review(expected, observations, require_reply_parent=require_reply_parent)
     report["workbook"] = build_workbook(Path(source), expected["rows"], report["results"], Path(output))
     return report

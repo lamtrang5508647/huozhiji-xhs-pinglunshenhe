@@ -3,6 +3,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
+PENDING_SETTLEMENT_REASONS = {
+    "pending_duplicate_claim": {"evidence_claimed_by_multiple_rows"},
+    "pending_source_amount": {"invalid_expected_amount", "missing_component_amount"},
+}
+
+
 def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) -> Decimal:
     expected_ids = [row.get("case_id") for row in rows]
     actual_ids = [item.get("case_id") for item in results]
@@ -26,6 +32,11 @@ def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) 
                 or (triage == "待人审" and category not in ("待人审", "文字成功", "图片成功"))):
             raise RuntimeError("report_category_triage_conflict")
         value = item.get("approved_amount")
+        reasons = PENDING_SETTLEMENT_REASONS.get(item.get("settlement_status"))
+        if reasons:
+            if triage != "成功" or value not in (None, "") or not reasons.intersection(item.get("reason_codes", [])):
+                raise RuntimeError("invalid_pending_settlement")
+            continue
         if triage == "待人审":
             if value not in (None, ""):
                 raise RuntimeError("manual_review_amount_must_be_blank")

@@ -24,7 +24,7 @@ On Windows, read `windows-operations.md`: native `msvcrt` locks, protected direc
 - Xiaohongshu: a saved session file alone does not prove login. A visible `手机号登录`, `输入验证码`, `登录后推荐更懂你的笔记`, or `登录后查看更多评论` gate is `session_expired`.
 - Douyin: visible scan/code/password login gates are `session_expired`; visible security verification is `captcha`.
 - After login, run one known target. Confirm target identity, visible comments, capture count, completeness, and image handling before batch mode.
-- The Xiaohongshu job passes the converted task rows to `capture-xhs --verify-replies`. If a numbered reply is unresolved, inspect the visible comments panel on that same note and expand replies, even when the initial fetch is complete. Multiple rows share one page check. A fresh checkpoint can still need this check if the source requirements have changed. Preserve the page-check outcome and any unresolved reasons in the job evidence.
+- The Xiaohongshu job passes its converted task rows to `capture-xhs --expected`. Read displayed comments and expand replies on the assigned note as needed. A visible match at any depth satisfies the text requirement. Reserve further visits for issues that can change a task's visibility or attachment result.
 
 ## Batch loop
 
@@ -40,7 +40,7 @@ Use navigate → observe → load comments → observe → checkpoint. Do not cl
 - Treat an authoritative visible terminal (`THE END`, `没有更多评论`, `暂时没有更多评论`) as complete. Preserve a warning if the platform counter is stale.
 - Treat Douyin `抢首评` as a complete zero-comment result only when no login/security gate is present.
 - Douyin may stop lazy loading once rendered comments reach the page-declared count. Do not stop merely because all expected texts have appeared; full capture is still required for duplicate detection and reliable failures.
-- Preserve duplicate candidates. Do not deduplicate solely by visible text; duplicate exact matches are reviewed separately.
+- Preserve distinct comments with identical text for settlement reconciliation. One visible occurrence establishes text presence on that post.
 
 ## Comment body extraction
 

@@ -16,14 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
-from capture_resume import reusable_capture
 from audit_validation import validate_results
 from build_audited_workbook import build_workbook
 from profile_lock import default_profile
 from review_comments import compare, unwrap_rows
 from runtime_environment import child_environment, configure_stdio
 from table_to_expected import convert_xlsx_sheets, parse_amount_rules, parse_maps
-from xhs_batch_capture import group_reply_requirements, needs_reply_recheck, plan_targets
+from xhs_batch_capture import capture_covers_tasks, group_note_requirements, plan_targets
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,10 +70,10 @@ def first_target(rows: Iterable[dict[str, Any]], platform: str) -> str:
     return ""
 
 
-def has_healthy_capture(observations: list[dict[str, Any]], target_key: str) -> bool:
+def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=()) -> bool:
     last = next((item for item in reversed(observations) if item.get("platform") == "xiaohongshu"
                  and str(item.get("target_key")) == target_key), None)
-    return reusable_capture(last, "xiaohongshu", target_key)
+    return capture_covers_tasks(last, target_key, rows)
 
 
 def checkpoint_covers_workbook(rows, checkpoint, requirements):
@@ -115,7 +114,7 @@ def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, alre
         if record.get("capture_complete") is True and record.get("image_detection_complete") is not False:
             continue
         if result["status"] == "blocked" or set(result["reason_codes"]).intersection(
-                {"reply_parent_unconfirmed", "comment_image_presence_unknown"}):
+                {"comment_image_presence_unknown", "reply_body_prefix_unconfirmed"}):
             retry[key] = []
     if not retry:
         return checkpoint, report
@@ -173,7 +172,7 @@ def discover_node_modules(explicit: str | None) -> str:
     raise RuntimeError("spreadsheet_runtime_not_found: pass --node-modules")
 
 
-def write_manifest(path: Path, source: Path, output: Path, rows, results, workbook) -> None:
+def write_manifest(path: Path, source: Path, output: Path, rows, results, workbook, settlement_pending_count=0) -> None:
     payout = validate_results(rows, results)
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("final_workbook_missing")
@@ -190,6 +189,7 @@ def write_manifest(path: Path, source: Path, output: Path, rows, results, workbo
                 "success": counts["成功"],
                 "failure": counts["失败"],
                 "manual_review": counts["待人审"],
+                **({"settlement_pending_count": settlement_pending_count} if settlement_pending_count else {}),
                 "approved_amount": float(payout.quantize(Decimal("0.01"))),
                 "source_sha256": workbook["source_sha256"] if workbook else sha256(source.read_bytes()).hexdigest(),
                 "output_sha256": workbook["output_sha256"] if workbook else sha256(output.read_bytes()).hexdigest(),
@@ -260,7 +260,7 @@ def execute_job(args, source, expected, observations, report, output, previews, 
         raise RuntimeError("no_xiaohongshu_target_found")
     checkpoint = read_checkpoint(observations)
     captures = unwrap_rows(checkpoint, "observations")
-    requirements = group_reply_requirements(rows)
+    requirements = group_note_requirements(rows)
     restoring_session = checkpoint.get("stopped") is True
     if restoring_session:
         row_targets = {str(row.get("target_key")) for row in rows}
@@ -272,7 +272,7 @@ def execute_job(args, source, expected, observations, report, output, previews, 
     capture_base = [
         sys.executable,
         str(SCRIPT_DIR / "xhs_batch_capture.py"),
-        "--input", str(source), "--output", str(observations), "--verify-replies", str(expected),
+        "--input", str(source), "--output", str(observations), "--expected", str(expected),
         "--task-targets", "--profile", args.profile, "--expand-dom", "--headed",
     ]
     for mapping in args.maps or ():
@@ -281,17 +281,14 @@ def execute_job(args, source, expected, observations, report, output, previews, 
         capture_base.append("--risk-averse")
     if args.wait_for_confirmation:
         capture_base.append("--wait-for-confirmation")
-    last_canary = next((item for item in reversed(captures) if item.get("platform") == "xiaohongshu"
-                        and str(item.get("target_key")) == target), None)
     already_retried = set()
-    if (restoring_session or not reusable_capture(last_canary, "xiaohongshu", target)
-            or needs_reply_recheck(requirements.get(target, []), last_canary)):
+    if restoring_session or not has_healthy_capture(captures, target, requirements.get(target)):
         canary = capture_base + ["--only-note-id", target]
         if restoring_session:
             canary.append("--refresh")
         run_capture(canary)
         checkpoint = read_checkpoint(observations)
-        healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), target)
+        healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), target, requirements.get(target))
         if not healthy and not restoring_session and not checkpoint.get("stopped"):
             # An isolated inaccessible or incomplete post cannot establish session health.
             # Try one other assigned note before blocking the whole workbook.
@@ -301,7 +298,8 @@ def execute_job(args, source, expected, observations, report, output, previews, 
                 already_retried.add(target)
                 run_capture(capture_base + ["--only-note-id", str(alternate), "--refresh"])
                 checkpoint = read_checkpoint(observations)
-                healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), str(alternate))
+                healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), str(alternate),
+                                              requirements.get(str(alternate)))
         if not healthy:
             write_state(manifest, {"status": "blocked", "source": str(source),
                                    "source_sha256": sha256(source.read_bytes()).hexdigest(),
@@ -331,7 +329,7 @@ def execute_job(args, source, expected, observations, report, output, previews, 
             "--report", str(report), "--output", str(output),
             "--preview-dir", str(previews),
         ], env=env)
-    write_manifest(manifest, source, output, rows, payload["results"], workbook)
+    write_manifest(manifest, source, output, rows, payload["results"], workbook, payload["summary"].get("settlement_pending_count", 0))
     print(manifest.read_text(encoding="utf-8"), end="")
     return 0
 

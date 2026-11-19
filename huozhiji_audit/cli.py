@@ -102,13 +102,16 @@ def main(argv=None):
     compare.add_argument("--expected", required=True)
     compare.add_argument("--observations", required=True)
     compare.add_argument("--output")
-    compare.add_argument("--strict", action="store_true", help="Return 2 if any row failed or needs manual review")
     audit = commands.add_parser("audit", help="Offline XLSX audit against supplied evidence; never opens Chrome")
     audit.add_argument("--source", required=True)
     audit.add_argument("--observations", required=True)
     audit.add_argument("--output", required=True, help="Distinct audited XLSX destination")
     audit.add_argument("--report", help="Optional JSON report destination")
-    audit.add_argument("--strict", action="store_true")
+    for command in (compare, audit):
+        command.add_argument("--strict", action="store_true",
+                             help="Return 2 when a task failed, is inconclusive, or has unsettled payment")
+        command.add_argument("--require-reply-parent", action="store_true",
+                             help="Require direct parent attribution for numbered replies (default: same-post presence)")
     for command, flag in ((convert, "--output"), (compare, "--output"), (audit, "--report")):
         command.add_argument("--brief", action="store_true",
                              help=f"Write full JSON to {flag} (required) and print only paths and totals")
@@ -164,22 +167,26 @@ def main(argv=None):
             emit(expected, args.output, brief=brief)
             return 0
         if args.command == "review":
-            result = review(read_json(args.expected), read_json(args.observations))
+            result = review(read_json(args.expected), read_json(args.observations),
+                            require_reply_parent=args.require_reply_parent)
             report_path = args.output
         else:
             result = audit_workbook(args.source, read_json(args.observations), args.output,
                                     mapping=table_to_expected.parse_maps(args.map),
-                                    amount_rules=table_to_expected.parse_amount_rules(args.amount_rules))
+                                    amount_rules=table_to_expected.parse_amount_rules(args.amount_rules),
+                                    require_reply_parent=args.require_reply_parent)
             report_path = args.report
         brief = None
         if args.brief:
             brief = {"status": "complete", "report": destination,
                      "summary": {key: result["summary"][key] for key in ("total", "triage_counts", "approved_amount")}}
+            if result["summary"].get("settlement_pending_count"):
+                brief["summary"]["settlement_pending_count"] = result["summary"]["settlement_pending_count"]
             if args.command == "audit":
                 brief["output"] = result["workbook"]["output"]
         emit(result, report_path, brief=brief)
         counts = result["summary"]["triage_counts"]
-        return 2 if args.strict and (counts["失败"] or counts["待人审"]) else 0
+        return 2 if args.strict and (counts["失败"] or counts["待人审"] or result["summary"].get("settlement_pending_count")) else 0
     except (OSError, ValueError, RuntimeError, KeyError, zipfile.BadZipFile, ET.ParseError, ArithmeticError) as exc:
         emit({"status": "error", "error": str(exc)})
         return 1
