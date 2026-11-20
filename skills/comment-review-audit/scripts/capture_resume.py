@@ -4,7 +4,7 @@ import hashlib
 import json
 
 # Bump the relevant revision when comment extraction or completeness changes.
-PARSER_REVISIONS = {'xiaohongshu':'xhs-confirmed-expansion-v6', 'douyin':'dy-body-20260930-v2'}
+PARSER_REVISIONS = {'xiaohongshu':'xhs-visible-controls-v7', 'douyin':'dy-body-20260930-v2'}
 
 def recheck_scope(rows):
     """Identify a success-only capture, including changes to the incoming first-pass results."""

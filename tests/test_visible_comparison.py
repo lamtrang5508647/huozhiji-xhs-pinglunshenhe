@@ -70,7 +70,7 @@ class VisibleComparisonTests(unittest.TestCase):
         self.assertIsNone(r["approved_amount"])
 
     def test_older_xhs_capture_can_prove_presence_not_absence(self):
-        for legacy in ("xhs-replies-20261118-v4", "xhs-visible-end-v5"):
+        for legacy in ("xhs-replies-20261118-v4", "xhs-visible-end-v5", "xhs-confirmed-expansion-v6"):
             with self.subTest(legacy=legacy):
                 original = self.cap([], parser_revision=legacy)
                 r = self.outcome(original)

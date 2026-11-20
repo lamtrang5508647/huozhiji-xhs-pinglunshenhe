@@ -43,7 +43,7 @@ POSSIBLE_REPLY_LABEL = re.compile(
     r"^(?:(?:(?:回复|回覆)\s*)?[@＠]\s*[^@＠\s:：]{1,64}(?:\s*[:：]\s*|\s+)"
     r"|(?:回复|回覆)\s*[^@＠\s:：]{1,64}\s*[:：]\s*)(?=\S)"
 )
-LEGACY_XHS_REVISIONS = {"xhs-replies-20261118-v4", "xhs-visible-end-v5"}
+LEGACY_XHS_REVISIONS = {"xhs-replies-20261118-v4", "xhs-visible-end-v5", "xhs-confirmed-expansion-v6"}
 AMOUNT_TOKEN = re.compile(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)(?:\s*)(万|千|百)?(?![\d.])")
 
 

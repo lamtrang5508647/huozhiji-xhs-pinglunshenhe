@@ -15,6 +15,7 @@ from pathlib import Path
 from . import _engine
 from .api import audit_workbook, convert_table, review
 from ._engine import table_to_expected
+from ._engine.capture_watchdog import DEFAULT_IDLE_SECONDS, IDLE_EXIT, positive_seconds, supervise
 from ._engine.runtime_environment import child_environment, configure_stdio
 from . import __version__
 
@@ -24,6 +25,19 @@ def script_path(name):
     if spec is None or spec.origin is None:
         raise RuntimeError(f"adapter_not_installed:{name}")
     return Path(spec.origin)
+
+
+def capture_adapter(name, script, arguments):
+    parser = argparse.ArgumentParser(prog=name, add_help=False)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--capture-idle-timeout", type=positive_seconds, default=DEFAULT_IDLE_SECONDS)
+    if name == "capture-xhs":
+        parser.add_argument("--wait-for-confirmation", action="store_true")
+    settings, forwarded = parser.parse_known_args(arguments)
+    command = [sys.executable, str(script), *forwarded, "--output", settings.output]
+    if getattr(settings, "wait_for_confirmation", False):
+        return subprocess.call([*command, "--wait-for-confirmation"], env=child_environment(), stdout=sys.stderr)
+    return supervise(command, Path(settings.output), settings.capture_idle_timeout, stdout=sys.stderr)
 
 
 def read_json(path):
@@ -132,12 +146,20 @@ def main(argv=None):
         script = script_path(adapters[argv[0]])
         env = child_environment()
         if any(argument in ("--help", "-h") for argument in argv[1:]):
+            if argv[0].startswith("capture-"):
+                print("WorkBuddy option: --capture-idle-timeout SECONDS (default: 300, unattended capture)", flush=True)
             return subprocess.call([sys.executable, str(script), *argv[1:]], env=env)
         if argv[0] == "maintain":
             return subprocess.call([sys.executable, str(script), *argv[1:]], env=env)
         # Child progress and prompts go to stderr. stdin is preserved for owner
         # confirmation; stdout remains a single machine-readable completion.
-        code = subprocess.call([sys.executable, str(script), *argv[1:]], env=env, stdout=sys.stderr)
+        if argv[0].startswith("capture-"):
+            code = capture_adapter(argv[0], script, argv[1:])
+            if code == IDLE_EXIT:
+                emit({"status": "blocked", "exit_code": 3, "reason": "capture_idle_timeout"})
+                return 3
+        else:
+            code = subprocess.call([sys.executable, str(script), *argv[1:]], env=env, stdout=sys.stderr)
         manifest = None
         if argv[0] == "run":
             directory = next((value.split("=", 1)[1] for value in argv if value.startswith("--work-dir=")), None)

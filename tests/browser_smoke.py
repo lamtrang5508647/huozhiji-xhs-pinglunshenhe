@@ -17,6 +17,7 @@ from xhs_batch_capture import expand_dom_comments, load_xhs_modules as capture_m
 from test_xhs_batch_capture import exercise_real_reply_recheck, exercise_visible_comments
 import xhs_batch_capture
 from deferred_comments import exercise_deferred_comments
+from recheck_dom import exercise_recheck_dom
 
 assert login_modules()[-1] is XhsClient
 assert capture_modules()[2] is XhsClient
@@ -54,9 +55,20 @@ with tempfile.TemporaryDirectory(prefix="audit-browser-") as directory:
                 assert "parent_comment_id" not in rows[0]
                 assert rows[1]["parent_comment_id"] == rows[0]["comment_id"]
                 if iteration == 0:
+                    # Playwright regex locators see the raw surrounding whitespace in this footer.
+                    for footer in (" - THE END - ", "\n　没有更多评论\t"):
+                        page.set_content(f'<div class="comments-container"><div class="end-container">{footer}</div></div>')
+                        assert xhs_batch_capture.visible_terminal(page.locator(".comments-container"))
+                    page.set_content('<div class="comments-container"><div class="comment-item">'
+                                     '<div class="content"> - THE END - </div></div></div>')
+                    assert not xhs_batch_capture.visible_terminal(page.locator(".comments-container"))
+                    page.set_content('<div class="comments-container"><button> 展开2条回复 </button>'
+                                     '<div class="end-container"> - THE END - </div></div>')
+                    assert xhs_batch_capture.reply_controls(page.locator(".comments-container")).count() == 1
                     exercise_real_reply_recheck(page)
                     exercise_visible_comments(page)
                     exercise_deferred_comments(page, xhs_batch_capture)
+                    exercise_recheck_dom(page, xhs_batch_capture)
                 context.close()
     # Exercise the actual supported XHS client interface with our Chrome wrapper.
     client = persistent_client(XhsClient, {}, str(Path(directory) / "xhs 测试"),

@@ -5,7 +5,7 @@ display_name_en: Xiaohongshu and Douyin Comment Audit
 description: 根据任务表和平台证据核对小红书、抖音评论文字及配图，生成审核版 Excel、待人审结果与结算汇总。用户要求核对评论是否发布、核算评论任务金额或续审时使用。
 description_zh: 逐行核对评论与配图，回填审核结果和核定金额，生成结算汇总。
 description_en: Check comment evidence against assigned tasks and export a reconciled workbook.
-version: 0.4.5
+version: 0.4.6
 author: lamtrang5508647
 ---
 
@@ -34,6 +34,10 @@ py -3 -X utf8 "<技能目录>/scripts/audit.py" audit --source "<原始评论表
 如果输入已经是要求 JSON，用 `review --expected <要求.json> --observations <证据.json> --output <报告.json> --brief --strict`。单纯转表用 `convert --source <原表> --output <要求.json> --brief`。工具返回逐行分类，使用原表报价，部分成功仅按表内明确的分项价格结算。需要核对字段、重复认领或图片状态时读 @references/data-contract.md。
 
 ## 需要到平台查看
+
+小红书二审时，如果同篇所选任务的正文、所需配图和结算证据已经在当前页面逐条确认，就可结束这一篇。缺少目标正文、图片或独立证据时继续展开。提前结束的页面只能证明已看见的评论。
+
+无人值守的 `run`、`capture-xhs` 和 `capture-douyin` 默认在连续 300 秒没有采集进展时返回 `capture_idle_timeout`，保留已落盘证据。正常的节奏休息单独计时。`run` 可从 `job-result.json` 读取采集覆盖数，恢复时沿用原任务目录；独立采集沿用同一证据路径。可用 `--capture-idle-timeout <秒数>` 调整。用户选择 `--wait-for-confirmation` 时保留扫码或验证的等待时间。
 
 用户要求审核原帖或减少待人审时，让在线流程跑完自动补查，再交付结果。采集从源表任务行和映射的链接列确定原帖，同一篇只列一次。展开回复后等实际评论出现。首轮仍有可补证的任务时，仅重查相应原帖一次。用户提供证据并明确要求离线时，按离线流程处理。
 

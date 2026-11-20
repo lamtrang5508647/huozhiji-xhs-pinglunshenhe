@@ -81,7 +81,7 @@ Sanitized URLs are identifiers only. Live navigation must recover the original c
 }
 ```
 
-`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, fulfilled reply expansions and no extraction gaps. When a reply control advertises a quantity, the reader confirms the increase in visible replies inside that same thread. Observations from `xhs-replies-20261118-v4` and `xhs-visible-end-v5` can still support positive matches. A new page read is required to confirm absence when either revision supplies the only evidence of completeness.
+`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, fulfilled reply expansions and no extraction gaps. When a reply control advertises a quantity, the reader confirms the increase in visible replies inside that same thread. Readers through `xhs-confirmed-expansion-v6` can still supply positive matches. When v4, v5 or v6 supplies the only completeness evidence, a fresh read with `xhs-visible-controls-v7` is required to confirm absence. The current reader recognizes surrounding whitespace on visible reply controls and list footers.
 
 Comment fields:
 

@@ -22,6 +22,7 @@ from xml.etree import ElementTree as ET
 
 from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, deleted_placeholder, flatten_comments, has_more, normalize_comment, normalized_comments
 from capture_pacing import has_remaining_target, pause_seconds
+from capture_watchdog import paced_sleep, visible_progress
 from capture_resume import fresh_capture, recheck_scope, PARSER_REVISIONS
 from audit_pass import rows_to_review
 from review_comments import compare, platform_key, target_key, unwrap_rows
@@ -513,7 +514,7 @@ def prefer_comment_snapshot(current, incoming, *, visible_complete=False):
     return selected
 
 
-MORE_REPLIES = re.compile(r"^(?:展开\s*(?:剩余\s*)?(?:\d+|更多)\s*条?\s*(?:回复|评论)|(?:查看|加载)更多(?:回复|评论)|更多回复|查看(?:被)?折叠(?:的)?评论)$")
+MORE_REPLIES = re.compile(r"^\s*(?:展开\s*(?:剩余\s*)?(?:\d+|更多)\s*条?\s*(?:回复|评论)|(?:查看|加载)更多(?:回复|评论)|更多回复|查看(?:被)?折叠(?:的)?评论)\s*$")
 
 
 def reply_controls(container):
@@ -528,13 +529,13 @@ def visible_terminal(container: Any) -> bool:
         .some(node => !node.closest('.content, .note-text, .comment-picture') &&
             node.getClientRects().length && getComputedStyle(node).visibility === 'visible')"""):
         return False
-    marker = re.compile(r"^(?:-\s*THE END\s*-|没有更多评论|暂时没有更多评论)$", re.I)
+    marker = re.compile(r"^\s*(?:-\s*THE END\s*-|没有更多评论|暂时没有更多评论)\s*$", re.I)
     # A comment (or reply thread) can itself contain the same words as a footer.
     outside_comments = container.locator(
         ':visible:not(.comment-item):not(.comment-item *):not(.reply-container):not(.reply-container *)')
     if container.get_by_text(marker).and_(outside_comments).count():
         return True
-    empty = re.compile(r"^(?:暂无评论|(?:暂时)?还没有评论(?:哦)?|还没有人评论)(?:[～~。！!])?$")
+    empty = re.compile(r"^\s*(?:暂无评论|(?:暂时)?还没有评论(?:哦)?|还没有人评论)(?:[～~。！!])?\s*$")
     return (not container.locator(".comment-item:visible").count()
             and container.get_by_text(empty).and_(outside_comments).count() > 0)
 
@@ -594,7 +595,19 @@ def capture_covers_tasks(observation, key, rows, *, require_reply_parent=False, 
     # An unfinished list can prove individual appearances. It cannot prove an
     # absence, missing image, partial payment, or visibility on another note.
     results = compare(rows, [observation], amount_mode="expected-only", reply_context_rows=context_rows)["results"]
+    if observation.get("capture_stop_reason") == "recheck_matches_visible":
+        return settled_recheck_matches(results)
     return all(result["status"] == "verified" for result in results)
+
+
+def settled_recheck_matches(results):
+    # A full-price match with an independent, identifiable comment cannot earn
+    # more from another page. An unattached image or a shared claim still can.
+    return bool(results) and all(
+        r["expected_type"] in ("text", "text+image") and r["status"] == "verified"
+        and r.get("approved_amount") is not None and not r.get("settlement_status")
+        and clean_comment_id(r.get("matched_comment", {}).get("comment_id")) for r in results
+    )
 
 
 def plan_targets(targets, existing, requirements, refresh=False, *, require_reply_parent=False, contexts=None):
@@ -691,12 +704,24 @@ def displayed_identities(records):
     return Counter(c.get("comment_id") or (c["text"], c["has_image"]) for c in records)
 
 
+def has_visible_comment(records):
+    return any(not c.get("deleted") and (str(c.get("text") or "").strip() or c.get("has_image") is True)
+               for c in records)
+
+
 class ExpansionChecks(ExitStack):
     """A disappearing button and an old footer cannot confirm async replies arrived."""
 
-    def __init__(self):
+    def __init__(self, sufficient=None):
         super().__init__()
         self.pending = []
+        self.sufficient = sufficient
+        self.stopped_on_matches = False
+
+    def all_matches_visible(self, comments):
+        if self.sufficient and self.sufficient(comments):
+            self.stopped_on_matches = True
+        return self.stopped_on_matches
 
     def click(self, page, control):
         # An unchanged control may still be loading after a timeout. Let that
@@ -728,6 +753,7 @@ class ExpansionChecks(ExitStack):
         # A partial page can expose the next button before the full advertised
         # quantity arrives. Keep that obligation through the same-page retry.
         page.wait_for_function("s => s.added() > 0", arg=receipt, timeout=3500).dispose()
+        visible_progress()
         if receipt.evaluate("s => s.added() >= s.required"):
             self.pending.remove(receipt)
 
@@ -766,7 +792,13 @@ def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tupl
         # Read before scrolling because a virtualized list may recycle its earlier nodes.
         rendered, parsed = read_visible_comments(container)
         parse_gap |= not parsed
+        if not parse_gap and checks.all_matches_visible(rendered):
+            # This snapshot proves the selected successes, not the rest of the list.
+            return rendered, False, True
+        previous_count = len(seen)
         seen = prefer_comment_snapshot(seen, rendered)
+        if len(seen) > previous_count:
+            visible_progress()
         state = (displayed_identities(rendered), expanders.count())
         stable = stable + 1 if state == previous else 0
         previous = state
@@ -795,6 +827,10 @@ def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tupl
         terminal = visible_terminal(container)
         if terminal and not reply_controls(container).count():
             break
+    if checks.sufficient and checks.pending and not parse_gap:
+        rendered, parsed = read_visible_comments(container)
+        if parsed and checks.all_matches_visible(rendered):
+            return rendered, False, True
     terminal = visible_terminal(container) and not reply_controls(container).count() and checks.confirmed(page)
     # Rows and a fresh pagination control may have appeared during confirmation.
     rendered, parsed = read_visible_comments(container)
@@ -819,19 +855,33 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     terminal, parse_failed = False, False
     panel = open_comments_panel(page) if expand else None
     if panel:
-        with ExpansionChecks() as checks:
+        sufficient = None
+        if not strict and requirements and all(r.get("prior_review", {}).get("triage") == "成功" for r in requirements):
+            def sufficient(visible):
+                if not visible:
+                    return False
+                partial = {**observation, "comments": visible, "reply_label_reader": "dom-markers-v1"}
+                results = compare(requirements, [partial], amount_mode="expected-only", reply_context_rows=context_rows)["results"]
+                return settled_recheck_matches(results)
+        with ExpansionChecks(sufficient) as checks:
             incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds, checks=checks)
-            captured = prefer_comment_snapshot(captured, incoming, visible_complete=terminal and parsed)
-            parse_failed = not parsed
-            if (parse_failed or not terminal) and args.incomplete_dom_retry_rounds:
+            panel_readable = has_visible_comment(incoming)
+            if not checks.stopped_on_matches and (not parsed or not terminal) and args.incomplete_dom_retry_rounds:
+                captured = prefer_comment_snapshot(captured, incoming, visible_complete=terminal and parsed)
                 first_view = displayed_identities(incoming)
                 incoming, end, parsed = expand_dom_comments(page, args.incomplete_dom_retry_rounds, checks=checks)
-                end = end and not (first_view - displayed_identities(incoming))
-                captured = prefer_comment_snapshot(captured, incoming, visible_complete=end and parsed)
-                terminal = end
-                parse_failed = not parsed
-            if not terminal and checks.pending:
-                observation["warnings"] = ["reply_expansion_unconfirmed"]
+                panel_readable = panel_readable or has_visible_comment(incoming)
+                terminal = end and not (first_view - displayed_identities(incoming))
+            if panel_readable:
+                observation["visible_comment_panel_readable"] = True
+            parse_failed = not parsed
+            if checks.stopped_on_matches:
+                captured = incoming
+                observation["capture_stop_reason"] = "recheck_matches_visible"
+            else:
+                captured = prefer_comment_snapshot(captured, incoming, visible_complete=terminal and parsed)
+                if not terminal and checks.pending:
+                    observation["warnings"] = ["reply_expansion_unconfirmed"]
     elif expand:
         observation["warnings"] = ["comments_panel_unavailable"]
     observation["capture_complete"] = bool(panel and terminal and not parse_failed and not has_more(raw_comments))
@@ -936,6 +986,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--break-max", type=float, default=45.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--only-note-id", action="append", help="Capture one target key; repeat to select several targets")
+    parser.add_argument("--skip-note-id", action="append", default=[], help="Skip a note already probed in this pass")
     parser.add_argument("--skip-existing-ok", action="store_true", help="Compatibility flag; only fresh complete captures are reused")
     parser.add_argument("--refresh", action="store_true", help="Recheck selected targets instead of resuming this job")
     parser.add_argument("--expand-dom", action="store_true", help="Expand lazy-loaded comments and reply groups in the visible page")
@@ -990,6 +1041,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         targets = [target for target in targets if target["note_id"] in set(args.only_note_id)]
         if not targets and not scope:
             parser.error("--only-note-id was not found in the input workbooks")
+    if args.skip_note_id:
+        skipped = set(args.skip_note_id)
+        targets = [target for target in targets if target["note_id"] not in skipped]
     if args.limit is not None:
         targets = targets[: max(0, args.limit)]
     output_path = Path(args.output)
@@ -1038,7 +1092,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.session_settle_max:
             settle = random.uniform(args.session_settle_min, args.session_settle_max)
             print(f"[session-settle] seconds={settle:.1f} profile={'risk-averse' if args.risk_averse else 'standard'}", flush=True)
-            time.sleep(settle)
+            paced_sleep(settle)
         for index, target in enumerate(targets, start=1):
             note_id = target["note_id"]
             if network_fingerprint() != initial_network:
@@ -1139,7 +1193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.break_every and processed_count and processed_count % args.break_every == 0:
                 pause = random.uniform(args.break_min, args.break_max)
                 print(f"[paced-break] seconds={pause:.1f}", flush=True)
-                time.sleep(pause)
+                paced_sleep(pause)
                 continue
             elapsed = time.monotonic() - target_started
             observation = existing[note_id]
@@ -1157,7 +1211,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 mode = args.pace_mode
             print(f"[target-pause] seconds={pause:.1f} capture={elapsed:.1f}s mode={mode}", flush=True)
-            time.sleep(pause)
+            paced_sleep(pause)
     finally:
         client.close()
     return 3 if stop_reason else 0

@@ -19,13 +19,14 @@ from uuid import uuid4
 from xml.etree import ElementTree as ET
 from audit_validation import validate_results
 from audit_pass import rows_to_review, merge_audit_results
-from capture_resume import recheck_scope
+from capture_resume import PARSER_REVISIONS, recheck_scope
+from capture_watchdog import DEFAULT_IDLE_SECONDS, IDLE_EXIT, positive_seconds
 from build_audited_workbook import build_workbook
 from profile_lock import default_profile
 from review_comments import compare, unwrap_rows
 from runtime_environment import child_environment, configure_stdio
 from table_to_expected import convert_xlsx_sheets, parse_amount_rules, parse_maps
-from xhs_batch_capture import capture_covers_tasks, group_note_requirements, plan_targets
+from xhs_batch_capture import capture_covers_tasks, group_note_requirements, has_visible_comment, plan_targets, target_from_url
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -73,10 +74,35 @@ def first_target(rows: Iterable[dict[str, Any]], platform: str) -> str:
     return ""
 
 
+def last_capture(observations, target):
+    return next((item for item in reversed(observations) if item.get("platform") == "xiaohongshu"
+                 and str(item.get("target_key")) == target), None)
+
+
 def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=(), *, context_rows=None) -> bool:
-    last = next((item for item in reversed(observations) if item.get("platform") == "xiaohongshu"
-                 and str(item.get("target_key")) == target_key), None)
-    return capture_covers_tasks(last, target_key, rows, context_rows=context_rows)
+    return capture_covers_tasks(last_capture(observations, target_key), target_key, rows, context_rows=context_rows)
+
+
+def readable_recheck_probe(item, key, rows, started_at):
+    """A fresh, identity-checked panel can establish session health without proving task absence."""
+    if (not item or item.get("platform") != "xiaohongshu" or item.get("target_key") != key
+            or item.get("capture_status") != "ok" or item.get("parser_revision") != PARSER_REVISIONS["xiaohongshu"]
+            or item.get("visible_comment_panel_readable") is not True
+            or not has_visible_comment(item.get("comments") or [])):
+        return False
+    resolved = item.get("resolved_target_key")
+    if not resolved:
+        return False
+    if resolved != key:
+        # Only the platform's short links resolve to a different canonical note ID.
+        sources = (target_from_url(row.get("target_url", "")) for row in rows)
+        if not any(link and link.get("short_url") and link["note_id"] == key for link in sources):
+            return False
+    try:
+        captured_at = datetime.fromisoformat(item["captured_at"].replace("Z", "+00:00"))
+        return started_at <= captured_at <= datetime.now(timezone.utc)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=None):
@@ -210,6 +236,8 @@ def main() -> int:
     parser.add_argument("--map", action="append", dest="maps", help="Override/add destination=header mapping")
     parser.add_argument("--amount-rules")
     parser.add_argument("--profile", default=str(default_profile("xhs")))
+    parser.add_argument("--capture-idle-timeout", type=positive_seconds, default=DEFAULT_IDLE_SECONDS, metavar="SECONDS",
+                        help="Stop an unattended capture after this long without new evidence (default: 300)")
     parser.add_argument("--node-modules")
     parser.add_argument("--workbook-engine", choices=("portable", "artifact"), default="portable",
                         help="Portable stdlib OOXML export (default); artifact enables host rendering")
@@ -277,10 +305,11 @@ def main() -> int:
         return export_job(args, source, expected, report, output, previews, manifest, rows, payload, pass_state)
     except (subprocess.CalledProcessError, RuntimeError, OSError, ValueError, KeyError,
             ArithmeticError, zipfile.BadZipFile, ET.ParseError) as exc:
-        phase = "blocked" if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (2, 3) else "error"
+        phase = "blocked" if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (2, 3, IDLE_EXIT) else "error"
         reason = str(exc)
         if isinstance(exc, subprocess.CalledProcessError):
-            reason = read_checkpoint(observations).get("stop_reason") or "subprocess_failed"
+            reason = ("capture_idle_timeout" if exc.returncode == IDLE_EXIT else
+                      read_checkpoint(observations).get("stop_reason") or "subprocess_failed")
         state = {"status": phase, "source": str(source), "source_sha256": source_hash,
                  "reason": reason, "checkpoint": str(observations), **pass_state}
         if phase == "blocked" and expected.exists():
@@ -318,15 +347,30 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
         capture_base.append("--risk-averse")
     if args.wait_for_confirmation:
         capture_base.append("--wait-for-confirmation")
+    else:
+        capture_base = [sys.executable, str(SCRIPT_DIR / "capture_watchdog.py"), str(args.capture_idle_timeout), *capture_base]
     already_retried = set()
+    probed_partial = set()
+
+    def probe(key, *, refresh=False):
+        command = capture_base + ["--only-note-id", key]
+        if refresh:
+            command.append("--refresh")
+        started = datetime.now(timezone.utc)
+        run_capture(command)
+        updated = read_checkpoint(observations)
+        item = last_capture(unwrap_rows(updated, "observations"), key)
+        healthy = not updated.get("stopped") and capture_covers_tasks(
+            item, key, requirements.get(key), context_rows=contexts.get(key))
+        if (not healthy and pass_state.get("recheck_id") and not updated.get("stopped")
+                and readable_recheck_probe(item, key, requirements.get(key, ()), started)):
+            # This visit already read the page. Defer any missing tasks to the bounded final retry.
+            probed_partial.add(key)
+            healthy = True
+        return updated, healthy
+
     if restoring_session or not has_healthy_capture(captures, target, requirements.get(target), context_rows=contexts.get(target)):
-        canary = capture_base + ["--only-note-id", target]
-        if restoring_session:
-            canary.append("--refresh")
-        run_capture(canary)
-        checkpoint = read_checkpoint(observations)
-        healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), target, requirements.get(target),
-                                      context_rows=contexts.get(target))
+        checkpoint, healthy = probe(target, refresh=restoring_session)
         if not healthy and not restoring_session and not checkpoint.get("stopped"):
             # An isolated inaccessible or incomplete post cannot establish session health.
             # Try one other assigned note before blocking the whole workbook.
@@ -334,10 +378,7 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
                               and row.get("target_key") and row["target_key"] != target), None)
             if alternate:
                 already_retried.add(target)
-                run_capture(capture_base + ["--only-note-id", str(alternate), "--refresh"])
-                checkpoint = read_checkpoint(observations)
-                healthy = has_healthy_capture(unwrap_rows(checkpoint, "observations"), str(alternate),
-                                              requirements.get(str(alternate)), context_rows=contexts.get(str(alternate)))
+                checkpoint, healthy = probe(str(alternate), refresh=True)
         if not healthy:
             write_state(manifest, {"status": "blocked", "source": str(source),
                                    "source_sha256": sha256(source.read_bytes()).hexdigest(),
@@ -347,8 +388,12 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
             return None
     else:
         print(f"[canary] resume-skip healthy target {target}", flush=True)
-    if not checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=contexts):
-        run_capture(capture_base)
+    batch_rows = [r for r in rows if r.get("target_key") not in probed_partial] if probed_partial else rows
+    if batch_rows and not checkpoint_covers_workbook(batch_rows, checkpoint, requirements, contexts=contexts):
+        command = capture_base.copy()
+        for key in sorted(probed_partial):
+            command.extend(["--skip-note-id", key])
+        run_capture(command)
         checkpoint = read_checkpoint(observations)
 
     payload = compare(rows, unwrap_rows(checkpoint, "observations"), amount_mode="expected-only", reply_context_rows=context_rows)

@@ -18,6 +18,7 @@ try:
 except ImportError:
     PlaywrightTimeoutError = TimeoutError  # parser-only hosts never call a live browser
 from capture_pacing import has_remaining_target, pause_seconds
+from capture_watchdog import paced_sleep, visible_progress
 from capture_resume import pending_targets, recheck_scope, PARSER_REVISIONS
 from audit_pass import rows_to_review
 from profile_lock import ProfileLock, default_profile
@@ -205,11 +206,15 @@ def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[
         declared = read_declared_comment_count(page, timeout_ms=800)
 
     previous = -1
+    highest_seen = 0
     stable = 0
     for _ in range(max_scrolls):
         terminal = visible_marker(page, ("暂时没有更多评论", "没有更多评论"))
         items = page.locator('[data-e2e="comment-item"]')
         count = items.count()
+        if count > highest_seen:
+            highest_seen = count
+            visible_progress()
         stable = stable + 1 if count == previous else 0
         previous = count
         if should_stop_loading(declared=declared, captured=count, terminal=terminal, stable=stable):
@@ -246,6 +251,8 @@ def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[
             comment["has_image"] = image_state
             comment["comment_type"] = "text+image" if text and image_state else "image" if image_state else "text"
         comments.append(comment)
+        # Reading distinct rows is useful work even when all were rendered at once.
+        visible_progress()
     complete = terminal or (declared is not None and len(comments) >= declared)
     result: Dict[str, Any] = {
         "capture_status": "ok",
@@ -382,7 +389,7 @@ def main() -> int:
                     if args.break_every and processed_count % args.break_every == 0:
                         pause = random.uniform(args.break_min, args.break_max)
                         print(f"[paced-break] seconds={pause:.1f}", flush=True)
-                        time.sleep(pause)
+                        paced_sleep(pause)
                         continue
                     elapsed = time.monotonic() - target_started
                     pause = pause_seconds(
@@ -394,7 +401,7 @@ def main() -> int:
                         minimum_rest=args.minimum_rest,
                     )
                     print(f"[target-pause] seconds={pause:.1f} capture={elapsed:.1f}s mode={args.pace_mode}", flush=True)
-                    time.sleep(pause)
+                    paced_sleep(pause)
             finally:
                 context.close()
     return 3 if stop_reason else 0
