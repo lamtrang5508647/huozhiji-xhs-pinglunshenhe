@@ -52,6 +52,8 @@ A recognized trailing parenthetical authoring note such as `（辛苦@点点要�
 
 Sanitized URLs are identifiers only. Live navigation must recover the original complete source link; its query parameters must not be copied into logs or reports. Xiaohongshu short-link observations retain the source slug as `target_key` and record the resolved note ID in `resolved_target_key` so rows remain traceable without rewriting the source workbook.
 
+A task that explicitly requires the exact reference image may include its SHA-256 under `required_image_sha256`. A captured attachment may include `image_sha256`, or `image_sha256s` for multiple attachments on that comment. A matching digest confirms byte identity. An absent or different digest leaves the specific-image check unresolved and the payment blank. A generic request for any image retains the ordinary attachment check.
+
 ## Platform observations
 
 `observations.json` is an array or `{ "observations": [...] }`.
@@ -81,7 +83,7 @@ Sanitized URLs are identifiers only. Live navigation must recover the original c
 }
 ```
 
-`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, fulfilled reply expansions and no extraction gaps. When a reply control advertises a quantity, the reader confirms the increase in visible replies inside that same thread. Readers through `xhs-confirmed-expansion-v6` can still supply positive matches. When v4, v5 or v6 supplies the only completeness evidence, a fresh read with `xhs-visible-controls-v7` is required to confirm absence. The current reader recognizes surrounding whitespace on visible reply controls and list footers.
+`capture_status` may be `ok`, `blocked`, `session_expired`, `captcha`, `risk_control`, `network_changed`, `inaccessible`, or `error`. Xiaohongshu negative findings require a healthy read of the rendered comments panel with a genuine terminal or empty state, fulfilled reply expansions and no extraction gaps. When a reply control advertises a quantity, the reader confirms the increase in visible replies inside that same thread. Readers through `xhs-confirmed-expansion-v6` can still supply positive matches. Revision v8 checks the rendered comment panel. For v7 replays, a confirmed rendered end can establish absence and DOM-attributed records can establish presence. When v4, v5 or v6 is the only completeness evidence, obtain a new page read to confirm absence. On Douyin, recordings from `dy-body-20260930-v2` can establish presence. To establish absence, v3 requires a read of the requested video’s comment panel, including folded replies and a verified end or empty state.
 
 Comment fields:
 

@@ -36,7 +36,7 @@ def capture_adapter(name, script, arguments):
     settings, forwarded = parser.parse_known_args(arguments)
     command = [sys.executable, str(script), *forwarded, "--output", settings.output]
     if getattr(settings, "wait_for_confirmation", False):
-        return subprocess.call([*command, "--wait-for-confirmation"], env=child_environment(), stdout=sys.stderr)
+        command.append("--wait-for-confirmation")
     return supervise(command, Path(settings.output), settings.capture_idle_timeout, stdout=sys.stderr)
 
 
@@ -62,24 +62,23 @@ def emit(value, output=None, *, brief=None):
     sys.stdout.write(encoded)
 
 
-def brief_destination(args):
+def output_destination(args):
     flag = "--report" if args.command == "audit" else "--output"
     filename = args.report if args.command == "audit" else args.output
-    if not filename:
+    if args.brief and not filename:
         raise ValueError(f"{args.command} --brief requires {flag}")
-    destination = Path(filename)
     protected = [Path(value).resolve() for name in ("source", "expected", "observations")
                  if (value := getattr(args, name, None))]
-    outputs = [destination.resolve()]
+    outputs = [Path(filename).resolve()] if filename else []
     if args.command == "audit":
         outputs.append(Path(args.output).resolve())
     for output in outputs:
         for other in protected:
             if output == other or (output.exists() and other.exists() and output.samefile(other)):
-                raise ValueError("--brief requires distinct input and output paths")
+                raise ValueError("input, workbook and report paths must be distinct")
         protected.append(output)
     # JSON writes atomically replace the directory entry, including an existing symlink.
-    return str(destination.parent.resolve() / destination.name)
+    return str(Path(filename).parent.resolve() / Path(filename).name) if filename else None
 
 
 def doctor():
@@ -147,7 +146,7 @@ def main(argv=None):
         env = child_environment()
         if any(argument in ("--help", "-h") for argument in argv[1:]):
             if argv[0].startswith("capture-"):
-                print("WorkBuddy option: --capture-idle-timeout SECONDS (default: 300, unattended capture)", flush=True)
+                print("WorkBuddy option: --capture-idle-timeout SECONDS (default: 300, owner input is excluded)", flush=True)
             return subprocess.call([sys.executable, str(script), *argv[1:]], env=env)
         if argv[0] == "maintain":
             return subprocess.call([sys.executable, str(script), *argv[1:]], env=env)
@@ -179,7 +178,7 @@ def main(argv=None):
         if args.command == "doctor":
             emit(doctor())
             return 0
-        destination = brief_destination(args) if args.brief else None
+        destination = output_destination(args)
         if args.command == "convert":
             expected = convert_table(args.source, mapping=table_to_expected.parse_maps(args.map),
                                      amount_rules=table_to_expected.parse_amount_rules(args.amount_rules), sheet=args.sheet)

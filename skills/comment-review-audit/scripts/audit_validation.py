@@ -10,6 +10,7 @@ else:
 PENDING_SETTLEMENT_REASONS = {
     "pending_duplicate_claim": {"evidence_claimed_by_multiple_rows"},
     "pending_source_amount": {"invalid_expected_amount", "missing_component_amount"},
+    "pending_specified_image": {"specified_image_unconfirmed"},
 }
 
 
@@ -47,7 +48,11 @@ def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) 
         value = item.get("approved_amount")
         reasons = PENDING_SETTLEMENT_REASONS.get(item.get("settlement_status"))
         if reasons:
-            if triage != "成功" or value not in (None, "") or not reasons.intersection(item.get("reason_codes", [])):
+            if item["settlement_status"] == "pending_specified_image":
+                valid = (triage, category) in (("成功", "文字成功"), ("待人审", "待人审"))
+            else:
+                valid = triage == "成功"
+            if not valid or value not in (None, "") or not reasons.intersection(item.get("reason_codes", [])):
                 raise RuntimeError("invalid_pending_settlement")
             continue
         if triage == "待人审":

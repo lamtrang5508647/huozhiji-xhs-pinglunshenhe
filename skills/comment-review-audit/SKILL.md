@@ -73,7 +73,7 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
    - General triage: `成功`, `失败`, `待人审`.
    - Text+image detail: `图字成功`, `文字成功`, `图片成功`, `失败`, `待人审`.
    - `文字成功` and `图片成功` identify the verified component. Use the explicit component rate for payment. Leave an unresolved payment blank and report the settlement reason. Confirmed failures receive `0.00`.
-8. Build the audited workbook. Preserve the original sheets and embedded images, write the row category to column G and the approved amount to column H, and add/refresh `审核汇总` in the required settlement template: `团长 / 产品名 / 涉及工作表数 / 总条数 / 成功数 / 失败数 / 需人审数 / 成功率 / 报销金额 / 涉及工作表 / 团长联系方式 / 跟团长结算时间 / 结算凭证 / 二维码`. The summary `团长` must directly use the complete value from the product sheet's `团长` field (legacy `团` is accepted); never substitute the `负责人` abbreviation. Group rows by source `团长` + `产品`; preserve previously entered values in the last four manual columns when rebuilding.
+8. Build the audited workbook. Preserve the original sheets and embedded images, use the workbook’s result and approved-amount columns, using free columns or appending missing ones while preserving source rates and notes, and add/refresh `审核汇总` in the required settlement template: `团长 / 产品名 / 涉及工作表数 / 总条数 / 成功数 / 失败数 / 需人审数 / 成功率 / 报销金额 / 涉及工作表 / 团长联系方式 / 跟团长结算时间 / 结算凭证 / 二维码`. The summary `团长` must directly use the complete value from the product sheet's `团长` field (legacy `团` is accepted); never substitute the `负责人` abbreviation. Group rows by source `团长` + `产品`; preserve previously entered values in the last four manual columns when rebuilding.
 
    Standalone hosts use `python3 scripts/build_audited_workbook.py --source ... --expected ... --report ... --output ...`. It checks row backfill, Decimal totals, formula caches, source-media preservation and ZIP integrity. It does not render previews or recalculate arbitrary Excel formulas. Unsupported protected/merged/drawing layouts produce an error rather than silently deleting data.
 
@@ -142,7 +142,7 @@ Never “improve” success rate by weakening completeness, image, duplicate, or
 - `scripts/run_comment_review_job.py`: one-command, resumable Xiaohongshu XLSX audit orchestration with canary reuse and a machine-readable completion manifest.
 - `scripts/review_comments.py`: deterministic comparison and result classification.
 - `scripts/audit_validation.py`, `scripts/build_audited_workbook.py`: host-independent monetary invariants and loss-conscious OOXML export.
-- `scripts/build_audited_workbook.mjs`: preserves source workbooks, backfills G/H, and creates formula-driven `审核汇总` plus audit detail.
+- `scripts/build_audited_workbook.mjs`: preserves source workbooks, writes the result and settlement columns, and creates formula-driven `审核汇总` plus audit detail.
 - `scripts/maintain_audit_storage.py`: dry-run-first 14-day intermediate evidence maintenance; preserves final spreadsheets.
 - `scripts/sync_openclaw_skill.sh`: force-syncs the validated source into OpenClaw agent `main` and verifies Skill readiness plus Feishu channel health without sending a message.
 - `scripts/verify_feishu_intake.py`: rejects deployments whose Feishu inbound-media limit would drop image-heavy audit workbooks.

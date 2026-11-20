@@ -12,6 +12,23 @@ from test_portable_api import fixture
 
 
 class InputCoverageTests(unittest.TestCase):
+    def test_douyin_homepage_modal_links_keep_distinct_official_note_ids(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "任务.csv"
+            def convert_links(*links):
+                source.write_text("文章链接,评论内容\n" + "".join(f"{link},目标\n" for link in links), encoding="utf-8")
+                return convert_table(source)["rows"]
+            rows = convert_links("https://www.douyin.com/user/example?modal_id=101&private=trim",
+                                 "https://www.douyin.com/user/example?modal_id=202",
+                                 "https://www.douyin.com.example.org/user/example?modal_id=101",
+                                 "https://www.douyin.com/share/slides/303/")
+            self.assertEqual([r["target_key"] for r in rows], ["101", "202", "example", "303"])
+            self.assertEqual([r["target_url"] for r in rows[:2]], ["https://www.douyin.com/video/101", "https://www.douyin.com/video/202"])
+            self.assertEqual(rows[2]["platform"], "")
+            for path in ("video/101?modal_id=202", "user/example?modal_id=101&modal_id=202", "user/example?modal_id=abc"):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "ambiguous_or_invalid_douyin_video_id"):
+                    convert_links("https://www.douyin.com/" + path)
+
     def test_only_post_column_uses_hyperlink_destinations_including_merged_rows(self):
         from huozhiji_audit._engine.table_to_expected import read_xlsx
         with tempfile.TemporaryDirectory() as tmp:

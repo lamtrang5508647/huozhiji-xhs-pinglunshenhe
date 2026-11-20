@@ -4,11 +4,12 @@
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from xhs_batch_capture import apply_risk_averse_profile, parse_dom_comment
 from xhs_batch_capture import target_from_url, targets_from_workbooks, visible_terminal, expand_dom_comments, prefer_comment_snapshot
-from xhs_batch_capture import check_note_comments, collect_note_evidence, plan_targets, reply_signature, unconfirmed_replies
+from xhs_batch_capture import check_note_comments, collect_note_evidence, note_page_state, plan_targets, reply_signature, unconfirmed_replies
 from capture_resume import PARSER_REVISIONS
 from review_comments import compare
 
@@ -94,6 +95,22 @@ def reply_case():
 
 
 def exercise_real_reply_recheck(page):
+    for mapping, state in [
+        ({}, "unknown"),
+        ({"elsewhere":{"note":{"noteId":"elsewhere"}}}, "wrong_note"),
+        ({"0123456789abcdef01234567":{"note":{}}}, "wrong_note"),
+        ({"some_alias":{"note":{"noteId":"note"}}}, "target_note"),
+        ({"elsewhere":{"note":{"noteId":"elsewhere"}}, "note":{"note":{"noteId":"note"}}}, "target_note"),
+        ({"note":{"note":{"noteId":"elsewhere"}}}, "wrong_note"),
+    ]:
+        page.set_content('<div class="comment-item"><div class="error">笔记不存在</div></div>')
+        page.evaluate("map => window.__INITIAL_STATE__ = {note:{noteDetailMap:map}}", mapping)
+        assert note_page_state(page, "note") == state
+    page.evaluate("delete window.__INITIAL_STATE__")
+    page.set_content('<div class="error" hidden>笔记不存在</div>')
+    assert note_page_state(page, "note") == "unknown"
+    page.locator(".error").evaluate("e=>e.hidden=false")
+    assert note_page_state(page, "note") == "post_unavailable"
     # The initial snapshot has the correct count and text, but no immediate parent.
     rows, comments = reply_case()
     page.set_content("""
@@ -216,7 +233,7 @@ def exercise_visible_comments(page):
     stale = [{"id":"old","text":"removed"}, {"id":"v","text":"old content"}]
     assert [c["text"] for c in observe(item("now shown") + end, stale)["comments"]] == ["now shown"]
     partial = observe(item("now shown"), stale)
-    assert {c["text"] for c in partial["comments"]} == {"removed", "now shown"} and not partial["capture_complete"]
+    assert {c["text"] for c in partial["comments"]} == {"now shown"} and not partial["capture_complete"]
     args.dom_max_rounds, args.incomplete_dom_retry_rounds = 1, 2
     recycle = """<button onclick="document.getElementById('window').innerHTML=document.getElementById('last').innerHTML;
                   this.remove()">查看更多评论</button>"""
@@ -284,7 +301,12 @@ def test_reply_resume():
     assert strict_plan(targets, {key: {**fresh, "reply_verification": check}}, altered, False) == targets
     comments[0]["subComments"][0]["target_comment_id"] = "c1"
     args = Namespace(expand_dom=False, dom_max_rounds=1, incomplete_dom_retry_rounds=0, require_reply_parent=True)
-    satisfied, _, _ = check_note_comments(None, key, comments, 2, rows, args)
+    from xhs_capture import normalized_comments
+    displayed = normalized_comments(comments, root_list=True)
+    with patch("xhs_batch_capture.open_comments_panel", return_value=True), \
+         patch("xhs_batch_capture.expand_dom_comments", return_value=(displayed, False, True)) as read_visible:
+        satisfied, _, _ = check_note_comments(None, key, comments, 2, rows, args)
+        assert read_visible.call_args.args[1] == 0
     assert satisfied["reply_verification"]["page_attempted"] is False
     assert not satisfied["capture_complete"]
     assert not strict_plan(targets, {key: {**fresh, "comments":satisfied["comments"]}}, requirements, False)

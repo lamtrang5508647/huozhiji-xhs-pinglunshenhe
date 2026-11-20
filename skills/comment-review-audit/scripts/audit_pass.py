@@ -1,10 +1,12 @@
 """Select successful rows for recheck and reconcile them with untouched source rows."""
+from collections import defaultdict
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 if __package__:
-    from .review_comments import compare
+    from .review_comments import compare, platform_key, target_key
 else:
-    from review_comments import compare
+    from review_comments import compare, platform_key, target_key
 
 
 def rows_to_review(rows):
@@ -72,8 +74,34 @@ def merge_audit_results(rows, active_report):
                         "result_category_counts": categories}, "results": results}
 
 
+def current_recheck_captures(captures):
+    """Use all fragments from the newest dated visit, falling back to legacy undated groups."""
+    visits = defaultdict(list)
+    for item in captures:
+        visits[platform_key(item), target_key(item)].append(item)
+    for group in visits.values():
+        if len(group) == 1:
+            yield group[0]
+            continue
+        dated = []
+        for item in group:
+            try:
+                when = datetime.fromisoformat(str(item.get("captured_at", "")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if when.tzinfo is not None:
+                dated.append((when, item))
+        if dated:
+            newest = max(when for when, item in dated)
+            yield from (item for when, item in dated if when == newest)
+        else:
+            yield from group
+
+
 def compare_audit_rows(rows, captures, *, require_reply_parent=False, amount_mode="expected-only", allow_duplicates=False):
     active = rows_to_review(rows)
+    if active and active is not rows:
+        captures = current_recheck_captures(captures)
     report = compare(active, captures if active else (), amount_mode=amount_mode, allow_duplicates=allow_duplicates,
                      require_reply_parent=require_reply_parent,
                      reply_context_rows=rows if active is not rows else None)

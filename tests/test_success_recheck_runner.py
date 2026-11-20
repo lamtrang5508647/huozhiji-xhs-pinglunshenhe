@@ -195,8 +195,10 @@ class SuccessRecheckRunnerTests(unittest.TestCase):
                 self.assertEqual(xhs.main(args + ["--only-note-id", note]), 0)
             self.assertEqual(xhs.main(args), 0)
             output.unlink()
-            for row in rows:
-                row["prior_review"]["triage"] = "失败"
+            for item in self.evidence["observations"]:
+                item.update(capture_complete=True, image_detection_complete=True, comments=[])
+            self.make_first_pass()
+            rows = runner.convert_xlsx_sheets(self.audited, {}, None, skip_summary=True)
             runner.write_state(expected, {"rows": rows})
             self.assertEqual(xhs.main(args), 0)
             self.assertEqual(runner.read_checkpoint(output), {

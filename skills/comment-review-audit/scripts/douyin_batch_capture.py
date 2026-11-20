@@ -9,6 +9,8 @@ import os
 import random
 import re
 import time
+from collections import Counter
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -25,6 +27,7 @@ from profile_lock import ProfileLock, default_profile
 from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
 from browser_environment import find_chrome
+from table_to_expected import douyin_video_id
 
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -41,6 +44,11 @@ def atomic_write(path: Path, payload: Dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def saved_observations(original, previous, current):
+    changed = {key: item for key, item in current.items() if previous.get(key) is not item}
+    return [item for item in original if item.get("platform") != "douyin" or str(item["target_key"]) not in changed] + list(changed.values())
 
 
 def expected_rows(path: str) -> Iterable[Dict[str, Any]]:
@@ -75,15 +83,21 @@ def capture_plan(paths: Iterable[str]):
     return list(targets.values()), recheck_scope(all_rows)
 
 
+ROW = '[data-e2e="comment-item"], [data-e2e="comment-reply-item"], [data-e2e="reply-item"], [data-e2e="comment-item-reply"]'
+BODY = '.FduGc_lz > .Sh1Da424, [data-e2e="comment-content"], [data-e2e="comment-text"], [data-e2e="comment-item-content"]'
+FOLD = re.compile(r"^\s*(?:(?:展开|查看)(?:其余|剩余)?\s*(\d+)\s*条?\s*(?:回复|评论)|(?:展开更多|查看更多|更多)\s*(?:回复|评论)|全部回复)\s*[⌄∨v]?\s*$")
+END = re.compile(r"^\s*(?:暂时没有更多评论|没有更多评论|没有更多了)\s*$")
+EMPTY = re.compile(r"^\s*(?:暂无评论|暂时没有评论|还没有评论|快来抢首评吧|抢首评)\s*[哦～~！!。]?\s*$")
+LOADING = '[aria-busy="true"], [role="progressbar"], [data-e2e="comment-loading"], .comments-loading, .reply-loading, .loading-more'
+
+
+def outside(selector):
+    return f':visible:not(:is({selector})):not(:is({selector}) *)'
+
+
 def visible_marker(page: Any, markers: Iterable[str]) -> bool:
-    for marker in markers:
-        try:
-            locator = page.get_by_text(marker, exact=False)
-            if locator.count() and locator.first.is_visible():
-                return True
-        except Exception:
-            continue
-    return False
+    outside_rows = page.locator(outside(ROW))
+    return any(page.get_by_text(marker, exact=False).and_(outside_rows).count() for marker in markers)
 
 
 def security_status(page: Any) -> str:
@@ -97,55 +111,144 @@ def security_status(page: Any) -> str:
     return ""
 
 
-def parse_comment_item(item: Any) -> str:
-    body = item.locator('.FduGc_lz > .Sh1Da424')
-    if body.count() == 1:
-        # The sibling .comment-item-tag is UI metadata, not author text.
-        # Emoji images carry the actual visible token in their alt attribute.
-        return body.first.evaluate('''el => {
-            const copy = el.cloneNode(true);
-            for (const img of copy.querySelectorAll('img')) {
-                img.replaceWith(document.createTextNode(img.getAttribute('alt') || ''));
-            }
-            for (const br of copy.querySelectorAll('br')) br.replaceWith(document.createTextNode('\\n'));
-            return copy.textContent.trim();
-        }''')
-    lines = [line.strip() for line in item.inner_text(timeout=3000).splitlines() if line.strip()]
-    if not lines:
-        return ""
-    start = 2 if len(lines) > 1 and lines[1] == "..." else 1
-    end = len(lines)
-    for index in range(start, len(lines)):
-        if TIME_LINE.match(lines[index]):
-            end = index
-            break
-    content = " ".join(lines[start:end]).strip()
-    return content
-
-
-def detect_comment_image(item: Any) -> bool | None:
-    """Detect a comment attachment while excluding ordinary avatars and emoji."""
-    explicit_selectors = (
-        '[data-e2e*="comment-image"]',
-        '[data-e2e*="comment-picture"]',
-        '[class*="comment-image"] img',
-        '[class*="comment-picture"] img',
-        '[class*="image-list"] img',
-    )
+def video_id(url):
     try:
-        if item.locator(", ".join(explicit_selectors)).count() > 0:
-            return True
-        return bool(item.locator("img").evaluate_all(
-            """images => images.some(img => {
-                const rect = img.getBoundingClientRect();
-                const label = `${img.alt || ''} ${img.className || ''} ${img.parentElement?.className || ''} ${img.parentElement?.parentElement?.className || ''}`.toLowerCase();
-                if (/avatar|head|user|emoji|icon|头像|表情/.test(label)) return false;
-                return rect.width >= 56 && rect.height >= 56 && img.naturalWidth >= 80 && img.naturalHeight >= 80;
-            })"""
-        ))
-    except Exception:
+        return douyin_video_id(url)
+    except ValueError:
         return None
 
+
+def on_assigned_video(url, target):
+    resolved = video_id(url)
+    if not resolved:
+        return False
+    try:
+        expected = douyin_video_id(target["url"])
+    except ValueError:
+        return False
+    key = str(target.get("target_key", ""))
+    if (expected and expected != resolved) or (key.isdigit() and key != resolved):
+        return False
+    return bool(expected or key.isdigit() or urlsplit(target["url"]).hostname == "v.douyin.com")
+
+
+def parse_item_lines(rendered):
+    lines = [line.strip() for line in rendered.splitlines() if line.strip()]
+    start = 2 if len(lines) > 1 and lines[1] == "..." else 1
+    for end in range(start, len(lines)):
+        if TIME_LINE.match(lines[end]):
+            return " ".join(lines[start:end])
+    # Without a timestamp there is no reliable boundary between a body and its action bar.
+    return ""
+
+
+# Keep nested replies' text, attachments and identifiers on their own rows.
+ROW_FIELDS = r"""(rows, cfg) => rows.map(row => {
+    const shown = el => el.getClientRects().length && getComputedStyle(el).visibility === 'visible';
+    const own = query => [...row.querySelectorAll(query)].filter(el => el.closest(cfg.row) === row && shown(el));
+    const matched = own(cfg.body);
+    const bodies = matched.filter(el => !matched.some(other => el !== other && el.contains(other)));
+    let body = null, raw = '';
+    if (bodies.length === 1) {
+        const bodyText = node => {
+            if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+            if (node.nodeType !== Node.ELEMENT_NODE || node.hidden || node.getAttribute('aria-hidden') === 'true') return '';
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility !== 'visible') return '';
+            if (node.tagName === 'IMG') return node.alt || '';
+            if (node.tagName === 'BR') return '\n';
+            return [...node.childNodes].map(bodyText).join('');
+        };
+        body = bodyText(bodies[0]).trim();
+    } else if (!bodies.length && !row.querySelector(cfg.row)) {
+        raw = row.innerText;
+    }
+    const explicit = own('[data-e2e*="comment-image"],[data-e2e*="comment-picture"],[class*="comment-image"] img,[class*="comment-picture"] img,[class*="image-list"] img');
+    const image = explicit.length > 0 || own('img').some(img => {
+        const rect = img.getBoundingClientRect();
+        const label = [img.alt,img.className,img.parentElement?.className,img.parentElement?.parentElement?.className].join(' ').toLowerCase();
+        return !/avatar|head|user|emoji|icon|头像|表情/.test(label) &&
+            rect.width >= 56 && rect.height >= 56 && img.naturalWidth >= 80 && img.naturalHeight >= 80;
+    });
+    return {body, raw, image, id: row.getAttribute('data-comment-id') || row.getAttribute('data-cid')};
+})"""
+
+
+def read_rows(panel):
+    items = panel.locator(f':is({ROW}):visible')
+    rows = []
+    parsed = True
+    for item in items.evaluate_all(ROW_FIELDS, {"row": ROW, "body": BODY}):
+        body = item["body"] if item["body"] is not None else parse_item_lines(item["raw"])
+        if not body and not item["image"]:
+            parsed = False
+            continue
+        image = item["image"]
+        record = {"text": body, "has_image": image, "comment_type": ("text+image" if body else "image") if image else "text"}
+        if item["id"]:
+            record["comment_id"] = item["id"]
+        rows.append(record)
+    return rows, parsed
+
+
+def identity(row):
+    if row.get("comment_id"):
+        return ("id", row["comment_id"])
+    return ("anonymous", row["text"], row["has_image"])
+
+
+def folded_controls(panel):
+    return panel.get_by_text(FOLD).and_(panel.locator(outside(BODY)))
+
+
+# Bind each click to the local thread and the pre-click multiset. A vanished
+# button or a newly mounted comment in another thread does not confirm loading.
+EXPANSION = r"""(control, cfg) => {
+    const root = control.closest(cfg.row);
+    const thread = root || control.parentElement;
+    const panel = control.closest('[data-e2e="comment-list"]');
+    const adjacent = root?.nextElementSibling;
+    const replyList = adjacent?.matches('[data-e2e="comment-reply-list"],[data-e2e="reply-list"],.reply-list') ? adjacent : null;
+    const signatures = () => {
+        const counts = new Map();
+        if (thread === panel || !thread.isConnected) return counts;
+        const descendants = [...thread.querySelectorAll(cfg.row), ...(replyList?.querySelectorAll(cfg.row) || [])];
+        for (const row of descendants) {
+            if (!row.getClientRects().length || getComputedStyle(row).visibility !== 'visible') continue;
+            const body = [...row.querySelectorAll(cfg.body)].find(el => el.closest(cfg.row) === row);
+            const sig = row.getAttribute('data-comment-id') || row.getAttribute('data-cid') || body?.innerText.trim();
+            if (sig) counts.set(sig, (counts.get(sig)||0)+1);
+        }
+        return counts;
+    };
+    const before = signatures();
+    const label = control.innerText.trim();
+    const state = JSON.stringify([label, [...before]]);
+    if (cfg.clicked.get(control) === state) return null;
+    cfg.clicked.set(control, state);
+    const required = Number(label.match(/\d+/)?.[0] || 1);
+    return {added: () => [...signatures()].reduce((n,[k,v]) => n + Math.max(0,v-(before.get(k)||0)),0), required};
+}"""
+
+
+def expand_controls(page, panel, clicked, pending):
+    controls = folded_controls(panel)
+    for i in reversed(range(controls.count())):
+        control = controls.nth(i)
+        if not control.count():
+            continue
+        receipt = control.evaluate_handle(EXPANSION, {"row": ROW, "body": BODY, "clicked": clicked})
+        if not receipt.evaluate("r => !!r"):
+            receipt.dispose()
+            continue
+        pending.append(receipt)
+        try:
+            control.click(timeout=2000)
+            page.wait_for_function("r => r.added() >= 1", arg=receipt, timeout=3500).dispose()
+            visible_progress()
+        except PlaywrightTimeoutError:
+            # The receipt will be checked again before any negative verdict.
+            continue
 
 def parse_declared_comment_count(text: str) -> int | None:
     text = (text or "").strip()
@@ -164,110 +267,101 @@ def read_declared_comment_count(page: Any, timeout_ms: int = 1500) -> int | None
     return parse_declared_comment_count(text)
 
 
-def should_stop_loading(*, declared: int | None, captured: int, terminal: bool, stable: int) -> bool:
-    """Stop scrolling only at a terminal/count boundary or after a stable fallback."""
-    return terminal or (declared is not None and captured >= declared) or stable >= 4
-
-
 def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[str, Any]:
+    source = urlsplit(target["url"])
+    host = (source.hostname or "").casefold()
+    if source.scheme not in ("http", "https") or (host != "douyin.com" and not host.endswith(".douyin.com")):
+        return {"capture_status": "inaccessible", "capture_complete": False, "comments": [],
+                "warnings": ["target_identity_unconfirmed"]}
     page.goto(target["url"], wait_until="domcontentloaded", timeout=30_000)
     status = security_status(page)
-    if status:
-        return {"capture_status": status, "capture_complete": False, "comments": []}
+    if status or not on_assigned_video(page.url, target):
+        return {"capture_status": status or "inaccessible", "capture_complete": False, "comments": [],
+                "warnings": [status or "target_identity_unconfirmed"]}
+    if visible_marker(page, ("作品已删除", "视频不存在", "该视频已删除", "作品暂时无法观看")):
+        return {"capture_status": "inaccessible", "capture_complete": False, "comments": [],
+                "warnings": ["target_unavailable"]}
 
-    declared = read_declared_comment_count(page)
-    if declared == 0:
-        status = security_status(page)
-        if status:
-            return {"capture_status": status, "capture_complete": False, "comments": []}
-        return {
-            "capture_status": "ok",
-            "capture_complete": True,
-            "declared_comment_count": 0,
-            "captured_comment_count": 0,
-            "image_detection_complete": True,
-            "image_detection_method": "attachment-selectors-and-dimensions",
-            "comments": [],
-            "resolved_url": page.url,
-        }
-
-    comment_list = page.locator('[data-e2e="comment-list"]')
+    panel = page.locator('[data-e2e="comment-list"]:visible')
     try:
-        comment_list.wait_for(state="visible", timeout=12_000)
-    except PlaywrightTimeoutError:
-        status = security_status(page)
-        return {
-            "capture_status": status or "inaccessible",
-            "capture_complete": False,
-            "comments": [],
-            "warnings": ["comment_list_not_visible"],
-        }
-    if declared is None:
-        declared = read_declared_comment_count(page, timeout_ms=800)
-
-    previous = -1
-    highest_seen = 0
-    stable = 0
-    for _ in range(max_scrolls):
-        terminal = visible_marker(page, ("暂时没有更多评论", "没有更多评论"))
-        items = page.locator('[data-e2e="comment-item"]')
-        count = items.count()
-        if count > highest_seen:
-            highest_seen = count
-            visible_progress()
-        stable = stable + 1 if count == previous else 0
-        previous = count
-        if should_stop_loading(declared=declared, captured=count, terminal=terminal, stable=stable):
-            break
-        if count:
+        if not panel.count():
             try:
+                panel.first.wait_for(state="visible", timeout=1200)
+            except PlaywrightTimeoutError:
+                opener = page.locator('[data-e2e="feed-comment-icon"]:visible')
+                if opener.count() == 1 and not panel.count():
+                    opener.click(timeout=2000)
+                panel.first.wait_for(state="visible", timeout=10_000)
+        if panel.count() != 1:
+            return {"capture_status":"inaccessible", "capture_complete":False, "comments":[],
+                    "warnings":["ambiguous_comment_panel"]}
+    except PlaywrightTimeoutError:
+        return {"capture_status": security_status(page) or "inaccessible", "capture_complete": False,
+                "comments": [], "warnings": ["comment_list_not_visible"]}
+    declared = read_declared_comment_count(page, timeout_ms=800)
+    pending = []
+    clicked = page.evaluate_handle("() => new WeakMap()")
+    all_rows = {}
+    previous = Counter()
+    stable = 0
+    recycled = False
+    gap = False
+    complete = False
+    try:
+        for iteration in range(max_scrolls + 1):
+            if iteration < max_scrolls:
+                expand_controls(page, panel, clicked, pending)
+            rows, parsed = read_rows(panel)
+            counts = Counter()
+            gap |= not parsed
+            for row in rows:
+                key = identity(row)
+                counts[key] += 1
+                # Anonymous duplicates are counted only if actually seen together.
+                all_rows[key, counts[key]] = row
+            if counts - previous:
+                visible_progress()
+            recycled |= bool(previous - counts)
+            stable = stable + 1 if previous == counts else 0
+            previous = counts
+            outside_comments = panel.locator(outside(ROW))
+            terminal = panel.get_by_text(END).and_(outside_comments).count()
+            empty = not rows and panel.get_by_text(EMPTY).and_(outside_comments).count()
+            busy = panel.get_attribute("aria-busy") == "true" or panel.locator(f':is({LOADING}):visible').count()
+            if ((terminal and all_rows) or empty) and not busy and not folded_controls(panel).count():
+                confirmed = all(r.evaluate("s => s.added() >= s.required") for r in pending)
+                if (parsed and not gap and confirmed and (not recycled or declared is not None)
+                        and (declared is None or len(all_rows) >= declared)):
+                    complete = True
+                    break
+            if stable >= 4 or iteration == max_scrolls:
+                break
+            items = panel.locator(f':is({ROW}):visible')
+            if items.count():
                 items.last.scroll_into_view_if_needed(timeout=3000)
-            except Exception:
-                pass
-        page.mouse.wheel(0, 700)
-        page.wait_for_timeout(random.randint(900, 1500))
-        status = security_status(page)
-        if status:
-            return {"capture_status": status, "capture_complete": False, "comments": []}
-
-    terminal = visible_marker(page, ("暂时没有更多评论", "没有更多评论"))
-    items = page.locator('[data-e2e="comment-item"]')
-    comments: List[Dict[str, Any]] = []
-    image_detection_complete = True
-    for index in range(items.count()):
-        try:
-            item = items.nth(index)
-            text = parse_comment_item(item)
-            image_state = detect_comment_image(item)
-        except Exception:
-            image_detection_complete = False
-            continue
-        if image_state is None:
-            image_detection_complete = False
-        if not text and image_state is not True:
-            continue
-        comment: Dict[str, Any] = {"dom_index": index, "text": text}
-        if image_state is not None:
-            comment["has_image"] = image_state
-            comment["comment_type"] = "text+image" if text and image_state else "image" if image_state else "text"
-        comments.append(comment)
-        # Reading distinct rows is useful work even when all were rendered at once.
-        visible_progress()
-    complete = terminal or (declared is not None and len(comments) >= declared)
-    result: Dict[str, Any] = {
-        "capture_status": "ok",
-        "capture_complete": complete,
-        "declared_comment_count": declared,
-        "captured_comment_count": len(comments),
-        "image_detection_complete": image_detection_complete,
-        "image_detection_method": "attachment-selectors-and-dimensions",
-        "comments": comments,
-        "resolved_url": page.url,
-    }
-    if not image_detection_complete:
-        result.setdefault("warnings", []).append("comment_image_presence_incomplete")
-    if not complete:
-        result.setdefault("warnings", []).append("comments_pagination_incomplete")
+            panel.hover(timeout=2000)
+            page.mouse.wheel(0, 600)
+            page.wait_for_timeout(random.randint(900, 1500))
+            status = security_status(page)
+            if status or not on_assigned_video(page.url, target):
+                break
+    finally:
+        for receipt in pending:
+            receipt.dispose()
+        clicked.dispose()
+    status = security_status(page)
+    if status or not on_assigned_video(page.url, target):
+        return {"capture_status": status or "inaccessible", "capture_complete": False, "comments": [],
+                "warnings": [status or "target_identity_unconfirmed"]}
+    comments = [dict(row, dom_index=i) for i, row in enumerate(all_rows.values())]
+    result = {"capture_status": "ok", "capture_complete": complete, "declared_comment_count": declared,
+              "captured_comment_count": len(comments), "image_detection_complete": not gap,
+              "image_detection_method": "attachment-selectors-and-dimensions", "comments": comments,
+              "resolved_target_key": video_id(page.url), "resolved_url": page.url.split("?", 1)[0]}
+    if complete:
+        result["capture_complete_source"] = "visible_comment_list_end"
+    else:
+        result["warnings"] = ["comments_pagination_incomplete"]
     return result
 
 
@@ -290,7 +384,7 @@ def main() -> int:
     args = parser.parse_args()
     if (
         args.delay_min < 0 or args.delay_max < args.delay_min or args.minimum_rest < 0
-        or args.break_every < 0 or args.break_min < 0 or args.break_max < args.break_min
+        or args.break_every < 0 or args.break_min < 0 or args.break_max < args.break_min or args.max_scrolls < 0
     ):
         parser.error("invalid delay bounds")
 
@@ -305,7 +399,7 @@ def main() -> int:
            for path in args.expected):
         parser.error("--output must differ from --expected")
     metadata = {"recheck_scope": scope} if scope else {}
-    existing: Dict[str, Dict[str, Any]] = {}
+    records = []
     if output.exists():
         try:
             payload = json.loads(output.read_text(encoding="utf-8"))
@@ -313,10 +407,13 @@ def main() -> int:
             if existing_scope != scope:
                 parser.error("different audit pass: use a new --output for this recheck")
             records = payload.get("observations", []) if isinstance(payload, dict) else payload
-            existing = {str(item["target_key"]): item for item in records}
+            if not isinstance(records, list) or any(not isinstance(r, dict) or "target_key" not in r for r in records):
+                parser.error("invalid observations in capture checkpoint")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             parser.error(f"cannot read existing capture checkpoint: {exc}")
 
+    previous = {str(item["target_key"]): item for item in records if item.get("platform") == "douyin"}
+    existing = previous.copy()
     total_targets = len(targets)
     targets = pending_targets(targets, existing, "douyin", "target_key", refresh=args.refresh)
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
@@ -348,7 +445,8 @@ def main() -> int:
                             "comments": [], "source_refs": target["source_refs"],
                         }
                         stop_reason = "network_changed"
-                        atomic_write(output, {**metadata, "observations": list(existing.values()), "stopped": True, "stop_reason": stop_reason})
+                        atomic_write(output, {**metadata, "observations": saved_observations(records, previous, existing),
+                                              "stopped": True, "stop_reason": stop_reason})
                         print(f"[{index}/{len(targets)}] stop {key} status=network_changed", flush=True)
                         break
                     captured_at = datetime.now(timezone.utc).isoformat()
@@ -381,7 +479,8 @@ def main() -> int:
                     )
                     if status in {"session_expired", "captcha", "risk_control"}:
                         stop_reason = status
-                    atomic_write(output, {**metadata, "observations": list(existing.values()), "stopped": bool(stop_reason), "stop_reason": stop_reason})
+                    atomic_write(output, {**metadata, "observations": saved_observations(records, previous, existing),
+                                          "stopped": bool(stop_reason), "stop_reason": stop_reason})
                     if stop_reason:
                         break
                     if not has_remaining_target(index, len(targets)):

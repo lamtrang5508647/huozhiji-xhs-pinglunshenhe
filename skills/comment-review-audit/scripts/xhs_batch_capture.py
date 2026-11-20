@@ -22,8 +22,8 @@ from xml.etree import ElementTree as ET
 
 from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, deleted_placeholder, flatten_comments, has_more, normalize_comment, normalized_comments
 from capture_pacing import has_remaining_target, pause_seconds
-from capture_watchdog import paced_sleep, visible_progress
-from capture_resume import fresh_capture, recheck_scope, PARSER_REVISIONS
+from capture_watchdog import owner_confirmation_input, paced_sleep, visible_progress
+from capture_resume import EMPTY_STATE_LABEL, EMPTY_STATE_SOURCE, fresh_capture, recheck_scope, PARSER_REVISIONS
 from audit_pass import rows_to_review
 from review_comments import compare, platform_key, target_key, unwrap_rows
 from xhs_persistent import persistent_client
@@ -164,12 +164,23 @@ def task_link_cells(path, assigned, mapping):
 
 def capture_task_groups(paths, expected_paths, mapping):
     groups = [unwrap_rows(json.loads(Path(path).read_text(encoding="utf-8")), "rows") for path in expected_paths]
-    known = {r.get("source_file") for group in groups for r in group if "prior_review" in r}
+    prior = defaultdict(list)
+    for group in groups:
+        for row in group:
+            if "prior_review" in row:
+                prior[row.get("source_file")].append(row)
     discovered = {}
     for path in map(Path, paths):
-        if path.name not in known:
-            rows = convert_xlsx_sheets(path, mapping, None, skip_summary=True, skip_non_task_sheets=True)
-            if rows and "prior_review" in rows[0]:
+        rows = convert_xlsx_sheets(path, mapping, None, skip_summary=True, skip_non_task_sheets=True)
+        old = prior.get(path.name, [])
+        if old or (rows and "prior_review" in rows[0]):
+            # Match physical tasks and previous verdicts. Retain separately supplied price
+            # rules in an up-to-date contract, but never select rows from a replaced workbook.
+            def source_tasks(records):
+                fields = ("source_sheet", "source_row", "platform", "target_url", "target_key", "comment_type",
+                          "comment_text", "reply_to", "has_image", "image_requirement", "prior_review")
+                return {r.get("case_id"): tuple(r.get(k) for k in fields) for r in records}
+            if source_tasks(rows) != source_tasks(old):
                 discovered[path.name] = rows
     if discovered:
         # First-pass JSON can predate the spreadsheet's results or a file rename.
@@ -243,7 +254,7 @@ def hold_verification(client: Any) -> bool:
         return False
     client._page.bring_to_front()
     try:
-        wait_for_owner_confirmation(client, REQUIRED_COOKIES, save_cookies)
+        wait_for_owner_confirmation(client, REQUIRED_COOKIES, save_cookies, confirm=owner_confirmation_input)
     except (EOFError, KeyboardInterrupt):
         print("VERIFICATION_INPUT_UNAVAILABLE — checkpoint retained", flush=True)
         return False
@@ -843,8 +854,65 @@ def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tupl
     return rendered, terminal, parsed
 
 
+def stable_visible_empty_state(page, note_id, raw_comments, declared):
+    """Recognize the separate, note-bound empty component after giving lazy content a chance to mount."""
+    active = target_from_url(str(getattr(page, "url", "")))
+    if not active or active["note_id"] != note_id or has_more(raw_comments):
+        return False
+    inspect = r"""({expected, scroll, more}) => {
+        const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
+        const shown = (root, selector) => [...root.querySelectorAll(selector)].filter(visible);
+        const detail = window.__INITIAL_STATE__?.note?.noteDetailMap?.[expected], note = detail?.note;
+        if (String(note?.noteId || note?.note_id || note?.id || '') !== expected) return false;
+        const notes = shown(document, '.note-container');
+        if (notes.length !== 1 || shown(document, '.comments-container').length) return false;
+        const root = notes[0], areas = shown(root, '.interaction-container .note-scroller .comments-el');
+        if (areas.length !== 1) return false;
+        const area = areas[0], empty = shown(area, '.no-comments');
+        if (empty.length !== 1 || !shown(empty[0], '.no-comments-image').length) return false;
+        const labels = shown(empty[0], '.no-comments-text'), compact = s => s.replace(/\s+/g, '');
+        const wording = '这是一片荒地点击评论';
+        if (labels.length !== 1 || compact(labels[0].innerText) !== wording || compact(area.innerText) !== wording) return false;
+        // The dependency returns only the list and can discard its outer pagination flags.
+        const containers = [detail.comments], seen = new Set();
+        while (containers.length) {
+            const value = containers.pop();
+            if (!value || typeof value !== 'object' || Array.isArray(value) || seen.has(value)) continue;
+            seen.add(value);
+            if ([value.hasMore, value.has_more].some(v => v === true || v === 1 || v === '1' || v === 'true')) return false;
+            containers.push(value.comments, value.data, value.list, value.pageInfo, value.pagination);
+        }
+        const scroller = area.closest('.note-scroller');
+        if (scroller.querySelector('.comment-item, [data-comment-id], .reply-container, .folded, .comments-container')
+                || area.closest('[aria-busy="true"]') || shown(root,
+                    '[aria-busy="true"], [role=progressbar], .comments-loading, .reply-loading, .loading-more, .loading-container, .loading, .skeleton').length)
+            return false;
+        const pending = new RegExp(more);
+        if (shown(scroller, 'button, [role=button], a, span, [aria-expanded=false]').some(e => pending.test(e.innerText))) return false;
+        const restrictions = /(?:评论(?:已关闭|暂时不可见|仅对.*可见)|暂时无法查看评论|仅作者可见|作者已关闭评论)/;
+        if (shown(root, '[role=alert], [class*="notice"], [class*="restrict"], [class*="error"], [class*="permission"]')
+                .some(e => !e.closest('.desc, .note-content') && restrictions.test(e.innerText))) return false;
+        if (scroll) {
+            labels[0].scrollIntoView({block:'center', inline:'nearest', behavior:'instant'});
+        } else {
+            const rect = labels[0].getBoundingClientRect(), x = rect.left + rect.width/2, y = rect.top + rect.height/2;
+            const hit = document.elementFromPoint(x, y);
+            if (!hit || (!empty[0].contains(hit) && hit !== area)) return false;
+        }
+        return true;
+    }"""
+    def matches(scroll):
+        return (page.evaluate(inspect, {"expected": note_id, "scroll": scroll, "more": MORE_REPLIES.pattern})
+                and note_page_state(page, note_id) == "target_note")
+    if not matches(True):
+        return False
+    page.wait_for_timeout(1000 if declared and declared > 0 else 650)
+    active = target_from_url(str(page.url))
+    return bool(active and active["note_id"] == note_id and matches(False))
+
+
 def check_note_comments(page, key, raw_comments, declared, requirements, args, *, structured_ok=True, prior=None,
-                        context_rows=None):
+                        context_rows=None, resolved_note_id=None):
     captured = normalized_comments(raw_comments, root_list=True)
     observation = {"target_key": key, "platform": "xiaohongshu", "capture_status": "ok",
                    "capture_complete": False, "comments": captured}
@@ -853,8 +921,20 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     page_needed = bool(missing or not structured_ok)
     expand = bool(page_needed or args.expand_dom or (requirements and not strict))
     terminal, parse_failed = False, False
-    panel = open_comments_panel(page) if expand else None
-    if panel:
+    note_id = resolved_note_id or key
+    empty_state = stable_visible_empty_state(page, note_id, raw_comments, declared)
+    panel = empty_state or open_comments_panel(page)
+    if not panel:
+        # The separately rendered empty area can mount during the ordinary panel wait.
+        empty_state = stable_visible_empty_state(page, note_id, raw_comments, declared)
+        panel = empty_state
+    if empty_state:
+        captured, terminal = [], True
+        observation.update(visible_comment_panel_readable=True, target_page_state="target_note",
+                           empty_state_label=EMPTY_STATE_LABEL, captured_comment_count=0)
+        if declared and declared > 0:
+            observation["warnings"] = ["visible_terminal_with_stale_declared_count"]
+    elif panel:
         sufficient = None
         if not strict and requirements and all(r.get("prior_review", {}).get("triage") == "成功" for r in requirements):
             def sufficient(visible):
@@ -864,14 +944,16 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
                 results = compare(requirements, [partial], amount_mode="expected-only", reply_context_rows=context_rows)["results"]
                 return settled_recheck_matches(results)
         with ExpansionChecks(sufficient) as checks:
-            incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds, checks=checks)
+            incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds if expand else 0, checks=checks)
             panel_readable = has_visible_comment(incoming)
-            if not checks.stopped_on_matches and (not parsed or not terminal) and args.incomplete_dom_retry_rounds:
-                captured = prefer_comment_snapshot(captured, incoming, visible_complete=terminal and parsed)
+            if expand and not checks.stopped_on_matches and (not parsed or not terminal) and args.incomplete_dom_retry_rounds:
+                first_render = incoming
                 first_view = displayed_identities(incoming)
                 incoming, end, parsed = expand_dom_comments(page, args.incomplete_dom_retry_rounds, checks=checks)
                 panel_readable = panel_readable or has_visible_comment(incoming)
                 terminal = end and not (first_view - displayed_identities(incoming))
+                if not terminal and not checks.stopped_on_matches:
+                    incoming = prefer_comment_snapshot(first_render, incoming)
             if panel_readable:
                 observation["visible_comment_panel_readable"] = True
             parse_failed = not parsed
@@ -879,24 +961,27 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
                 captured = incoming
                 observation["capture_stop_reason"] = "recheck_matches_visible"
             else:
-                captured = prefer_comment_snapshot(captured, incoming, visible_complete=terminal and parsed)
+                # Initial page state can contain comments that aren't displayed (including
+                # deleted/hidden replies). Enrich matching rendered IDs, never append cached rows.
+                captured = prefer_comment_snapshot(captured, incoming, visible_complete=True)
                 if not terminal and checks.pending:
                     observation["warnings"] = ["reply_expansion_unconfirmed"]
-    elif expand:
+    else:
+        captured = []
         observation["warnings"] = ["comments_panel_unavailable"]
     observation["capture_complete"] = bool(panel and terminal and not parse_failed and not has_more(raw_comments))
     if panel and not parse_failed:
         observation["reply_label_reader"] = "dom-markers-v1"
     apply_displayed_parents(captured, raw_comments, observation["capture_complete"])
     if observation["capture_complete"]:
-        observation["capture_complete_source"] = "visible_comment_list_end"
+        observation["capture_complete_source"] = EMPTY_STATE_SOURCE if empty_state else "visible_comment_list_end"
     observation["comments"] = captured
-    observation["image_detection_complete"] = not parse_failed
-    if not structured_ok and (not panel or (not captured and not terminal)):
+    observation["image_detection_complete"] = bool(panel and not parse_failed)
+    if not panel or (not structured_ok and not captured and not terminal):
         observation.update(capture_status="inaccessible", capture_complete=False, image_detection_complete=False)
     if strict and requirements:
         after = missing
-        if expand and observation["capture_status"] == "ok":
+        if observation["capture_status"] == "ok":
             after = unconfirmed_replies(requirements, observation, context_rows)
         signature = reply_signature(requirements, context_rows)
         previous = (prior or {}).get("reply_verification", {})
@@ -915,21 +1000,60 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
     return observation, terminal, parse_failed
 
 
+SINGLE_NOTE_PAGE_STATES = ("target_note", "post_unavailable")
+
+
+def note_page_state(page, note_id):
+    # xhs-cli falls back to the first map entry when the requested note is absent.
+    # Inspect that exact entry before and after reading the displayed comments.
+    return page.evaluate("""expected => {
+        const map = window.__INITIAL_STATE__?.note?.noteDetailMap || {};
+        const key = Object.hasOwn(map, expected) ? expected : Object.keys(map)[0];
+        const note = map[key]?.note;
+        const entity = note?.noteId || note?.note_id || note?.id;
+        if (entity && String(entity) !== expected) return 'wrong_note';
+        if (key && key !== expected && /^[a-f0-9]{24}$/i.test(key) && !entity) return 'wrong_note';
+        const messages = document.querySelectorAll(
+            '[role=alert], [class*="unavailable"], [class*="not-found"], [class*="error"], .access-wrapper');
+        const restriction = /(?:这篇笔记已被删除|笔记不存在|笔记已删除|当前笔记暂时无法浏览|作者设置了权限|该笔记仅作者可见)/;
+        for (const node of messages) {
+            if (node.closest('.comment-item, .comments-container, .note-content, .desc')) continue;
+            if (node.getClientRects().length && getComputedStyle(node).visibility === 'visible'
+                    && restriction.test(node.innerText)) return 'post_unavailable';
+        }
+        if (entity || (key === expected && (note?.type || note?.interactInfo))) return 'target_note';
+        return 'unknown';
+    }""", note_id)
+
+
 def collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error, prior=None,
                           *, context_rows=None):
     def check_note_identity(check=None):
         active_note = target_from_url(str(client._page.url))
-        if not active_note or active_note["note_id"] != note_id:
+        page_state = note_page_state(client._page, note_id)
+        if (not active_note or active_note["note_id"] != note_id or page_state == "wrong_note"
+                or (detail_id and str(detail_id) != note_id)):
             error = fetch_error("note_identity_unconfirmed")
             if check:
                 error.reply_verification = {**check, "status": "target_changed", "unconfirmed_after": None}
             raise error
+        return page_state
+
+    def restricted_result():
+        return ({"target_key": source_key, "platform": "xiaohongshu", "capture_status": "inaccessible",
+                 "capture_complete": False, "image_detection_complete": False, "comments": [],
+                 "target_page_state": "post_unavailable", "warnings": ["post_unavailable"]}, False, False, declared)
 
     declared = None
+    detail_id = None
     structured_ok = True
     try:
-        declared = declared_comment_count(client.get_note_detail(note_id, token))
-        raw = client.get_note_comments(note_id, token, max_comments=0)
+        detail = client.get_note_detail(note_id, token)
+        note = detail.get("note", detail) if isinstance(detail, dict) else {}
+        if isinstance(note, dict):
+            detail_id = note.get("noteId") or note.get("note_id") or note.get("id")
+        declared = declared_comment_count(detail)
+        raw = [] if detail_id and str(detail_id) != note_id else client.get_note_comments(note_id, token, max_comments=0)
     except login_error:
         raise
     except fetch_error as error:
@@ -941,25 +1065,31 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
         # An unavailable data view can still leave the ordinary note page usable.
         structured_ok = False
         raw = []
-    if login_gate_visible(client):
-        raise login_error("login required: visible login gate")
-    check_note_identity()
-    if not structured_ok or args.expand_dom or requirements:
-        blocker = reply_page_blocker(client)
-        if blocker:
-            raise login_error(blocker)
+    blocker = reply_page_blocker(client)
+    if blocker:
+        raise login_error(blocker)
+    if check_note_identity() == "post_unavailable":
+        return restricted_result()
     evidence, terminal, parse_failed = check_note_comments(
         client._page, source_key, raw, declared, requirements, args, structured_ok=structured_ok, prior=prior,
-        context_rows=context_rows)
+        context_rows=context_rows, resolved_note_id=note_id)
     check = evidence.get("reply_verification", {})
-    if check.get("page_attempted") or args.expand_dom or requirements:
-        blocker = reply_page_blocker(client)
-        if blocker:
-            error = login_error(blocker)
-            if check.get("page_attempted"):
-                error.reply_verification = {**check, "status": "blocked", "unconfirmed_after": None}
-            raise error
-        check_note_identity(check)
+    blocker = reply_page_blocker(client)
+    if blocker:
+        error = login_error(blocker)
+        if check.get("page_attempted"):
+            error.reply_verification = {**check, "status": "blocked", "unconfirmed_after": None}
+        raise error
+    page_state = check_note_identity(check)
+    if page_state == "post_unavailable":
+        return restricted_result()
+    if evidence.get("capture_complete_source") == EMPTY_STATE_SOURCE and page_state != "target_note":
+        raise fetch_error("note_identity_unconfirmed")
+    if evidence["capture_status"] == "inaccessible":
+        if page_state in SINGLE_NOTE_PAGE_STATES:
+            evidence["target_page_state"] = page_state
+        elif detail_id and str(detail_id) == note_id:
+            evidence["target_page_state"] = "target_note"
     return evidence, terminal, parse_failed, declared
 
 
@@ -1148,7 +1278,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     observation["warnings"] = ["visible_terminal_with_stale_declared_count"]
                 existing[note_id] = observation
                 processed_count += 1
-                consecutive_errors = 0 if evidence["capture_status"] == "ok" else consecutive_errors + 1
+                arrived = evidence["capture_status"] == "ok" or evidence.get("target_page_state") in SINGLE_NOTE_PAGE_STATES
+                consecutive_errors = 0 if arrived else consecutive_errors + 1
                 if consecutive_errors >= 2:
                     stop_reason = "repeated_navigation_failure"
                 print(
@@ -1171,7 +1302,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 existing[note_id] = {
                     "platform": "xiaohongshu", "target_key": note_id,
                     "capture_status": "inaccessible", "capture_complete": False,
-                    "captured_at": captured_at, "warnings": ["note_data_unavailable"],
+                    "captured_at": captured_at, "warnings": [
+                        "note_identity_unconfirmed" if str(exc) == "note_identity_unconfirmed" else "note_data_unavailable"],
                     "comments": [], "source_refs": target["sources"],
                 }
                 if hasattr(exc, "reply_verification"):

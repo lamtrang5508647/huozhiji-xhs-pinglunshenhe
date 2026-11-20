@@ -13,6 +13,10 @@ from decimal import Decimal, InvalidOperation
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+if __package__:
+    from .capture_resume import consistent_empty_state
+else:
+    from capture_resume import consistent_empty_state
 
 
 PLATFORM_ALIASES = {
@@ -35,8 +39,9 @@ TYPE_ALIASES = {
 }
 
 PUNCTUATION = re.compile(
-    r"[\s\u3000，。！？；：、‘’“”\"'（）()【】\[\]《》<>…·,!?;:/\\|~`@#$%^&*_+=-]"
+    r"[\s\u3000，。！？；：、‘’“”\"'（）()【】\[\]《》<>…·,!?;:/\\|~`@#$^&*_=]"
 )
+NON_NUMERIC_SIGNS = re.compile(r"[+-](?!\d)|(?<!\d)%")
 XHS_EMOJI_TOKEN = re.compile(r"\[[^\[\]]+R\]", flags=re.IGNORECASE)
 DISPLAY_FORMAT = re.compile("[\u200b\u2060\ufeff\ufe0e\ufe0f]")
 POSSIBLE_REPLY_LABEL = re.compile(
@@ -82,15 +87,40 @@ def normalize_text(value: Any) -> str:
     # Ignore zero-width spacing and emoji presentation style, while preserving
     # the emoji itself, joined sequences, skin tone and numeric punctuation.
     normalized = DISPLAY_FORMAT.sub("", unicodedata.normalize("NFKC", raw).casefold())
-    normalized = XHS_EMOJI_TOKEN.sub("", normalized)
+    prose = XHS_EMOJI_TOKEN.sub("", normalized)
     # Treat a prose full stop like its Chinese counterpart, but retain decimal
     # points so materially different numbers never collapse (1.5 != 15).
-    normalized = re.sub(r"(?<!\d)\.|\.(?!\d)", "", normalized)
-    return PUNCTUATION.sub("", normalized)
+    prose = re.sub(r"(?<!\d)\.|\.(?!\d)", "", prose).replace("−", "-")
+    body = NON_NUMERIC_SIGNS.sub("", PUNCTUATION.sub("", prose))
+    # An optional sticker beside prose and a task consisting entirely of stickers
+    # are different cases. For the latter, retain the named stickers in order.
+    return body or "".join(XHS_EMOJI_TOKEN.findall(normalized))
 
 
 def has_text(value: Any) -> bool:
     return bool(normalize_text(value))
+
+
+def requires_specified_image(row):
+    if row.get("required_image_sha256"):
+        return True
+    instruction = row.get("image_requirement")
+    if not isinstance(instruction, str) or not instruction:
+        return False
+    for clause in re.split(r"[，,。；;\n]", instruction):
+        if re.search(r"不指定|(?:不必|不需(?:要)?|无需|无须|不用|不要求|不限制|禁止|不得|不允许|不要|不可|不使用|非).{0,12}(?:指定|原图|同图|这张)", clause):
+            continue
+        if re.search(r"指定(?:的)?(?:配图|图片|图)|(?:使用|用|附|发|上传|要求)原图|(?:必须|务必|需要|请).{0,5}这张图|与.{0,8}(?:样图|示例图|参考图|原图).{0,4}(?:一致|相同)", clause):
+            return True
+    return instruction.strip() == "原图"
+
+
+def matches_specified_image(required_hash, comment):
+    if image_signal(comment) is not True or not isinstance(required_hash, str) or not re.fullmatch("[a-fA-F0-9]{64}", required_hash):
+        return False
+    hashes = comment.get("image_sha256s")
+    observed = [comment.get("image_sha256"), *(hashes if isinstance(hashes, list) else [])]
+    return any(isinstance(value, str) and value.lower() == required_hash.lower() for value in observed)
 
 
 def infer_type(row: Dict[str, Any], *, text_present: Optional[bool] = None) -> Optional[str]:
@@ -98,7 +128,7 @@ def infer_type(row: Dict[str, Any], *, text_present: Optional[bool] = None) -> O
     if text_present is None:
         text_present = has_text(row.get("comment_text", row.get("text", "")))
     image_value = row.get("has_image", row.get("image", None))
-    image_present = bool(image_value) if image_value is not None else False
+    image_present = bool(image_value) or requires_specified_image(row)
     if explicit:
         if explicit == "text" and image_present:
             return None
@@ -206,13 +236,31 @@ def prepare_observation(raw: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(raw)
     result["platform"] = canonical_platform(raw.get("platform")) or str(raw.get("platform", "")).strip().casefold()
     result["target_key"] = target_key(raw)
-    result["comments"] = raw.get("comments") if isinstance(raw.get("comments"), list) else []
+    if not consistent_empty_state(result):
+        return {**result, "capture_status": "inaccessible", "capture_complete": False,
+                "image_detection_complete": False, "comments": []}
+    records = raw.get("comments")
+    result["comments"] = []
+    if isinstance(records, list):
+        for comment in records:
+            if not isinstance(comment, dict):
+                continue
+            body = _observed_body(comment)
+            if isinstance(body, str) and body.strip():
+                result["comments"].append(comment)
+            elif body in ("", None) and (image_signal(comment) is True or comment.get("deleted") is True):
+                result["comments"].append(comment)
+    result["comments"] = verified_visible_comments(result)
+    if not isinstance(records, list) or len(result["comments"]) != len(records):
+        result["capture_complete"] = False
+        result["image_detection_complete"] = False
     return result
 
 
 def compact_comment(comment: Dict[str, Any]) -> Dict[str, Any]:
     keys = ("comment_id", "dom_index", "text", "comment_type", "has_image", "observed_amount", "amount_source",
-            "evidence_path", "parent_comment_id", "parent_text", "parent_evidence", "reply_label_removed")
+            "evidence_path", "parent_comment_id", "parent_text", "parent_evidence", "reply_label_removed",
+            "image_sha256", "image_sha256s")
     record = {key: comment[key] for key in keys if key in comment}
     if "text" not in record and "comment_text" in comment:
         record["text"] = comment["comment_text"]
@@ -410,8 +458,28 @@ def _distinct_matches(comments):
     return distinct
 
 
+def verified_visible_comments(capture):
+    """Keep v7 evidence that can be attributed to what was actually rendered."""
+    comments = capture["comments"]
+    if capture["platform"] != "xiaohongshu" or capture.get("parser_revision") != "xhs-visible-controls-v7":
+        return comments
+    if (capture.get("capture_complete") is True and capture.get("capture_complete_source") == "visible_comment_list_end"
+            or capture.get("capture_stop_reason") == "recheck_matches_visible"):
+        return comments
+    return [c for c in comments if c.get("text_source") == "dom_note_text"]
+
+
 def _legacy_xhs(capture):
     return capture["platform"] == "xiaohongshu" and capture.get("parser_revision") in LEGACY_XHS_REVISIONS
+
+
+def _unreliable_end(capture):
+    revision = capture.get("parser_revision")
+    if capture["platform"] == "douyin":
+        return revision == "dy-body-20260930-v2"
+    if capture["platform"] == "xiaohongshu" and revision == "xhs-visible-controls-v7":
+        return capture.get("capture_complete_source") != "visible_comment_list_end"
+    return _legacy_xhs(capture)
 
 
 def _observed_roots(evidence, parent_text):
@@ -529,11 +597,11 @@ class _TargetEvidence:
 
     @cached_property
     def complete(self):
-        return any(c.get("capture_complete") is True and not _legacy_xhs(c) for c in self.usable)
+        return any(c.get("capture_complete") is True and not _unreliable_end(c) for c in self.usable)
 
     @cached_property
     def legacy_absence(self):
-        return not self.complete and any(c.get("capture_complete") is True and _legacy_xhs(c) for c in self.usable)
+        return not self.complete and any(c.get("capture_complete") is True and _unreliable_end(c) for c in self.usable)
 
     @cached_property
     def image_detection_incomplete(self):
@@ -706,7 +774,8 @@ def _check_settlement_claims(results, claims, amount_mode, allow_duplicates, not
     for index in disputed:
         result = results[index]
         if note_presence:
-            result["settlement_status"] = "pending_duplicate_claim"
+            if result.get("settlement_status") != "pending_specified_image":
+                result["settlement_status"] = "pending_duplicate_claim"
             result["approved_amount"] = None
             result["reason_codes"].append("evidence_claimed_by_multiple_rows")
             continue
@@ -846,9 +915,12 @@ def compare(
         allow_text_alternatives = allow_duplicates or (note_presence and bool(expected_text))
         constrained_reply = index in reply_parents
         reply_images = []
+        specified = expected_type in ("image", "text+image") and requires_specified_image(expected)
         if constrained_reply:
             parent_text = reply_parents[index]
             possible = same_text if expected_text else evidence.by_type.get(expected_type, [])
+            if specified and expected_type == "image":
+                possible = [c for c in evidence.comments if image_signal(c) is True and c.get("deleted") is not True]
             same_text = _matching_replies(evidence, parent_text, possible)
             if not same_text and expected_type == "text+image":
                 reply_images = _matching_replies(evidence, parent_text, evidence.image_only)
@@ -863,6 +935,31 @@ def compare(
                     result["candidates"] = [compact_comment(c) for c in possible]
                 results.append(result)
                 continue
+        exact_images = None
+        if specified:
+            if expected_type == "image" and not constrained_reply:
+                candidates = [c for c in evidence.comments if image_signal(c) is True and c.get("deleted") is not True]
+            elif same_text:
+                candidates = same_text
+            else:
+                candidates = reply_images if constrained_reply else [c for c in evidence.image_only if c.get("deleted") is not True]
+            exact_images = [c for c in candidates if matches_specified_image(expected.get("required_image_sha256"), c)]
+            unknown_image = expected_type == "image" and (image_detection_incomplete or any(
+                image_signal(c) is None for c in evidence.comments if c.get("deleted") is not True))
+            if not exact_images and (candidates or unknown_image):
+                text_seen = bool(expected_text and same_text)
+                result.update(status="partial_text" if text_seen else "needs_review",
+                              settlement_status="pending_specified_image", expected_amount=format_amount(expected_amount),
+                              candidates=[compact_comment(c) for c in candidates])
+                result["reason_codes"].append("specified_image_unconfirmed")
+                if text_seen and evidence.row_count > 1:
+                    settlement_claims[index] = candidates, evidence.capture_by_record if len(candidates) > 1 else None
+                results.append(result)
+                continue
+            if exact_images:
+                result["verified_image_sha256"] = expected["required_image_sha256"].lower()
+            if expected_type == "image" or same_text:
+                same_text = exact_images
         if expected_type == "text+image":
             text_with_image = [comment for comment in same_text if image_signal(comment) is True]
             if same_text and not text_with_image:
@@ -896,6 +993,8 @@ def compare(
             if not same_text:
                 image_only = _distinct_matches(reply_images if constrained_reply else
                                                [c for c in evidence.image_only if c.get("deleted") is not True])
+                if exact_images is not None:
+                    image_only = _distinct_matches(exact_images)
                 combo_count = combo_rows_by_target.get(key, 0)
                 if len(image_only) == 1 and combo_count == 1:
                     if not complete:
@@ -925,7 +1024,9 @@ def compare(
                     result["reason_codes"].append("comment_image_presence_unknown")
                     results.append(result)
                     continue
-        if note_presence and expected_type == "text":
+        if specified and expected_type == "image":
+            same_type = exact_images
+        elif note_presence and expected_type == "text":
             same_type = same_text
         elif expected_text or constrained_reply:
             same_type = [comment for comment in same_text if _observed_type(comment) == expected_type]
@@ -1003,7 +1104,8 @@ def compare(
         if ((result["platform"], result["target_key"]) in legacy_absence_targets
                 and any(code.startswith("capture_incomplete_") or code == "reply_parent_unconfirmed"
                         for code in result["reason_codes"])):
-            result["reason_codes"].append("legacy_xhs_visible_recheck_required")
+            result["reason_codes"].append("legacy_xhs_visible_recheck_required" if result["platform"] == "xiaohongshu"
+                                          else "legacy_douyin_visible_recheck_required")
         if result.get("expected_type") == "text+image" and result["status"] == "verified":
             result["result_category"] = "图字成功"
         else:
@@ -1014,7 +1116,10 @@ def compare(
             component_amount = parse_amount(expected_row.get("partial_text_amount"))
         elif result["status"] == "partial_image":
             component_amount = parse_amount(expected_row.get("partial_image_amount"))
-        if result["status"] == "verified":
+        if result.get("settlement_status") == "pending_specified_image":
+            result["triage"] = "成功" if result["status"] == "partial_text" else "待人审"
+            result["approved_amount"] = None
+        elif result["status"] == "verified":
             result["triage"] = "成功"
             result["approved_amount"] = result.get("expected_amount")
             if note_presence and result["approved_amount"] is None:

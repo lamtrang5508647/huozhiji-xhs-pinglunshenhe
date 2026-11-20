@@ -18,6 +18,8 @@ from test_xhs_batch_capture import exercise_real_reply_recheck, exercise_visible
 import xhs_batch_capture
 from deferred_comments import exercise_deferred_comments
 from recheck_dom import exercise_recheck_dom
+from douyin_visibility import exercise_douyin_visibility
+from xhs_empty_state import exercise_empty_state
 
 assert login_modules()[-1] is XhsClient
 assert capture_modules()[2] is XhsClient
@@ -67,8 +69,10 @@ with tempfile.TemporaryDirectory(prefix="audit-browser-") as directory:
                     assert xhs_batch_capture.reply_controls(page.locator(".comments-container")).count() == 1
                     exercise_real_reply_recheck(page)
                     exercise_visible_comments(page)
+                    exercise_empty_state(page, xhs_batch_capture)
                     exercise_deferred_comments(page, xhs_batch_capture)
                     exercise_recheck_dom(page, xhs_batch_capture)
+                    exercise_douyin_visibility(page)
                 context.close()
     # Exercise the actual supported XHS client interface with our Chrome wrapper.
     client = persistent_client(XhsClient, {}, str(Path(directory) / "xhs 测试"),

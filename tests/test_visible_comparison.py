@@ -29,6 +29,16 @@ class VisibleComparisonTests(unittest.TestCase):
         for a, b in (("👩‍💻", "👩💻"), ("👍", "👍🏽"), ("好", "不好"), ("1.5", "15")):
             self.assertNotEqual(normalize_text(a), normalize_text(b))
 
+    def test_sticker_only_tasks_and_numeric_signs_are_distinguishable(self):
+        for wanted, visible, verdict in (
+                ("[笑哭R]", "[笑哭R]", "成功"), ("[笑哭R]", "[捂脸R]", "失败"),
+                ("[笑哭R]", "笑哭r", "失败"), ("好[笑哭R]", "好", "成功"),
+                ("-2度", "2度", "失败"), ("−2度", "-2度", "成功"),
+                ("2%", "2", "失败"), ("3-5天", "35天", "失败")):
+            with self.subTest(wanted=wanted, visible=visible):
+                result = self.outcome(self.cap([dict(self.seen, text=visible)]), row=dict(self.row, comment_text=wanted))
+                self.assertEqual(result["triage"], verdict)
+
     def test_stable_id_repeated_is_one_candidate_without_merging_different_evidence(self):
         first = self.cap([dict(self.seen, evidence_path="a.png")])
         second = self.cap([dict(self.seen, evidence_path="b.png", dom_index=8)])
@@ -47,8 +57,7 @@ class VisibleComparisonTests(unittest.TestCase):
         self.assertEqual(compare([self.row], evidence)["results"][0]["triage"], "待人审")
         amount_row = dict(self.row, comment_text="样例2元")
         captions = [dict(self.seen, text=t) for t in ("样例2元", "样例-2元")]
-        self.assertIn("duplicate_matching_comments",
-                      compare([amount_row], [self.cap(captions)])["results"][0]["reason_codes"])
+        self.assertEqual(compare([amount_row], [self.cap(captions)])["results"][0]["status"], "verified")
 
     def test_observation_text_alias_is_consistent_for_type_matching_and_money(self):
         record = dict(comment_id="c", comment_text="收到2元", has_image=False)
@@ -80,3 +89,25 @@ class VisibleComparisonTests(unittest.TestCase):
                 self.assertEqual(self.outcome(original, self.cap([]))["status"], "not_found")
                 dy = dict(original, platform="douyin")
                 self.assertEqual(self.outcome(dy, row=dict(self.row, platform="douyin"))["status"], "not_found")
+
+    def test_malformed_comment_list_cannot_establish_absence(self):
+        for records in (None, "unreadable", [None], [{}], [{"text": ["broken"]}]):
+            with self.subTest(records=records):
+                self.assertEqual(self.outcome(self.cap(records))["triage"], "待人审")
+        self.assertEqual(self.outcome(self.cap([{}, self.seen]))["triage"], "成功")
+        self.assertEqual(self.outcome(self.cap([]))["triage"], "失败")
+        photo_task = dict(self.row, comment_type="image", comment_text="")
+        photo = dict(comment_id="photo", text=None, has_image=True)
+        self.assertEqual(self.outcome(self.cap([photo]), row=photo_task)["triage"], "成功")
+
+    def test_old_douyin_reader_can_prove_presence_but_missed_replies(self):
+        row = dict(self.row, platform="douyin")
+        old = self.cap([], platform="douyin", parser_revision="dy-body-20260930-v2")
+        self.assertEqual(self.outcome(old, row=row)["triage"], "待人审")
+        self.assertEqual(self.outcome(dict(old, comments=[self.seen]), row=row)["triage"], "成功")
+        self.assertEqual(self.outcome(dict(old, parser_revision="dy-visible-replies-v3"), row=row)["triage"], "失败")
+
+    def test_v7_needs_a_rendered_end_to_prove_absence(self):
+        old = self.cap([], parser_revision="xhs-visible-controls-v7")
+        self.assertEqual(self.outcome(old)["triage"], "待人审")
+        self.assertEqual(self.outcome(dict(old, capture_complete_source="visible_comment_list_end"))["triage"], "失败")

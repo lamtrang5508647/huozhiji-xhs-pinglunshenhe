@@ -45,6 +45,7 @@ function derivedTriage(result) {
 }
 
 const settlementNotes = new Map([
+  ["pending_specified_image", "指定图片尚未核实，金额暂缓核定"],
   ["pending_duplicate_claim", "多行共用评论证据，金额暂缓核定"],
   ["pending_source_amount", "原表缺少可用报价，金额暂缓核定"],
 ]);
@@ -54,7 +55,8 @@ function approvedAmount(result) {
     return result.approved_amount == null ? null : Number(result.approved_amount);
   }
   if (settlementNotes.has(result.settlement_status)) {
-    if (derivedTriage(result) !== "成功" || (result.approved_amount != null && result.approved_amount !== "")) {
+    const imageReview = result.settlement_status === "pending_specified_image" && derivedTriage(result) === "待人审";
+    if ((!imageReview && derivedTriage(result) !== "成功") || (result.approved_amount != null && result.approved_amount !== "")) {
       throw new Error("Invalid pending settlement");
     }
     return null;
@@ -88,8 +90,57 @@ function groupKey(leader, product) {
   return `${leader}\u0000${product}`;
 }
 
+const columnIndex = (name) => [...name].reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0);
+
+function columnName(number) {
+  if (!Number.isInteger(number) || number < 1 || number > 16384) throw new Error("No room for audit column");
+  let label = "";
+  while (number > 0) {
+    number -= 1;
+    label = String.fromCharCode(65 + number % 26) + label;
+    number = Math.floor(number / 26);
+  }
+  return label;
+}
+
+function legacyFirstPassLayout(sheet, merges) {
+  // Older standalone contracts have no physical column map. Inspect the source before writing.
+  const used = sheet.getUsedRange();
+  let lastCol = used.columnIndex + used.columnCount;
+  const lastRow = used.rowIndex + used.rowCount;
+  const headers = sheet.getRange(`A1:${columnName(lastCol)}1`).values[0].map((v) => clean(v).normalize("NFKC"));
+  const find = (pattern) => {
+    const index = headers.findIndex((header) => pattern.test(header));
+    return index < 0 ? null : columnName(index + 1);
+  };
+  const hasData = (col, start) => {
+    if (start > lastRow || columnIndex(col) > lastCol) return false;
+    const range = sheet.getRange(`${col}${start}:${col}${lastRow}`);
+    return [range.values, range.formulas].some((matrix) => matrix.some(([v]) => v != null && v !== ""));
+  };
+  const result = find(/^(审核结果|核验结果|初审结果|首审结果|审核状态|核验状态|结果分类)/);
+  let amount = find(/^(核定金额|结算金额|审核金额|核验金额|复核金额|审定金额)/);
+  if (!amount) {
+    const generic = find(/^(金额|返现金额|核对金额|amount)/i);
+    if (generic && !hasData(generic, 2)) amount = generic;
+  }
+  const reserved = new Set([result, amount]);
+  const allocate = (preferred) => {
+    const index = columnIndex(preferred);
+    const merged = merges.some((address) => {
+      const [, a, b] = /^([A-Z]+)\d+:([A-Z]+)\d+$/.exec(address);
+      return columnIndex(a) <= index && index <= columnIndex(b);
+    });
+    const col = reserved.has(preferred) || merged || hasData(preferred, 1) ? columnName(++lastCol) : preferred;
+    lastCol = Math.max(lastCol, columnIndex(col));
+    reserved.add(col);
+    return col;
+  };
+  return {result_column: result || allocate("G"), amount_column: amount || allocate("H"),
+          new_result: !result, new_amount: !amount};
+}
+
 function splitAuditMerges(sheet, ranges, columns, active, lastRow) {
-  const columnIndex = (name) => [...name].reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0);
   const allowed = columns.map(columnIndex);
   for (const address of ranges) {
     const match = /^([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(address);
@@ -169,24 +220,17 @@ for (const sheetRecord of sourceSheets) {
   });
   if (!active.length) continue;
   const sheet = workbook.worksheets.getItem(sheetRecord.name);
-  const prior = active[0].prior_review;
-  const categoryColumn = prior ? prior.result_column : "G";
-  let amountColumn = prior ? prior.amount_column : "H";
+  const layout = active[0].prior_review || active[0].audit_columns || legacyFirstPassLayout(sheet, mergedBySheet.get(sheetRecord.name) || []);
+  const categoryColumn = layout.result_column;
+  let amountColumn = layout.amount_column;
   if (!amountColumn) {
     const used = sheet.getUsedRange();
-    let next = used.columnIndex + used.columnCount + 1;
-    if (!Number.isInteger(next) || next < 1 || next > 16384) throw new Error("No room for settlement column");
-    amountColumn = "";
-    while (next > 0) {
-      next -= 1;
-      amountColumn = String.fromCharCode(65 + next % 26) + amountColumn;
-      next = Math.floor(next / 26);
-    }
-    sheet.getRange(`${amountColumn}1`).values = [["核定金额"]];
+    amountColumn = columnName(used.columnIndex + used.columnCount + 1);
   }
   if (!categoryColumn || categoryColumn === amountColumn) throw new Error("Invalid audit output columns");
   layouts.set(sheetRecord.name, [categoryColumn, amountColumn]);
-  if (!prior) sheet.getRange("G1").values = [["审核结果"]];
+  if (layout.new_result) sheet.getRange(`${categoryColumn}1`).values = [["审核结果"]];
+  if (layout.new_amount || !layout.amount_column) sheet.getRange(`${amountColumn}1`).values = [["核定金额"]];
   active.sort((a, b) => a.source_row - b.source_row);
   splitAuditMerges(sheet, mergedBySheet.get(sheetRecord.name) || [], [categoryColumn, amountColumn],
                   active.map((row) => row.source_row), Math.max(...rows.map((row) => row.source_row)));

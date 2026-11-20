@@ -32,6 +32,17 @@ class DouyinSecondPassTests(unittest.TestCase):
         self.assertEqual([t["target_key"] for t in targets], ["a"])
         self.assertEqual([r["row"] for r in targets[0]["source_refs"]], [3])
 
+    def test_refresh_keeps_cross_platform_and_unvisited_capture_history(self):
+        douyin = {"target_key":"same","platform":"douyin"}
+        xhs = {"target_key":"same","platform":"xiaohongshu"}
+        older = dict(douyin, target_key="other", captured_at="earlier")
+        later = dict(older, captured_at="later")
+        fresh = dict(douyin, captured_at="fresh")
+        original = [xhs, douyin, older, later]
+        previous = {"same":douyin, "other":later}
+        self.assertEqual(dy.saved_observations(original, previous, {**previous,"same":fresh}),
+                         [xhs, older, later, fresh])
+
     def test_empty_recheck_creates_empty_evidence_without_browser_and_protects_first_pass(self):
         self.write([("a","失败")])
         args = ["capture", "--expected", str(self.source), "--output", str(self.output)]

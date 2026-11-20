@@ -12,15 +12,15 @@ import sys
 import unicodedata
 import zipfile
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 try:
-    from .review_comments import canonical_type
+    from .review_comments import canonical_type, requires_specified_image
 except ImportError:
-    from review_comments import canonical_type
+    from review_comments import canonical_type, requires_specified_image
 
 
 FIELD_ALIASES = {
@@ -36,6 +36,7 @@ FIELD_ALIASES = {
     "prior_amount": ["核定金额", "结算金额", "审核金额", "核验金额", "复核金额", "审定金额"],
     "reply_text": ["reply_text", "replytext", "需要回复评论内容左边填写回第几条", "需要回复评论内容", "回复评论内容", "回复内容"],
     "image_requirement": ["image_requirement", "imagerequirement", "评论图片需求", "图片需求"],
+    "required_image_sha256": ["required_image_sha256", "指定图片SHA256", "指定图SHA256"],
     "product_name": ["product_name", "productname", "产品名", "产品"],
     "group_leader": ["group_leader", "groupleader", "团长", "团"],
     "leader_contact": ["leader_contact", "leadercontact", "团长联系方式", "联系方式"],
@@ -56,9 +57,11 @@ PRIOR_CATEGORIES = {
 
 class WorksheetRows(list):
     """Worksheet records together with the physical columns of their headers."""
-    def __init__(self, rows, columns):
+    def __init__(self, rows, columns, occupied, data_columns):
         super().__init__(rows)
         self.columns = columns
+        self.occupied = occupied
+        self.data_columns = data_columns
 
 
 class MissingTaskColumns(ValueError):
@@ -324,8 +327,13 @@ def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[s
     max_col = max((max(row.keys()) for row in matrix if row), default=-1)
     headers = [matrix[0].get(index, "") for index in range(max_col + 1)]
     columns = {header: column_letters(index) for index, header in enumerate(headers) if header}
+    data_columns = {column_letters(i) for row in matrix[1:] for i, value in row.items() if value != ""}
+    occupied = data_columns | set(columns.values())
+    for merged in merged_ranges:
+        start, end = (merged.split(":") + [merged])[:2]
+        occupied.update(column_letters(i) for i in range(col_index(start), col_index(end) + 1))
     return WorksheetRows(({header: row.get(index, "") for index, header in enumerate(headers) if header}
-                          for row in matrix[1:]), columns)
+                          for row in matrix[1:]), columns, occupied, data_columns)
 
 
 def read_rows(path: Path, sheet_name: Optional[str], *, target_url_header: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -365,12 +373,32 @@ def extract_url(value: Any) -> str:
     return match.group(0).rstrip(".,，。!?！？") if match else ""
 
 
+def douyin_video_id(url: str) -> Optional[str]:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    if host != "douyin.com" and not host.endswith(".douyin.com"):
+        return None
+    path_id = re.fullmatch(r"/(?:share/)?(?:video|note|slides)/([0-9]+)/?", parsed.path)
+    ids = set(parse_qs(parsed.query, keep_blank_values=True).get("modal_id", []))
+    if path_id:
+        ids.add(path_id[1])
+    if not ids:
+        return None
+    if len(ids) != 1 or not re.fullmatch("[0-9]+", next(iter(ids))):
+        raise ValueError("ambiguous_or_invalid_douyin_video_id")
+    return ids.pop()
+
+
 def sanitize_url(value: Any) -> str:
     url = extract_url(value)
     if not url:
         return ""
     parsed = urlsplit(url)
-    # Query strings may contain access tokens; they are not needed as a stable target identity.
+    if parsed.query and "modal_id" in parse_qs(parsed.query, keep_blank_values=True):
+        video_id = douyin_video_id(url)
+        if video_id:
+            return f"https://www.douyin.com/video/{video_id}"
+    # Private share parameters do not belong in the stable target identity.
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
@@ -388,10 +416,10 @@ def target_key_from_url(value: Any) -> str:
 
 
 def infer_platform(value: Any) -> str:
-    text = str(value or "").casefold()
-    if "xiaohongshu.com" in text or "xhslink.com" in text or "xhslink.cn" in text:
+    host = (urlsplit(str(value or "")).hostname or "").casefold()
+    if any(host == domain or host.endswith("." + domain) for domain in ("xiaohongshu.com", "xhslink.com", "xhslink.cn")):
         return "xiaohongshu"
-    if "douyin.com" in text:
+    if host == "douyin.com" or host.endswith(".douyin.com"):
         return "douyin"
     return ""
 
@@ -457,6 +485,35 @@ def resolve_mapping(headers: Iterable[str], explicit: Dict[str, str]) -> Dict[st
     return result
 
 
+def audit_headers(headers, mapping):
+    result = mapping.get("prior_result")
+    dedicated = mapping.get("prior_amount")
+    generic = resolve_mapping([h for h in headers if norm_header(h).startswith(
+        ("金额", "返现金额", "核对金额", "amount"))], {}).get("expected_amount")
+    return result, dedicated, generic
+
+
+def first_pass_columns(columns, occupied, data_columns, mapping):
+    """Use the mapped output headers; never use a populated source quote as the settlement column."""
+    result_header, amount_header, generic = audit_headers(columns, mapping)
+    if not amount_header and columns.get(generic) not in data_columns:
+        amount_header = generic
+    occupied = set(occupied)
+    def allocate(preferred):
+        if preferred in occupied:
+            index = max((col_index(col) for col in occupied), default=-1) + 1
+            if index >= 16384:
+                raise ValueError("no_room_for_audit_column")
+            preferred = column_letters(index)
+        occupied.add(preferred)
+        return preferred
+    return {
+        "result_column": columns.get(result_header) or allocate("G"),
+        "amount_column": columns.get(amount_header) or allocate("H"),
+        "new_result": result_header is None, "new_amount": amount_header is None,
+    }
+
+
 def convert(
     rows: List[Dict[str, Any]],
     explicit: Dict[str, str],
@@ -475,15 +532,12 @@ def convert(
         if header not in headers:
             raise ValueError(f"Mapped column not found in {source_sheet or source_name}: {field}={header}")
     mapping = resolve_mapping(headers, explicit)
-    result_header = mapping.pop("prior_result", None)
-    settled_header = mapping.pop("prior_amount", None)
+    result_header, dedicated_amount, generic_amount = audit_headers(headers, mapping)
+    settled_header = dedicated_amount or generic_amount
+    first_mapping = mapping.copy()
+    mapping.pop("prior_result", None)
+    mapping.pop("prior_amount", None)
     price_header = mapping.get("expected_amount")
-    if settled_header is None:
-        # Older templates use the same amount column for the original unit
-        # price and the later approved amount. A dedicated quotation is distinct.
-        generic = resolve_mapping([h for h in headers if norm_header(h).startswith(
-            ("金额", "返现金额", "核对金额", "amount"))], {}).get("expected_amount")
-        settled_header = generic
     is_xlsx = source_name.lower().endswith(".xlsx")
     columns = getattr(rows, "columns", {})
     if "group_leader" in mapping and norm_header(mapping["group_leader"]) == norm_header("负责人"):
@@ -496,7 +550,7 @@ def convert(
     missing = []
     if "target_key" not in mapping and "target_url" not in mapping:
         missing.append("target_key or target_url")
-    if not {"comment_text", "reply_text", "image_requirement"}.intersection(mapping):
+    if not {"comment_text", "reply_text", "image_requirement", "required_image_sha256"}.intersection(mapping):
         type_header = mapping.get("comment_type")
         if not type_header or not any(str(row.get(type_header) or "").strip() for row in rows):
             missing.append("comment_text, reply_text, image_requirement or populated comment_type")
@@ -509,7 +563,7 @@ def convert(
     previous_product_name = ""
     relevant_sources = [
         mapping[field]
-        for field in ("target_key", "target_url", "comment_text", "comment_type", "expected_amount", "reply_text", "image_requirement")
+        for field in ("target_key", "target_url", "comment_text", "comment_type", "expected_amount", "reply_text", "image_requirement", "required_image_sha256")
         if field in mapping
     ]
     for row_number, row in enumerate(rows, start=2):
@@ -601,7 +655,7 @@ def convert(
         if str(image_value).strip():
             item["image_requirement"] = str(image_value).strip()
         explicit_type = canonical_type(item.get("comment_type"))
-        item["has_image"] = looks_like_image_requirement(image_value) or explicit_type in ("image", "text+image")
+        item["has_image"] = looks_like_image_requirement(image_value) or explicit_type in ("image", "text+image") or requires_specified_image(item)
         if "comment_type" not in item or not str(item["comment_type"]).strip():
             if item["comment_text"] and item["has_image"]:
                 item["comment_type"] = "text+image"
@@ -640,15 +694,23 @@ def convert(
                 rate = "partial_text_amount" if category == "文字成功" else "partial_image_amount"
                 item.setdefault(rate, amount)
         output.append(item)
-    if is_xlsx and not detect_prior_in_workbook:
-        discard_unused_prior(output)
+    if is_xlsx:
+        if isinstance(rows, WorksheetRows) and output and not any(row["prior_review"]["category"] for row in output):
+            layout = first_pass_columns(columns, rows.occupied, rows.data_columns, first_mapping)
+            for row in output:
+                row["audit_columns"] = layout
+        if not detect_prior_in_workbook:
+            discard_unused_prior(output)
     return output
 
 
 def discard_unused_prior(rows):
     """An empty result column or template placeholders do not make this a recheck."""
-    if not any(row["prior_review"]["category"] for row in rows):
-        for row in rows:
+    has_prior = any(row["prior_review"]["category"] for row in rows)
+    for row in rows:
+        if has_prior:
+            row.pop("audit_columns", None)
+        else:
             row.pop("prior_review")
 
 

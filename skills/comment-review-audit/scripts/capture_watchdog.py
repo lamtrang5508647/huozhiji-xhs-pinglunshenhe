@@ -28,6 +28,22 @@ def visible_progress() -> None:
             receipt.write(b".")
 
 
+def owner_confirmation_input():
+    marker = os.environ.get(PROGRESS_ENV)
+    if not marker:
+        return input()
+    waiting = Path(marker).with_name("waiting-for-owner")
+    waiting.touch()
+    try:
+        return input()
+    finally:
+        # Reset the idle budget before the supervisor can observe the prompt as closed.
+        try:
+            visible_progress()
+        finally:
+            waiting.unlink(missing_ok=True)
+
+
 def paced_sleep(seconds: float) -> None:
     marker = os.environ.get(PROGRESS_ENV)
     if marker and math.isfinite(seconds) and seconds > 0:
@@ -58,6 +74,7 @@ def supervise(command, checkpoint: Path, idle_seconds: float, *, stdout=None) ->
     with tempfile.TemporaryDirectory(prefix="capture-progress-") as directory:
         marker = Path(directory, "progress")
         pause = Path(directory, "pause-until")
+        owner_prompt = Path(directory, "waiting-for-owner")
         last = checkpoint_version(checkpoint), checkpoint_version(marker)
         env = child_environment({PROGRESS_ENV: str(marker.resolve())})
         process = subprocess.Popen(command, env=env, stdout=stdout, **process_group_options())
@@ -65,7 +82,7 @@ def supervise(command, checkpoint: Path, idle_seconds: float, *, stdout=None) ->
             deadline = time.monotonic() + idle_seconds
             while process.poll() is None:
                 current = checkpoint_version(checkpoint), checkpoint_version(marker)
-                if current != last:
+                if current != last or owner_prompt.exists():
                     last = current
                     deadline = time.monotonic() + idle_seconds
                 try:

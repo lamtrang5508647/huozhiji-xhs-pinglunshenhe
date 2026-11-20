@@ -104,7 +104,7 @@ def test_shared_settlement():
     rows = [dict(exact, case_id=f"{p}-{t}", platform=p, target_key=t) for p,t in places]
     source = [dict(capture, platform=p, target_key=t, comments=[first]) for p,t in places]
     assert all(r["status"] == "verified" for r in compare(rows, source, require_reply_parent=True)["results"])
-    blank = [dict(exact, case_id=str(i), comment_text=body) for i, body in enumerate(["", "！", "[笑R]"])]
+    blank = [dict(exact, case_id=str(i), comment_text=body) for i, body in enumerate(["", "！", "……"])]
     result = compare(blank + [exact], [{**capture, "comments": [first]}], amount_mode="expected-only", require_reply_parent=True)["results"]
     assert all(r["reason_codes"] == ["invalid_or_contradictory_comment_type"] for r in result[:-1])
     assert result[-1]["approved_amount"] == "2.00"

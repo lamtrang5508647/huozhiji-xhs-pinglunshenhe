@@ -72,6 +72,17 @@ class BriefCliTests(unittest.TestCase):
         self.observations.write_text(json.dumps(evidence), encoding="utf-8")
         self.assertEqual(self.invoke(*args, code=2)["summary"]["audit_pass"]["reviewed_triage_counts"]["失败"], 1)
 
+    def test_full_audit_rejects_output_collisions_before_writing(self):
+        for report in (self.source, self.observations, self.audited):
+            with self.subTest(report=report):
+                source = self.source.read_bytes()
+                evidence = self.observations.read_bytes()
+                self.invoke("audit", "--source", self.source, "--observations", self.observations,
+                            "--output", self.audited, "--report", report, code=1)
+                self.assertEqual(self.source.read_bytes(), source)
+                self.assertEqual(self.observations.read_bytes(), evidence)
+                self.assertFalse(self.audited.exists())
+
     def test_brief_requires_full_evidence_destination_before_processing(self):
         for args, flag in ((["convert", "--source", self.source], "--output"),
                            (["review", "--expected", self.expected, "--observations", self.observations], "--output"),

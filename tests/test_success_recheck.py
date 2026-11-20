@@ -26,6 +26,27 @@ def capture(*comments):
 
 
 class SuccessRecheckTests(unittest.TestCase):
+    def test_undatable_fragments_only_merge_when_no_dated_visit_exists(self):
+        matched = capture({"text": "评论2", "comment_id": "c", "has_image": False})
+        latest = dict(capture(), captured_at="2026-01-02T00:10:00Z")
+        old = dict(matched, captured_at="2026-01-01T18:00:00Z")
+        row = task(2, "成功")
+        for fragment in (matched, dict(matched, captured_at="bad-date"), dict(matched, captured_at="2026-01-03")):
+            for group in ([latest, fragment, old], [fragment, old, latest]):
+                self.assertEqual(compare_audit_rows([row], group)["results"][0]["triage"], "失败")
+        concurrent = dict(matched, captured_at="2026-01-02T08:10:00+08:00")
+        self.assertEqual(compare_audit_rows([row], [latest, capture(), concurrent])["results"][0]["triage"], "成功")
+        self.assertEqual(compare_audit_rows([row], [capture(), matched])["results"][0]["triage"], "成功")
+
+    def test_newer_dated_snapshot_controls_offline_recheck(self):
+        row = task(2, "成功")
+        prior = dict(capture({"text":"评论2","comment_id":"c","has_image":False}), captured_at="2026-01-02T08:00:00+08:00")
+        latest = dict(capture(), captured_at="2026-01-02T00:10:00Z")
+        for recent, verdict in [(latest, "失败"), (dict(latest, capture_complete=False), "待人审")]:
+            for evidence in ([prior, recent], [recent, prior]):
+                result = compare_audit_rows([row], evidence)["results"][0]
+                self.assertEqual(result["triage"], verdict)
+
     def test_same_note_and_separate_note_only_recheck_success(self):
         rows = [task(2, "成功"), task(3, "失败", amount="12"), task(4, "成功"), task(5, "", amount="11"),
                 task(6, "待人审"), task(7, "未提交", target_key="other")]

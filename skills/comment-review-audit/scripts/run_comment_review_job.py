@@ -26,7 +26,7 @@ from profile_lock import default_profile
 from review_comments import compare, unwrap_rows
 from runtime_environment import child_environment, configure_stdio
 from table_to_expected import convert_xlsx_sheets, parse_amount_rules, parse_maps
-from xhs_batch_capture import capture_covers_tasks, group_note_requirements, has_visible_comment, plan_targets, target_from_url
+from xhs_batch_capture import SINGLE_NOTE_PAGE_STATES, capture_covers_tasks, group_note_requirements, has_visible_comment, plan_targets, target_from_url
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -79,16 +79,26 @@ def last_capture(observations, target):
                  and str(item.get("target_key")) == target), None)
 
 
+def latest_note_observations(checkpoint):
+    # Planning uses the last capture written for each note. Use exactly that same view
+    # when judging the live job, including on resume from older multi-snapshot files.
+    captures = unwrap_rows(checkpoint, "observations")
+    return list({(c.get("platform"), str(c.get("target_key"))): c for c in captures}.values())
+
+
 def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=(), *, context_rows=None) -> bool:
     return capture_covers_tasks(last_capture(observations, target_key), target_key, rows, context_rows=context_rows)
 
 
-def readable_recheck_probe(item, key, rows, started_at):
-    """A fresh, identity-checked panel can establish session health without proving task absence."""
+def readable_recheck_probe(item, key, rows, started_at, *, recheck=True):
+    """Identify a fresh target-specific visit, independent of whether its tasks were resolved."""
     if (not item or item.get("platform") != "xiaohongshu" or item.get("target_key") != key
-            or item.get("capture_status") != "ok" or item.get("parser_revision") != PARSER_REVISIONS["xiaohongshu"]
-            or item.get("visible_comment_panel_readable") is not True
-            or not has_visible_comment(item.get("comments") or [])):
+            or item.get("parser_revision") != PARSER_REVISIONS["xiaohongshu"]):
+        return False
+    local_problem = item.get("capture_status") == "inaccessible" and item.get("target_page_state") in SINGLE_NOTE_PAGE_STATES
+    readable = (recheck and item.get("capture_status") == "ok" and item.get("visible_comment_panel_readable") is True
+                and has_visible_comment(item.get("comments") or []))
+    if not (local_problem or readable):
         return False
     resolved = item.get("resolved_target_key")
     if not resolved:
@@ -184,7 +194,7 @@ def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, alre
                                 if c.get("capture_status") in ("captcha", "session_expired", "risk_control")), {})
                 checkpoint["stop_target_key"] = stopped.get("target_key")
             write_state(path, checkpoint)
-    return checkpoint, compare(rows, checkpoint["observations"], amount_mode="expected-only", reply_context_rows=context_rows)
+    return checkpoint, compare(rows, latest_note_observations(checkpoint), amount_mode="expected-only", reply_context_rows=context_rows)
 
 
 def discover_node_modules(explicit: str | None) -> str:
@@ -237,7 +247,7 @@ def main() -> int:
     parser.add_argument("--amount-rules")
     parser.add_argument("--profile", default=str(default_profile("xhs")))
     parser.add_argument("--capture-idle-timeout", type=positive_seconds, default=DEFAULT_IDLE_SECONDS, metavar="SECONDS",
-                        help="Stop an unattended capture after this long without new evidence (default: 300)")
+                        help="Stop capture after this long without progress, excluding owner input and scheduled breaks (default: 300)")
     parser.add_argument("--node-modules")
     parser.add_argument("--workbook-engine", choices=("portable", "artifact"), default="portable",
                         help="Portable stdlib OOXML export (default); artifact enables host rendering")
@@ -276,6 +286,9 @@ def main() -> int:
         if not rows:
             raise ValueError("expected_rows_empty")
         active = rows_to_review(rows)
+        if any(r.get("platform") != "xiaohongshu" for r in active):
+            raise ValueError("run supports Xiaohongshu tasks only: use the appropriate capture-xhs and "
+                             "capture-douyin commands, merge observations, then run audit on the workbook")
         scope = recheck_scope(rows)
         if scope:
             if prior.get("status") == "complete" and not prior.get("recheck_id") and output.exists():
@@ -347,8 +360,7 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
         capture_base.append("--risk-averse")
     if args.wait_for_confirmation:
         capture_base.append("--wait-for-confirmation")
-    else:
-        capture_base = [sys.executable, str(SCRIPT_DIR / "capture_watchdog.py"), str(args.capture_idle_timeout), *capture_base]
+    capture_base = [sys.executable, str(SCRIPT_DIR / "capture_watchdog.py"), str(args.capture_idle_timeout), *capture_base]
     already_retried = set()
     probed_partial = set()
 
@@ -362,8 +374,8 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
         item = last_capture(unwrap_rows(updated, "observations"), key)
         healthy = not updated.get("stopped") and capture_covers_tasks(
             item, key, requirements.get(key), context_rows=contexts.get(key))
-        if (not healthy and pass_state.get("recheck_id") and not updated.get("stopped")
-                and readable_recheck_probe(item, key, requirements.get(key, ()), started)):
+        if (not healthy and not updated.get("stopped") and readable_recheck_probe(
+                item, key, requirements.get(key, ()), started, recheck=bool(pass_state.get("recheck_id")))):
             # This visit already read the page. Defer any missing tasks to the bounded final retry.
             probed_partial.add(key)
             healthy = True
@@ -396,7 +408,7 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
         run_capture(command)
         checkpoint = read_checkpoint(observations)
 
-    payload = compare(rows, unwrap_rows(checkpoint, "observations"), amount_mode="expected-only", reply_context_rows=context_rows)
+    payload = compare(rows, latest_note_observations(checkpoint), amount_mode="expected-only", reply_context_rows=context_rows)
     checkpoint, payload = retry_incomplete_notes(rows, checkpoint, payload, observations, capture_base, already_retried,
                                                 context_rows=context_rows)
     return payload

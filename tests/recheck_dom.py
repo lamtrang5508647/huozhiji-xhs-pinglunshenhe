@@ -55,3 +55,15 @@ def exercise_recheck_dom(page, collector):
     ):
         hit, _, clicked = capture(tasks, visible, more, strict=strict)
         assert clicked and hit.get("capture_stop_reason") is None
+
+    # The note's initial state and the actually rendered comment list can disagree.
+    cached = [{"id":"old", "content":"target"}]
+    args = Namespace(expand_dom=True, dom_max_rounds=0, incomplete_dom_retry_rounds=0)
+    for visible, verdict in ((card("new", "different"), "待人审"),
+                             (card("new", "different") + "<span>没有更多评论</span>", "失败"),
+                             (card("new", "target"), "成功")):
+        page.set_content('<div class="comments-container">' + visible + '</div>')
+        observed, _, _ = collector.check_note_comments(page, "note", cached, 1, [row], args)
+        verdicts = collector.compare([row], [observed], amount_mode="expected-only")["results"]
+        assert verdicts[0]["triage"] == verdict
+        assert all(record["comment_id"] != "old" for record in observed["comments"])

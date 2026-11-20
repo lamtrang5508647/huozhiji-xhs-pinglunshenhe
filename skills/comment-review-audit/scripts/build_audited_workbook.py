@@ -26,9 +26,11 @@ from xml.etree import ElementTree as ET
 try:
     from .audit_validation import validate_results
     from .review_comments import parse_amount
+    from .table_to_expected import first_pass_columns, read_xlsx, resolve_mapping
 except ImportError:
     from audit_validation import validate_results
     from review_comments import parse_amount
+    from table_to_expected import first_pass_columns, read_xlsx, resolve_mapping
 
 S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -36,6 +38,7 @@ P = "http://schemas.openxmlformats.org/package/2006/relationships"
 CT = "http://schemas.openxmlformats.org/package/2006/content-types"
 HEADERS = ["团长", "产品名", "涉及工作表数", "总条数", "成功数", "失败数", "需人审数", "成功率", "报销金额", "涉及工作表", "团长联系方式", "跟团长结算时间", "结算凭证", "二维码"]
 SETTLEMENT_NOTES = {
+    "pending_specified_image": "指定图片尚未核实，金额暂缓核定",
     "pending_duplicate_claim": "多行共用评论证据，金额暂缓核定",
     "pending_source_amount": "原表缺少可用报价，金额暂缓核定",
 }
@@ -247,9 +250,15 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         root = ET.fromstring(parts[path])
         data = root.find(tag("sheetData"))
         active_rows = {row["source_row"] for row in selected if by_id[row["case_id"]].get("status") != "carried_forward"}
-        first_prior = selected[0].get("prior_review", {})
-        category_column = first_prior.get("result_column", "G")
-        amount_column = first_prior.get("amount_column", "H")
+        layout = selected[0].get("prior_review") or selected[0].get("audit_columns")
+        if layout is None:
+            # Standalone writer callers can supply contracts created before column metadata existed.
+            table = read_xlsx(source, name)
+            columns = getattr(table, "columns", {})
+            layout = first_pass_columns(columns, getattr(table, "occupied", set()),
+                                        getattr(table, "data_columns", set()), resolve_mapping(columns, {}))
+        category_column = layout["result_column"]
+        amount_column = layout["amount_column"]
         if active_rows and not amount_column:
             highest = max((col_index(c.get("r")) for c in data.iter(tag("c"))), default=0)
             if highest >= 16384:
@@ -303,9 +312,9 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
             merges.set("count", str(len(merges)))
             if not len(merges):
                 root.remove(merges)
-        if not first_prior:
-            write_cell("G1", "审核结果")
-        elif first_prior.get("amount_column") is None:
+        if layout.get("new_result"):
+            write_cell(f"{category_column}1", "审核结果")
+        if layout.get("new_amount") or layout.get("amount_column") is None:
             write_cell(f"{amount_column}1", "核定金额")
         for item in selected:
             result = by_id[item["case_id"]]
