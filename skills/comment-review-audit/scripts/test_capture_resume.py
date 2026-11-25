@@ -33,7 +33,7 @@ def main():
         source=Path(temp)/'fixture.json'
         source.write_text(json.dumps({"rows":[dict(platform="douyin",target_key="a",target_url="https://www.douyin.com/video/a")]}))
         with patch.object(dy,'sync_playwright',side_effect=AssertionError('browser should not open')), \
-             patch('sys.argv',['capture','--expected',str(source),'--output',str(checkpoint)]):
+             patch('sys.argv',['capture','--expected',str(source),'--output',str(checkpoint),'--no-screenshots']):
             assert dy.main()==0
         xhs_good={**good,'platform':'xiaohongshu','parser_revision':PARSER_REVISIONS['xiaohongshu']}
         with patch.object(xhs,'capture_task_groups',return_value=[]), \
@@ -41,7 +41,7 @@ def main():
              patch.object(xhs,'load_xhs_modules',side_effect=AssertionError('browser should not open')):
             for original in ({'observations':[xhs_good]}, [good, xhs_good]):
                 checkpoint.write_text(json.dumps(original))
-                assert xhs.main(['--input','fixture.xlsx','--output',str(checkpoint)])==0
+                assert xhs.main(['--input','fixture.xlsx','--output',str(checkpoint),'--no-screenshots'])==0
                 assert json.loads(checkpoint.read_text()) == original
         others = [good, {**xhs_good,'target_key':'b'}, {**xhs_good,'target_key':'b'}]
         last = {**xhs_good,'captured_comment_count':2}

@@ -4,7 +4,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 function parseArgs(argv) {
   const result = {};
@@ -504,7 +505,25 @@ await renderAllSheets(
 
 await fs.mkdir(path.dirname(args.output), { recursive: true });
 const exported = await SpreadsheetFile.exportXlsx(workbook);
-await exported.save(args.output);
+const needsIndex = results.some(row => "screenshot_status" in row || "comment_screenshots" in row)
+  || [...sourceSheetNames].some(name => /^评论(?:截图|原图)(?:（\d+）)?$/.test(name));
+if (needsIndex) {
+  // The embedded finance gallery and internal XLSX links are shared with the portable writer.
+  const temporary = await fs.mkdtemp(path.join(path.dirname(args.output), ".audit-images-"));
+  try {
+    const intermediate = path.join(temporary, "export.xlsx");
+    await exported.save(intermediate);
+    const python = process.env.AUDIT_PYTHON || (process.platform === "win32" ? "python" : "python3");
+    const helper = fileURLToPath(new URL("./workbook_screenshots.py", import.meta.url));
+    const options = [helper, "--workbook", intermediate, "--source", args.source, "--output", args.output, "--expected", args.expected, "--report", args.report];
+    if (args["screenshot-base"]) options.push("--screenshot-base", args["screenshot-base"]);
+    execFileSync(python, options, { stdio: "inherit", windowsHide: true });
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+} else {
+  await exported.save(args.output);
+}
 
 const triage = countBy(results, derivedTriage, results.some((r) => r.triage === "未复核") ? ["成功", "失败", "待人审", "未复核"] : ["成功", "失败", "待人审"]);
 const comboRows = results.filter((item) => item.expected_type === "text+image");

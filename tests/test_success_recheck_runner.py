@@ -44,8 +44,8 @@ class SuccessRecheckRunnerTests(unittest.TestCase):
     def make_first_pass(self):
         audit_workbook(self.raw, self.evidence, self.audited)
 
-    def invoke(self, collector):
-        argv = ["job", "--source", str(self.audited), "--work-dir", str(self.job)]
+    def invoke(self, collector, *options):
+        argv = ["job", "--source", str(self.audited), "--work-dir", str(self.job), *options]
         with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=collector):
             return runner.main()
 
@@ -126,7 +126,7 @@ class SuccessRecheckRunnerTests(unittest.TestCase):
                     if not initially_complete and not keys:
                         next(item for item in evidence if item["target_key"] == "n4")["capture_complete"] = False
                     runner.write_state(dest, {"observations": evidence, "recheck_scope": recheck_scope(rows)})
-                self.assertEqual(self.invoke(collect), 0)
+                self.assertEqual(self.invoke(collect, "--no-screenshots"), 0)
                 report = runner.read_checkpoint(self.job / "review-report.json")
                 self.assertEqual(report["results"], expected_results)
                 self.assertEqual(calls, [["n1"], []] + ([] if initially_complete else [["n4"]]))
@@ -189,7 +189,7 @@ class SuccessRecheckRunnerTests(unittest.TestCase):
         seen = [dict(item, captured_at=now, parser_revision=PARSER_REVISIONS["xiaohongshu"])
                 for item in self.evidence["observations"] if item["target_key"] in active]
         runner.write_state(output, {"observations": seen, "recheck_scope": recheck_scope(rows)})
-        args = ["--input", str(self.audited), "--expected", str(expected), "--output", str(output), "--task-targets"]
+        args = ["--input", str(self.audited), "--expected", str(expected), "--output", str(output), "--task-targets", "--no-screenshots"]
         with patch.object(xhs, "load_xhs_modules", side_effect=AssertionError("unexpected browser")):
             for note in ("n1", "n3"):
                 self.assertEqual(xhs.main(args + ["--only-note-id", note]), 0)

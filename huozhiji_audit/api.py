@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Any
 
 from ._engine import review_comments, table_to_expected
-from ._engine.audit_pass import compare_audit_rows
+from ._engine.audit_pass import compare_audit_rows, current_recheck_captures
 from ._engine.audit_validation import validate_results
+from ._engine.screenshot_evidence import attach_screenshots
 
 
 def convert_table(source: str | Path, *, mapping: dict[str, str] | None = None,
@@ -47,11 +48,16 @@ def review(expected: list[dict] | dict, observations: list[dict] | dict, *,
 def audit_workbook(source: str | Path, observations: list[dict] | dict, output: str | Path,
                    *, mapping: dict[str, str] | None = None,
                    amount_rules: dict[str, str] | None = None,
-                   require_reply_parent: bool = False) -> dict[str, Any]:
+                   require_reply_parent: bool = False, evidence_base: str | Path | None = None) -> dict[str, Any]:
     """Convert + compare supplied observations + export; not a live platform capture."""
     from ._engine.build_audited_workbook import build_workbook
 
     expected = convert_table(source, mapping=mapping, amount_rules=amount_rules)
     report = review(expected, observations, require_reply_parent=require_reply_parent)
-    report["workbook"] = build_workbook(Path(source), expected["rows"], report["results"], Path(output))
+    captures = review_comments.unwrap_rows(observations, "observations")
+    if report["summary"]["audit_pass"]["mode"] == "success_recheck":
+        captures = list(current_recheck_captures(captures))
+    base = evidence_base or Path(output).resolve().parent
+    attach_screenshots(report, captures, base)
+    report["workbook"] = build_workbook(Path(source), expected["rows"], report["results"], Path(output), screenshot_base=base)
     return report

@@ -27,7 +27,7 @@ class CurrentVisibilityTests(unittest.TestCase):
                          parser_revision=PARSER_REVISIONS["xiaohongshu"])
             newer = dict(captures[0], comments=[])
             job.write_state(folder / "observations.json", {"observations": [*captures, newer]})
-            with patch.object(sys, "argv", ["job","--source",str(book),"--work-dir",directory]), \
+            with patch.object(sys, "argv", ["job","--source",str(book),"--work-dir",directory,"--no-screenshots"]), \
                  patch.object(job,"run_capture", side_effect=AssertionError("checkpoint already complete")):
                 self.assertEqual(job.main(), 0)
             report = job.read_checkpoint(folder / "review-report.json")

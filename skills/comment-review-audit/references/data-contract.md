@@ -151,3 +151,6 @@ Every row has both `result_category` and `triage`.
 The report preserves `source_file`, `source_sheet`, `source_row`, `reason_codes`, compact candidate metadata, and capture evidence whenever available.
 
 Text normalization treats an ASCII prose full stop like Chinese punctuation but retains periods between digits, so `1.5` never matches `15` merely through punctuation normalization.
+### Comment screenshots for finance
+
+An observation can include `screenshot_status` (`captured`, `partial`, or `missing`) and a `comment_screenshots` array. Each image has a relative PNG `path`, `sha256`, `kind`, `captured_at`, and the `comment_ids` actually visible in that image. A target comment may also be bound by visible text or its captured evidence path. Store the screenshot folder beside its observations JSON. When merging multiple observation files, use the bundled merge command to carry referenced images into the merged evidence directory. XLSX export checks image hashes and embeds the verified PNG bytes in the workbook. Finance can open just the workbook on another computer. When a custom capture directory is outside the observations folder, pass the same directory to `audit --screenshot-dir`. Rows carried forward from an earlier audit have no new screenshot claim.

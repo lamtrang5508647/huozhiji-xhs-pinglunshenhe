@@ -24,6 +24,7 @@ from xhs_capture import add_reply_relation, classify_failure, clean_comment_id, 
 from capture_pacing import has_remaining_target, pause_seconds
 from capture_watchdog import owner_confirmation_input, paced_sleep, visible_progress
 from capture_resume import EMPTY_STATE_LABEL, EMPTY_STATE_SOURCE, fresh_capture, recheck_scope, PARSER_REVISIONS
+from screenshot_evidence import NoteScreenshots, screenshots_valid
 from audit_pass import rows_to_review
 from review_comments import compare, platform_key, target_key, unwrap_rows
 from xhs_persistent import persistent_client
@@ -526,6 +527,9 @@ def prefer_comment_snapshot(current, incoming, *, visible_complete=False):
 
 
 MORE_REPLIES = re.compile(r"^\s*(?:展开\s*(?:剩余\s*)?(?:\d+|更多)\s*条?\s*(?:回复|评论)|(?:查看|加载)更多(?:回复|评论)|更多回复|查看(?:被)?折叠(?:的)?评论)\s*$")
+END_TEXT = re.compile(r"^\s*(?:-\s*THE END\s*-|没有更多评论|暂时没有更多评论)\s*$", re.I)
+EMPTY_TEXT = re.compile(r"^\s*(?:暂无评论|(?:暂时)?还没有评论(?:哦)?|还没有人评论)(?:[～~。！!])?\s*$")
+OUTSIDE_CARDS = ':visible:not(.comment-item):not(.comment-item *):not(.reply-container):not(.reply-container *)'
 
 
 def reply_controls(container):
@@ -540,15 +544,12 @@ def visible_terminal(container: Any) -> bool:
         .some(node => !node.closest('.content, .note-text, .comment-picture') &&
             node.getClientRects().length && getComputedStyle(node).visibility === 'visible')"""):
         return False
-    marker = re.compile(r"^\s*(?:-\s*THE END\s*-|没有更多评论|暂时没有更多评论)\s*$", re.I)
     # A comment (or reply thread) can itself contain the same words as a footer.
-    outside_comments = container.locator(
-        ':visible:not(.comment-item):not(.comment-item *):not(.reply-container):not(.reply-container *)')
-    if container.get_by_text(marker).and_(outside_comments).count():
+    outside_comments = container.locator(OUTSIDE_CARDS)
+    if container.get_by_text(END_TEXT).and_(outside_comments).count():
         return True
-    empty = re.compile(r"^\s*(?:暂无评论|(?:暂时)?还没有评论(?:哦)?|还没有人评论)(?:[～~。！!])?\s*$")
     return (not container.locator(".comment-item:visible").count()
-            and container.get_by_text(empty).and_(outside_comments).count() > 0)
+            and container.get_by_text(EMPTY_TEXT).and_(outside_comments).count() > 0)
 
 
 def group_note_requirements(rows):
@@ -587,8 +588,10 @@ def needs_reply_recheck(rows, observation, context_rows=None):
     return bool(unconfirmed_replies(rows, observation, context_rows))
 
 
-def capture_covers_tasks(observation, key, rows, *, require_reply_parent=False, context_rows=None):
+def capture_covers_tasks(observation, key, rows, *, require_reply_parent=False, context_rows=None, screenshot_dir=None):
     if not fresh_capture(observation, "xiaohongshu", key):
+        return False
+    if screenshot_dir is not None and not screenshots_valid(observation, screenshot_dir):
         return False
     if observation.get("capture_complete") is True:
         if require_reply_parent:
@@ -621,12 +624,12 @@ def settled_recheck_matches(results):
     )
 
 
-def plan_targets(targets, existing, requirements, refresh=False, *, require_reply_parent=False, contexts=None):
+def plan_targets(targets, existing, requirements, refresh=False, *, require_reply_parent=False, contexts=None, screenshot_dir=None):
     if refresh:
         return list(targets)
     return [target for target in targets if not capture_covers_tasks(
         existing.get(target["note_id"]), target["note_id"], requirements.get(target["note_id"]),
-        require_reply_parent=require_reply_parent, context_rows=(contexts or {}).get(target["note_id"]))]
+        require_reply_parent=require_reply_parent, context_rows=(contexts or {}).get(target["note_id"]), screenshot_dir=screenshot_dir)]
 
 
 def saved_observations(original, previous, existing):
@@ -679,7 +682,7 @@ def apply_risk_averse_profile(args: argparse.Namespace) -> None:
     args.warmup_max = max(args.warmup_max, 35.0)
 
 
-def read_visible_comments(container):
+def read_visible_comments(container, photos=None):
     items = container.locator(".comment-item")
     extract = "items => items.map(item => { try { return (" + DOM_COMMENT_FIELDS + ")(item); } catch { return null; } })"
     try:
@@ -687,9 +690,10 @@ def read_visible_comments(container):
     except Exception:
         return [], False
     comments = []
+    positioned = []
     identities = {}
     parsed = True
-    for fields in records:
+    for index, fields in enumerate(records):
         if fields is None:
             parsed = False
             continue
@@ -708,6 +712,11 @@ def read_visible_comments(container):
                 continue
             identities[identifier] = comment
         comments.append(comment)
+        if photos is not None:
+            positioned.append((index, comment))
+    if photos is not None:
+        photos.cards(container, items, [(i, c) for i, c in positioned
+                                      if not c.get("comment_id") or identities[c["comment_id"]] is not None])
     return [c for c in comments if not c.get("comment_id") or identities[c["comment_id"]] is not None], parsed
 
 
@@ -720,14 +729,202 @@ def has_visible_comment(records):
                for c in records)
 
 
+class CommentPhotos:
+    """Capture rendered cards before scrolling can recycle them; associate only stable pixels with an observation."""
+
+    def __init__(self, writer, page, note_id):
+        self.writer = writer
+        self.page = page
+        self.note_id = note_id
+        self.by_card = {}
+        self.end = None
+        self.waited_for_images = set()
+
+    @staticmethod
+    def key(comment):
+        return (comment.get("comment_id"), comment.get("text"), comment.get("has_image"), bool(comment.get("deleted")))
+
+    def same_note(self):
+        target = target_from_url(str(self.page.url))
+        return target and target["note_id"] == self.note_id and note_page_state(self.page, self.note_id) != "wrong_note"
+
+    def take(self, node, kind, *, valid, ids=(), image_keys=()):
+        record = None
+        try:
+            # Responsive note layouts can keep Playwright's action-stability wait pending
+            # even when the correct card already fills a stationary, visible rectangle.
+            exposed = """e => {
+                const r = e.getBoundingClientRect();
+                const x = (Math.max(0,r.left) + Math.min(innerWidth,r.right))/2;
+                const y = (Math.max(0,r.top) + Math.min(innerHeight,r.bottom))/2;
+                const hit = document.elementFromPoint(x,y);
+                return !!hit && (e.contains(hit) ||
+                    (getComputedStyle(e).pointerEvents === 'none' && hit.contains(e)));
+            }"""
+            node.evaluate("""e => {
+                const box = e.getBoundingClientRect();
+                let top = 0, left = 0, right = innerWidth, bottom = innerHeight;
+                for (let p = e.parentElement; p; p = p.parentElement) {
+                    const css = getComputedStyle(p), r = p.getBoundingClientRect();
+                    if (/(auto|scroll|hidden|clip)/.test(css.overflowY)) { top=Math.max(top,r.top); bottom=Math.min(bottom,r.bottom); }
+                    if (/(auto|scroll|hidden|clip)/.test(css.overflowX)) { left=Math.max(left,r.left); right=Math.min(right,r.right); }
+                }
+                const hit = document.elementFromPoint((box.left+box.right)/2,(box.top+box.bottom)/2);
+                if (box.top < top || box.bottom > bottom || box.left < left || box.right > right ||
+                    !hit || !(e.contains(hit) || (getComputedStyle(e).pointerEvents === 'none' && hit.contains(e))))
+                    e.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'});
+            }""")
+            image_ready = """async (node, wait) => {
+                const end = performance.now() + wait;
+                do {
+                    const images = [...node.querySelectorAll('.comment-picture img')];
+                    if (images.length && images.every(i => i.complete && i.naturalWidth && i.naturalHeight &&
+                            i.getClientRects().length && getComputedStyle(i).visibility === 'visible')) return true;
+                    if (performance.now() >= end) return false;
+                    await new Promise(done => setTimeout(done, 40));
+                } while (node.isConnected);
+                return false;
+            }"""
+            # Lazy thumbnails can start loading only when the card is scrolled into view.
+            wait = 800 if any(k not in self.waited_for_images for k in image_keys) else 0
+            self.waited_for_images.update(image_keys)
+            if self.same_note() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, wait)):
+                record = self.writer.save(node, kind, comment_ids=ids)
+                if record and self.same_note() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, 0)):
+                    return record
+        except Exception:
+            # A recycled or detached node still needs a new, verifiable screenshot.
+            pass
+        if record:
+            self.writer.discard(record)
+        return None
+
+    def card(self, node, comment):
+        key = self.key(comment)
+        if key in self.by_card:
+            return
+        def matches():
+            fields = node.evaluate(DOM_COMMENT_FIELDS)
+            return bool(fields and not fields.get("hidden") and self.key(dom_comment_record(fields)) == key)
+        record = self.take(node, "comment", valid=matches, ids=[key[0]] if key[0] else [],
+                           image_keys=[key] if key[2] else [])
+        if not record and key[1] and not key[2] and comment.get("text_source") == "dom_note_text":
+            # A floating bar can cover a card's center while its actual comment body is fully visible.
+            handle = None
+            try:
+                handle = node.evaluate_handle("""card => {
+                    const own = [...card.querySelectorAll('.content .note-text')]
+                        .filter(e => e.closest('.comment-item') === card && e.getClientRects().length);
+                    return own.length === 1 ? own[0] : null;
+                }""")
+                body = handle.as_element()
+                if body is not None:
+                    record = self.take(body, "comment", valid=matches, ids=[key[0]] if key[0] else [])
+            except Exception:
+                pass
+            finally:
+                if handle is not None:
+                    handle.dispose()
+        if record:
+            if key[1]:
+                record["comment_texts"] = [key[1]]
+            self.by_card[key] = record
+            visible_progress()
+
+    def cards(self, panel, items, positioned):
+        keys = [self.key(c) for _, c in positioned]
+        if not keys or all(key in self.by_card for key in keys):
+            return
+        try:
+            compact = panel.evaluate("""p => {
+                const bounds = p.getBoundingClientRect();
+                let height = innerHeight, width = innerWidth;
+                for (let e = p; e; e = e.parentElement) {
+                    const css = getComputedStyle(e);
+                    if (/(auto|scroll|hidden|clip)/.test(css.overflowY)) height = Math.min(height,e.clientHeight);
+                    if (/(auto|scroll|hidden|clip)/.test(css.overflowX)) width = Math.min(width,e.clientWidth);
+                }
+                return bounds.height <= height && bounds.width <= width && p.scrollHeight <= p.clientHeight + 1;
+            }""")
+            if compact:
+                at_end = visible_terminal(panel) and not reply_controls(panel).count()
+                def same_screen():
+                    states, parsed = read_visible_comments(panel)
+                    return (parsed and [self.key(c) for c in states] == keys
+                            and (not at_end or visible_terminal(panel) and not reply_controls(panel).count())
+                            and panel.evaluate("""p => {
+                                const box = p.getBoundingClientRect();
+                                const visible = (x,y) => p.contains(document.elementFromPoint(x,y));
+                                return box.width > 2 && box.height > 2 && visible(box.left+2,box.top+2)
+                                    && visible(box.right-2,box.bottom-2);
+                            }"""))
+                record = self.take(panel, "end" if at_end else "comment", valid=same_screen,
+                                   ids=[k[0] for k in keys if k[0]], image_keys=[k for k in keys if k[2]])
+                if record:
+                    record["comment_texts"] = [k[1] for k in keys if k[1]]
+                    self.by_card.update((k, record) for k in keys)
+                    if at_end:
+                        self.end = record
+                    visible_progress()
+                    return
+        except Exception:
+            pass
+        for i, comment in positioned:
+            self.card(items.nth(i), comment)
+
+    def finish(self, observation):
+        panel = self.page.locator(".comments-container:visible").first
+        if observation.get("capture_complete"):
+            if observation.get("capture_complete_source") == EMPTY_STATE_SOURCE:
+                empty = self.page.locator(".note-container .comments-el .no-comments:visible").first
+                def still_empty():
+                    return ("".join(empty.inner_text(timeout=1200).split()) == "这是一片荒地点击评论"
+                            and not panel.count() and note_page_state(self.page, self.note_id) == "target_note")
+                self.end = self.take(empty, "empty", valid=still_empty)
+                if not self.end:
+                    self.end = self.take(empty.locator(".no-comments-text:visible").first, "empty", valid=still_empty)
+            elif not self.end and panel.count():
+                outside = panel.locator(OUTSIDE_CARDS)
+                footer = panel.get_by_text(END_TEXT).and_(outside).first
+                kind = "end"
+                if not footer.count():
+                    footer = panel.get_by_text(EMPTY_TEXT).and_(outside).first
+                    kind = "empty"
+                if footer.count():
+                    self.end = self.take(footer, kind, valid=lambda: visible_terminal(panel) and not reply_controls(panel).count())
+        complete = (bool(self.end) if observation.get("capture_complete")
+                    else observation.get("capture_stop_reason") == "recheck_matches_visible")
+        for comment in observation.get("comments", []):
+            shot = self.by_card.get(self.key(comment))
+            if shot:
+                comment["evidence_path"] = shot["path"]
+            else:
+                complete = False
+        return self.attach(observation, complete and observation.get("capture_status") == "ok")
+
+    def attach(self, observation, complete):
+        records = self.writer.records
+        observation["comment_screenshots"] = records
+        # A failed panel-level shot can be fully recovered by individual cards plus a footer.
+        observation["screenshot_status"] = ("missing" if not records else
+                                            "captured" if complete else "partial")
+        return observation
+
+
 class ExpansionChecks(ExitStack):
     """A disappearing button and an old footer cannot confirm async replies arrived."""
 
-    def __init__(self, sufficient=None):
+    def __init__(self, sufficient=None, photos=None):
         super().__init__()
         self.pending = []
         self.sufficient = sufficient
+        self.photos = photos
         self.stopped_on_matches = False
+
+    def read(self, container):
+        if self.photos is not None:
+            return read_visible_comments(container, self.photos)
+        return read_visible_comments(container)
 
     def all_matches_visible(self, comments):
         if self.sufficient and self.sufficient(comments):
@@ -801,7 +998,7 @@ def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tupl
         if not expanders.count() and visible_terminal(container):
             break
         # Read before scrolling because a virtualized list may recycle its earlier nodes.
-        rendered, parsed = read_visible_comments(container)
+        rendered, parsed = checks.read(container)
         parse_gap |= not parsed
         if not parse_gap and checks.all_matches_visible(rendered):
             # This snapshot proves the selected successes, not the rest of the list.
@@ -839,12 +1036,12 @@ def expand_dom_comments(page: Any, max_rounds: int = 30, *, checks=None) -> tupl
         if terminal and not reply_controls(container).count():
             break
     if checks.sufficient and checks.pending and not parse_gap:
-        rendered, parsed = read_visible_comments(container)
+        rendered, parsed = checks.read(container)
         if parsed and checks.all_matches_visible(rendered):
             return rendered, False, True
     terminal = visible_terminal(container) and not reply_controls(container).count() and checks.confirmed(page)
     # Rows and a fresh pagination control may have appeared during confirmation.
-    rendered, parsed = read_visible_comments(container)
+    rendered, parsed = checks.read(container)
     parsed = parsed and not parse_gap
     terminal = terminal and visible_terminal(container) and not reply_controls(container).count()
     if displayed_identities(seen) - displayed_identities(rendered):
@@ -912,7 +1109,7 @@ def stable_visible_empty_state(page, note_id, raw_comments, declared):
 
 
 def check_note_comments(page, key, raw_comments, declared, requirements, args, *, structured_ok=True, prior=None,
-                        context_rows=None, resolved_note_id=None):
+                        context_rows=None, resolved_note_id=None, photos=None):
     captured = normalized_comments(raw_comments, root_list=True)
     observation = {"target_key": key, "platform": "xiaohongshu", "capture_status": "ok",
                    "capture_complete": False, "comments": captured}
@@ -943,7 +1140,7 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
                 partial = {**observation, "comments": visible, "reply_label_reader": "dom-markers-v1"}
                 results = compare(requirements, [partial], amount_mode="expected-only", reply_context_rows=context_rows)["results"]
                 return settled_recheck_matches(results)
-        with ExpansionChecks(sufficient) as checks:
+        with ExpansionChecks(sufficient, photos) as checks:
             incoming, terminal, parsed = expand_dom_comments(page, args.dom_max_rounds if expand else 0, checks=checks)
             panel_readable = has_visible_comment(incoming)
             if expand and not checks.stopped_on_matches and (not parsed or not terminal) and args.incomplete_dom_retry_rounds:
@@ -997,6 +1194,8 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
             "panel_available": panel, "unconfirmed_before": missing, "unconfirmed_after": after,
             "status": status, "structured_read": "ok" if structured_ok else "unavailable",
         }
+    if photos is not None:
+        photos.finish(observation)
     return observation, terminal, parse_failed
 
 
@@ -1028,6 +1227,19 @@ def note_page_state(page, note_id):
 
 def collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error, prior=None,
                           *, context_rows=None):
+    directory = getattr(args, "screenshot_dir", None)
+    photos = CommentPhotos(NoteScreenshots(directory, "xiaohongshu", source_key), client._page, note_id) if directory else None
+    try:
+        return _collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error,
+                                      prior, context_rows=context_rows, photos=photos)
+    except BaseException:
+        if photos is not None:
+            photos.writer.discard_all()
+        raise
+
+
+def _collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error, prior,
+                           *, context_rows, photos):
     def check_note_identity(check=None):
         active_note = target_from_url(str(client._page.url))
         page_state = note_page_state(client._page, note_id)
@@ -1040,9 +1252,19 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
         return page_state
 
     def restricted_result():
-        return ({"target_key": source_key, "platform": "xiaohongshu", "capture_status": "inaccessible",
-                 "capture_complete": False, "image_detection_complete": False, "comments": [],
-                 "target_page_state": "post_unavailable", "warnings": ["post_unavailable"]}, False, False, declared)
+        observation = {"target_key": source_key, "platform": "xiaohongshu", "capture_status": "inaccessible",
+                       "capture_complete": False, "image_detection_complete": False, "comments": [],
+                       "target_page_state": "post_unavailable", "warnings": ["post_unavailable"]}
+        if photos is not None:
+            photos.writer.discard_all()
+            messages = client._page.locator('[role=alert], [class*="unavailable"], [class*="not-found"], [class*="error"], .access-wrapper')
+            reason = re.compile("这篇笔记已被删除|笔记不存在|笔记已删除|当前笔记暂时无法浏览|作者设置了权限|该笔记仅作者可见")
+            visible = messages.filter(has_text=reason).and_(client._page.locator(":visible")).first
+            if visible.count():
+                photos.take(visible, "unavailable", valid=lambda: check_note_identity() == "post_unavailable"
+                            and not reply_page_blocker(client))
+            photos.attach(observation, False)
+        return observation, False, False, declared
 
     declared = None
     detail_id = None
@@ -1072,7 +1294,7 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
         return restricted_result()
     evidence, terminal, parse_failed = check_note_comments(
         client._page, source_key, raw, declared, requirements, args, structured_ok=structured_ok, prior=prior,
-        context_rows=context_rows, resolved_note_id=note_id)
+        context_rows=context_rows, resolved_note_id=note_id, photos=photos)
     check = evidence.get("reply_verification", {})
     blocker = reply_page_blocker(client)
     if blocker:
@@ -1097,6 +1319,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", required=True, help="Source XLSX; repeat for multiple files")
     parser.add_argument("--output", required=True)
+    screenshot_options = parser.add_mutually_exclusive_group()
+    screenshot_options.add_argument("--screenshot-dir", type=Path, help="Directory for original comment screenshots (default: 评论截图 beside --output)")
+    screenshot_options.add_argument("--no-screenshots", action="store_true", help="Capture comment observations without PNG files")
     parser.add_argument("--expected", "--verify-replies", action="append", default=[], metavar="EXPECTED_JSON",
                         help="Source task rows to check against comments anywhere on the same note")
     parser.add_argument("--require-reply-parent", action="store_true",
@@ -1177,6 +1402,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.limit is not None:
         targets = targets[: max(0, args.limit)]
     output_path = Path(args.output)
+    args.screenshot_dir = None if args.no_screenshots else (args.screenshot_dir or output_path.parent / "评论截图").resolve()
     if any(output_path.resolve() == Path(path).resolve() or (output_path.exists() and Path(path).exists() and output_path.samefile(path))
            for path in (*args.expected, *args.input)):
         parser.error("--output must differ from --expected and --input")
@@ -1194,7 +1420,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.require_reply_parent:
         requirements = {key: rows for key, rows in requirements.items() if any(row.get("reply_to") for row in rows)}
     targets = plan_targets(targets, existing, requirements, args.refresh, require_reply_parent=args.require_reply_parent,
-                           contexts=contexts)
+                           contexts=contexts, screenshot_dir=args.screenshot_dir)
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
     if not targets:
         if scope and not output_path.exists():
@@ -1313,6 +1539,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 consecutive_errors += 1
                 if consecutive_errors >= 2:
                     stop_reason = "repeated_navigation_failure"
+            if args.screenshot_dir is not None and "screenshot_status" not in existing[note_id]:
+                existing[note_id].update(screenshot_status="missing", comment_screenshots=[])
             existing[note_id]["capture_duration_ms"] = round((time.monotonic() - target_started) * 1000)
             atomic_write(output_path, {**scope_meta, "observations": saved_observations(original, previous, existing), "stopped": bool(stop_reason), "stop_reason": stop_reason})
             if stop_reason:

@@ -105,6 +105,31 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+SCREENSHOT_INDEX_TITLE = "评论审核 · 财务截图索引"
+SCREENSHOT_INDEX_HEADERS = ("平台", "笔记或视频编号", "原表位置", "任务评论", "审核结果", "核定金额", "截图状态", "截图（点击打开首张）")
+SCREENSHOT_GALLERY_TITLE = "评论审核 · 评论原图与核对结果"
+SCREENSHOT_GALLERY_HEADERS = ("评论原图", "原表位置", "待核对评论", "审核结果", "核定金额", "原帖链接", "图号", "画面", "笔记或视频编号", "截图时间（UTC）")
+
+
+def screenshot_index_name(name: str) -> bool:
+    return bool(re.fullmatch(r"评论(?:截图|原图)(?:（\d+）)?", name))
+
+
+def generated_screenshot_index(name: str, root: ET.Element, strings: list[str]) -> bool:
+    if not screenshot_index_name(name):
+        return False
+    cells = {cell.get("r"): xlsx_text(cell, strings) for row in root.findall("{*}sheetData/{*}row")[:2]
+             for cell in row.findall("{*}c")}
+    title, headers = ((SCREENSHOT_GALLERY_TITLE, SCREENSHOT_GALLERY_HEADERS) if name.startswith("评论原图")
+                      else (SCREENSHOT_INDEX_TITLE, SCREENSHOT_INDEX_HEADERS))
+    choices = [headers]
+    if title == SCREENSHOT_GALLERY_TITLE:
+        # The first embedded gallery predated the F-column link back to the original note.
+        choices.append(headers[:5] + headers[6:])
+    return cells.get("A1") == title and any(
+        all(cells.get(f"{chr(65 + i)}2") == header for i, header in enumerate(candidate)) for candidate in choices)
+
+
 def child(element: ET.Element, name: str) -> Optional[ET.Element]:
     for item in element:
         if local_name(item.tag) == name:
@@ -257,7 +282,7 @@ def read_xlsx(path: Path, sheet_name: Optional[str] = None, *, target_url_header
 
 
 def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[str], *,
-                   target_url_header: Optional[str] = None) -> List[Dict[str, Any]]:
+                   target_url_header: Optional[str] = None, all_link_columns: bool = False) -> List[Dict[str, Any]]:
     root = ET.fromstring(archive.read(member))
     relationships = worksheet_relationships(archive, member)
     image_cells = worksheet_image_cells(archive, member, relationships)
@@ -289,7 +314,7 @@ def read_worksheet(archive: zipfile.ZipFile, member: str, shared_strings: List[s
     hyperlinks = child(root, "hyperlinks")
     if matrix and hyperlinks is not None:
         link_header = target_url_header or resolve_mapping(matrix[0].values(), {}).get("target_url")
-        link_columns = {index for index, name in matrix[0].items() if name and name == link_header}
+        link_columns = {index for index, name in matrix[0].items() if name and (all_link_columns or name == link_header)}
         destinations = {rel.get("Id"): rel.get("Target", "") for rel in relationships
                         if rel.get("Type", "").endswith("/hyperlink") and rel.get("TargetMode") == "External"}
         rel_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
@@ -767,6 +792,8 @@ def convert_xlsx_sheets(path: Path, explicit: Dict[str, str], amount_rules: Opti
         for name, member in sheets.items():
             if (skip_summary or sheet_name) and name == "审核汇总":
                 continue
+            if screenshot_index_name(name) and generated_screenshot_index(name, ET.fromstring(archive.read(member)), strings):
+                continue
             rows = read_worksheet(archive, member, strings, target_url_header=explicit.get("target_url"))
             if sheet_name and name != sheet_name:
                 # Optional sheets may be ledgers with a different schema. Only
@@ -780,7 +807,7 @@ def convert_xlsx_sheets(path: Path, explicit: Dict[str, str], amount_rules: Opti
                 try:
                     converted.extend(convert(rows, explicit, path.name, name, amount_rules, detect_prior_in_workbook=True))
                 except MissingTaskColumns:
-                    if not skip_non_task_sheets:
+                    if not skip_non_task_sheets and (not screenshot_index_name(name) or sheet_name == name):
                         raise
         discard_unused_prior(converted)
         if converted and "prior_review" in converted[0] and "审核汇总" in sheets:

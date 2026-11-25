@@ -74,6 +74,22 @@ def relation_target(part, target):
     return posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join(posixpath.dirname(part), target))
 
 
+def add_worksheet_part(parts, sheets, rels, types, name, rid):
+    number = 1
+    while f"xl/worksheets/sheet{number}.xml" in parts:
+        number += 1
+    path = f"xl/worksheets/sheet{number}.xml"
+    used = {rel.get("Id") for rel in rels}
+    while rid in used:
+        rid += "x"
+    ET.SubElement(rels, f"{{{P}}}Relationship", {"Id": rid, "Type": R + "/worksheet", "Target": path[3:]})
+    ET.SubElement(sheets, tag("sheet"), {"name": name, "sheetId": str(max(int(item.get("sheetId")) for item in sheets) + 1),
+                                         f"{{{R}}}id": rid})
+    ET.SubElement(types, f"{{{CT}}}Override", {"PartName": "/" + path,
+                                              "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"})
+    return path
+
+
 def col_index(address):
     value = 0
     for letter in re.match(r"[A-Z]+", address)[0]:
@@ -208,7 +224,7 @@ def add_styles(parts):
     return styles
 
 
-def build_workbook(source: Path, rows: list[dict], results: list[dict], output: Path) -> dict:
+def build_workbook(source: Path, rows: list[dict], results: list[dict], output: Path, *, screenshot_base=None) -> dict:
     source, output = Path(source).resolve(), Path(output).resolve()
     if source == output or source.suffix.lower() != ".xlsx" or output.suffix.lower() != ".xlsx":
         raise ValueError("use_distinct_source_and_output_xlsx")
@@ -346,16 +362,7 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
                 manual[key] = {n: copy.deepcopy(cells[n]) for n in range(11, 15) if n in cells}
                 old_row_keys[int(row.get("r")) - 1] = key
     if summary_path is None:
-        number = 1
-        while f"xl/worksheets/sheet{number}.xml" in parts:
-            number += 1
-        summary_path = f"xl/worksheets/sheet{number}.xml"
-        rid = "rIdAuditSummary"
-        while rid in targets:
-            rid += "x"
-        ET.SubElement(rels, f"{{{P}}}Relationship", {"Id": rid, "Type": R + "/worksheet", "Target": summary_path[3:]})
-        ET.SubElement(sheets, tag("sheet"), {"name": "审核汇总", "sheetId": str(max(int(item.get("sheetId")) for item in sheets) + 1), f"{{{R}}}id": rid})
-        ET.SubElement(types, f"{{{CT}}}Override", {"PartName": "/" + summary_path, "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"})
+        summary_path = add_worksheet_part(parts, sheets, rels, types, "审核汇总", "rIdAuditSummary")
     summary = ET.Element(tag("worksheet"))
     end = 11 + len(rows)
     total_row = len(groups) + 2
@@ -516,6 +523,16 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     parts["xl/workbook.xml"] = encode(workbook, original_parts["xl/workbook.xml"])
     parts["xl/_rels/workbook.xml.rels"] = encode(rels, original_parts["xl/_rels/workbook.xml.rels"])
     parts["[Content_Types].xml"] = encode(types, original_parts["[Content_Types].xml"])
+    if __package__:
+        from .workbook_screenshots import add_screenshot_index
+        from .note_links import with_finance_note_urls
+    else:
+        from workbook_screenshots import add_screenshot_index
+        from note_links import with_finance_note_urls
+    removed_screenshot_media = set()
+    with_screenshots = any("screenshot_status" in result or "comment_screenshots" in result for result in results)
+    finance_rows = with_finance_note_urls(source,rows) if with_screenshots or any(name.startswith(("评论原图","评论截图")) for name in sheet_paths) else rows
+    screenshot_index = add_screenshot_index(parts, finance_rows, results, screenshot_base or output.parent, removed_screenshot_media)
     output.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(dir=output.parent, prefix=".audit-", suffix=".xlsx", delete=False)
     temporary = Path(handle.name)
@@ -528,7 +545,7 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
             if archive.testzip() is not None:
                 raise RuntimeError("export_zip_validation_failed")
             for name in original_parts:
-                if name.startswith("xl/media/") and archive.read(name) != original_parts[name]:
+                if name.startswith("xl/media/") and name not in removed_screenshot_media and archive.read(name) != original_parts[name]:
                     raise RuntimeError("source_media_changed")
             for name, selected in rows_by_sheet.items():
                 root = ET.fromstring(archive.read(sheet_paths[name]))
@@ -559,17 +576,22 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
-    return {"output": str(output), "groups": len(groups), "total": len(results), "approved_amount": format(payout, ".2f"), "source_sha256": sha256(source.read_bytes()).hexdigest(), "output_sha256": sha256(output.read_bytes()).hexdigest(), "engine": "portable-ooxml", "formula_check": "cached_values_reconciled; Excel_recalculates_on_open"}
+    metadata = {"output": str(output), "groups": len(groups), "total": len(results), "approved_amount": format(payout, ".2f"), "source_sha256": sha256(source.read_bytes()).hexdigest(), "output_sha256": sha256(output.read_bytes()).hexdigest(), "engine": "portable-ooxml", "formula_check": "cached_values_reconciled; Excel_recalculates_on_open"}
+    if screenshot_index:
+        metadata["screenshot_index"] = screenshot_index
+    return metadata
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "expected", "report", "output"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--screenshot-base", type=Path)
     args = parser.parse_args()
     expected = json.loads(Path(args.expected).read_text(encoding="utf-8"))
     report = json.loads(Path(args.report).read_text(encoding="utf-8"))
-    print(json.dumps(build_workbook(Path(args.source), expected.get("rows", []) if isinstance(expected, dict) else expected, report["results"], Path(args.output)), ensure_ascii=False))
+    print(json.dumps(build_workbook(Path(args.source), expected.get("rows", []) if isinstance(expected, dict) else expected, report["results"], Path(args.output),
+                                    screenshot_base=args.screenshot_base or Path(args.report).resolve().parent), ensure_ascii=False))
     return 0
 
 

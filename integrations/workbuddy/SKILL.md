@@ -5,7 +5,7 @@ display_name_en: Xiaohongshu and Douyin Comment Audit
 description: 根据任务表和平台证据核对小红书、抖音评论文字及配图，生成审核版 Excel、待人审结果与结算汇总。用户要求核对评论是否发布、核算评论任务金额或续审时使用。
 description_zh: 逐行核对评论与配图，回填审核结果和核定金额，生成结算汇总。
 description_en: Check comment evidence against assigned tasks and export a reconciled workbook.
-version: 0.4.7
+version: 0.4.8
 author: lamtrang5508647
 ---
 
@@ -14,6 +14,8 @@ author: lamtrang5508647
 使用本技能目录中的 `scripts/audit.py`。从已加载的 SKILL.md 确定脚本绝对路径。每份源表使用独立工作目录，给成品、报告和证据分别命名，保留原表作为报价依据。离线核对需要 Python 3.11 或以上，使用脚本时可以在任意工作目录运行。
 
 ## 有源表和采集证据
+
+用户要给财务核对时，正常使用 `run`、`capture-xhs` 或 `capture-douyin`，在访问每篇笔记的评论区时保存原始 PNG，随后按本轮证据逐行审核。直接交付审核版 Excel。财务打开「评论原图」即可在截图旁查看对应任务的原文、结论、金额、原表行号和可点击的原笔记链接；这些图片嵌入工作簿，单独复制 Excel 也能查看。另报告有截图的笔记数和截图不全的审核行数。旧表需要本轮截图时，使用新任务目录重新访问相应笔记。仅当用户明确要求跳过截图时，在线采集命令可加 `--no-screenshots`。
 
 导入 Excel 后自动确定范围。所有任务都没有首审结论时，审核全表。只要有明确的首审结果，就只复核“成功、图字成功、文字成功、图片成功”等已判成功的行。已判失败、待人审、未填和无法识别的行保留原单元格。成功和失败在同一篇笔记下时，也只重判已成功的任务行。审核结果和核定金额写到对应列，保留客户的单价与备注。
 

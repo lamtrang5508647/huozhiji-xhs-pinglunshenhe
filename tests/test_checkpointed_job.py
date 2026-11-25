@@ -1,3 +1,4 @@
+import base64
 import json
 import sys
 import tempfile
@@ -5,7 +6,7 @@ import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_portable_api import fixture
 
@@ -13,6 +14,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "skills/comment-review-audit/scr
 sys.path.insert(0, str(SCRIPTS))
 import run_comment_review_job as runner
 from capture_resume import PARSER_REVISIONS
+from screenshot_evidence import NoteScreenshots
 
 
 class CheckpointedJobTests(unittest.TestCase):
@@ -41,6 +43,33 @@ class CheckpointedJobTests(unittest.TestCase):
                 self.assertFalse(runner.has_healthy_capture(latest, captures[0]["target_key"]))
                 self.assertFalse(runner.checkpoint_covers_workbook(self.rows, {"observations": latest}, {}))
 
+    def test_default_runner_reuses_verified_pngs_and_revisits_a_missing_file(self):
+        source_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j+WQAAAAASUVORK5CYII=")
+        screenshot_source = Mock()
+        screenshot_source.screenshot.return_value = source_png
+        directory = self.job / "评论截图"
+        def snapshot(item):
+            writer = NoteScreenshots(directory, "xiaohongshu", item["target_key"])
+            record = writer.save(screenshot_source, "end")
+            item.update(comment_screenshots=[record], screenshot_status="captured")
+        for item in self.checkpoint["observations"]:
+            snapshot(item)
+        destination = self.job / "observations.json"
+        runner.write_state(destination, self.checkpoint)
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=AssertionError("unexpected revisit")):
+            self.assertEqual(runner.main(), 0)
+        first = self.checkpoint["observations"][0]
+        (self.job / first["comment_screenshots"][0]["path"]).unlink()
+        def restore(command):
+            self.assertEqual(command[command.index("--only-note-id") + 1], first["target_key"])
+            self.assertEqual(Path(command[command.index("--screenshot-dir")+1]), directory)
+            snapshot(first)
+            runner.write_state(destination, self.checkpoint)
+        with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=restore) as calls:
+            self.assertEqual(runner.main(), 0)
+            self.assertEqual(calls.call_count, 1)
+
     def test_live_job_reuses_visible_reply_without_parent_even_when_only_positives_were_captured(self):
         captures = self.checkpoint["observations"]
         root = dict(platform="xiaohongshu", target_key="n1", source_sheet="S", source_row=2,
@@ -51,7 +80,7 @@ class CheckpointedJobTests(unittest.TestCase):
                     dict(text="child", comment_id="c", has_image=False)]
         captures[0]["comments"] = comments
         checkpoint = self.job / "observations.json"
-        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job), "--no-screenshots"]
         for complete in (True, False):
             captures[0]["capture_complete"] = complete
             runner.write_state(checkpoint, self.checkpoint)
@@ -117,7 +146,7 @@ class CheckpointedJobTests(unittest.TestCase):
                              "comments": [{"text":"待验证", "has_image":False}]}
                 path = Path(argv[argv.index("--output") + 1])
                 runner.write_state(path, {"observations": [recovered]})
-        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job), "--no-screenshots"]
         with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=collect):
             self.assertEqual(runner.main(), 0)
         self.assertEqual(calls, [[], ["n3"]])
@@ -143,7 +172,7 @@ class CheckpointedJobTests(unittest.TestCase):
         rows = [self.rows[0], {**self.rows[0], "source_row": 3, "case_id": "duplicate-task"}]
         captures = self.checkpoint["observations"][:1]
         runner.write_state(self.job / "observations.json", {"observations": captures})
-        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job), "--no-screenshots"]
         with patch.object(sys, "argv", argv), patch.object(runner, "convert_xlsx_sheets", return_value=rows), \
              patch.object(runner, "run_capture", side_effect=AssertionError("already visible")):
             self.assertEqual(runner.main(), 0)
@@ -163,7 +192,7 @@ class CheckpointedJobTests(unittest.TestCase):
             for name, data in parts.items():
                 archive.writestr(name, data)
         (self.job / "observations.json").write_text(json.dumps(self.checkpoint), encoding="utf-8")
-        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job)]
+        argv = ["job", "--source", str(self.source), "--work-dir", str(self.job), "--no-screenshots"]
         with patch.object(sys, "argv", argv), patch.object(runner, "run", side_effect=AssertionError("unexpected subprocess")):
             self.assertEqual(runner.main(), 0)
         expected = json.loads((self.job / "expected.json").read_text(encoding="utf-8"))

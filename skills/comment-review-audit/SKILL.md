@@ -19,6 +19,8 @@ Feishu intake/delivery and OpenClaw synchronization apply only when that integra
 
 ## Operating boundary
 
+For finance review, live capture saves PNGs of the current note's comments. Deliver the audited Excel workbook. It embeds the original screenshots next to their matching task text, review results, amounts and verified source-post links. Follow the existing success-only scope when taking screenshots for a second pass.
+
 - Keep platform work read-only. Never like, comment, publish, delete, follow, or change platform data.
 - Never bypass login, CAPTCHA, security review, frequency limits, or risk controls. Stop, checkpoint, and report the blocker.
 - Use one authorized account, one ordinary persistent Chrome profile, and one stable network route per platform session. Do not use incognito for batches, rotate accounts after a warning, or run concurrent captures.

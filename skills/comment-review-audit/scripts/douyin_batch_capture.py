@@ -28,6 +28,7 @@ from runtime_environment import configure_stdio
 from session_environment import network_fingerprint
 from browser_environment import find_chrome
 from table_to_expected import douyin_video_id
+from screenshot_evidence import DEFAULT_SCREENSHOT_DIR, NoteScreenshots, screenshots_valid
 
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -89,6 +90,7 @@ FOLD = re.compile(r"^\s*(?:(?:展开|查看)(?:其余|剩余)?\s*(\d+)\s*条?\s*
 END = re.compile(r"^\s*(?:暂时没有更多评论|没有更多评论|没有更多了)\s*$")
 EMPTY = re.compile(r"^\s*(?:暂无评论|暂时没有评论|还没有评论|快来抢首评吧|抢首评)\s*[哦～~！!。]?\s*$")
 LOADING = '[aria-busy="true"], [role="progressbar"], [data-e2e="comment-loading"], .comments-loading, .reply-loading, .loading-more'
+UNAVAILABLE = ("作品已删除", "视频不存在", "该视频已删除", "作品暂时无法观看")
 
 
 def outside(selector):
@@ -174,11 +176,10 @@ ROW_FIELDS = r"""(rows, cfg) => rows.map(row => {
 })"""
 
 
-def read_rows(panel):
-    items = panel.locator(f':is({ROW}):visible')
+def read_cards(items):
     rows = []
     parsed = True
-    for item in items.evaluate_all(ROW_FIELDS, {"row": ROW, "body": BODY}):
+    for position, item in enumerate(items.evaluate_all(ROW_FIELDS, {"row": ROW, "body": BODY})):
         body = item["body"] if item["body"] is not None else parse_item_lines(item["raw"])
         if not body and not item["image"]:
             parsed = False
@@ -187,14 +188,146 @@ def read_rows(panel):
         record = {"text": body, "has_image": image, "comment_type": ("text+image" if body else "image") if image else "text"}
         if item["id"]:
             record["comment_id"] = item["id"]
-        rows.append(record)
+        rows.append((position, record))
     return rows, parsed
+
+
+def read_rows(panel):
+    indexed, parsed = read_cards(panel.locator(f':is({ROW}):visible'))
+    return [row for _, row in indexed], parsed
 
 
 def identity(row):
     if row.get("comment_id"):
         return ("id", row["comment_id"])
     return ("anonymous", row["text"], row["has_image"])
+
+
+# Playwright's :visible includes rows outside clipped scrolling panes. Only label
+# a screenshot with cards that the finance reviewer can actually see in the PNG.
+FULLY_SHOWN = """el => {
+    const r = el.getBoundingClientRect(), margin = 1;
+    if (r.width <= 0 || r.height <= 0 || r.left < -margin || r.top < -margin ||
+            r.right > innerWidth+margin || r.bottom > innerHeight+margin) return false;
+    for (let a=el; a; a=a.parentElement) {
+        const s=getComputedStyle(a), box=a.getBoundingClientRect();
+        if (s.visibility!=='visible' || s.display==='none' || Number(s.opacity)===0) return false;
+        if (a===el) continue;
+        if (/(hidden|clip|auto|scroll)/.test(s.overflowY) &&
+                (r.top < box.top + a.clientTop-margin || r.bottom > box.top+a.clientTop+a.clientHeight+margin)) return false;
+        if (/(hidden|clip|auto|scroll)/.test(s.overflowX) &&
+                (r.left < box.left+a.clientLeft-margin || r.right > box.left+a.clientLeft+a.clientWidth+margin)) return false;
+    }
+    const hit=document.elementFromPoint((r.left+r.right)/2,(r.top+r.bottom)/2);
+    return !!hit && el.contains(hit);
+}"""
+
+
+def card_key(row):
+    return (row.get("comment_id"), row["text"], row["has_image"])
+
+
+class CommentPictures:
+    def __init__(self, writer, page, resolved_id):
+        self.writer = writer
+        self.page = page
+        self.resolved_id = resolved_id
+        self.paths = {}
+        self.end_saved = False
+
+    def assigned(self):
+        return (video_id(self.page.url) == self.resolved_id and not security_status(self.page)
+                and not visible_marker(self.page, UNAVAILABLE)
+                and self.page.locator('[data-e2e="comment-list"]:visible').count() == 1)
+
+    def discard_terminal(self):
+        for shot in self.writer.records.copy():
+            if shot["kind"] in ("empty", "end"):
+                self.paths = {key:path for key,path in self.paths.items() if path != shot["path"]}
+                self.writer.discard(shot)
+        self.end_saved = False
+
+    def save(self, surface, kind, rows, unchanged, *, texts=True):
+        if not self.assigned() or not surface.evaluate(FULLY_SHOWN):
+            return None
+        shot = self.writer.save(surface, kind, [row["comment_id"] for row in rows if row.get("comment_id")])
+        if shot:
+            try:
+                valid = self.assigned() and unchanged() and surface.evaluate(FULLY_SHOWN)
+            except Exception:
+                valid = False
+            if not valid:
+                self.writer.discard(shot)
+                return None
+            if texts:
+                shot["comment_texts"] = list(dict.fromkeys(r["text"] for r in rows if r["text"]))
+        return shot
+
+    def collect(self, panel, cards, indexed, marker, kind):
+        """Old rendered nodes can be recycled by any scroll, including scrolling to take a picture."""
+        rows = [row for _, row in indexed]
+        keys = [card_key(row) for row in rows]
+        new = [(i, row) for i, row in indexed if card_key(row) not in self.paths]
+        if not new and (self.end_saved or marker is None) and self.writer.records:
+            return
+        def same_list():
+            return ([card_key(r) for _,r in read_cards(cards)[0]] == keys
+                    and (marker is None or marker.evaluate(FULLY_SHOWN)))
+        panel_fits = bool(panel.evaluate(FULLY_SHOWN))
+        fully_visible = panel_fits and cards.evaluate_all("els => els.every(" + FULLY_SHOWN + ")")
+        if fully_visible and (marker is None or marker.evaluate(FULLY_SHOWN)):
+            shot = self.save(panel, kind, rows, same_list)
+            if shot:
+                self.paths.update({key:shot["path"] for key in keys})
+                self.end_saved |= marker is not None
+                return
+        for index, row in new:
+            card = cards.nth(index)
+            key = card_key(row)
+            if key in self.paths:
+                continue
+            def same_card():
+                current = read_cards(card)[0]
+                return len(current) == 1 and card_key(current[0][1]) == key
+            if not card.count() or not same_card():
+                continue
+            card.scroll_into_view_if_needed(timeout=1800)
+            if not same_card():
+                continue
+            shot = None
+            if panel_fits and panel.evaluate(FULLY_SHOWN):
+                # Ordinary Douyin uses an inner scroll pane. One viewport usually
+                # holds several cards, so save those together before moving again.
+                def visible_rows():
+                    indexes = cards.evaluate_all("els => els.flatMap((el,i) => ("+FULLY_SHOWN+")(el) ? [i] : [])")
+                    visible = set(indexes)
+                    return [r for pos,r in read_cards(cards)[0] if pos in visible]
+                shown = visible_rows()
+                shown_keys = [card_key(r) for r in shown]
+                if key in shown_keys:
+                    shot = self.save(panel,"comments",shown,lambda: [card_key(r) for r in visible_rows()] == shown_keys)
+                    if shot:
+                        self.paths.update({k:shot["path"] for k in shown_keys})
+                        continue
+            shot = self.save(card, "comments", [row], same_card)
+            if not shot and row["text"] and not row["has_image"]:
+                # An expanded parent can wrap hundreds of replies. Its own text
+                # remains useful even when the entire thread can't fit on screen.
+                own = card.locator(BODY)
+                if own.count() and card.evaluate("(card,cfg) => card.querySelector(cfg.body)?.closest(cfg.row) === card",
+                                                 {"row":ROW, "body":BODY}):
+                    body = own.first
+                    body.scroll_into_view_if_needed(timeout=1800)
+                    if same_card():
+                        shot = self.save(body, "comments", [row], same_card)
+            if shot:
+                self.paths[key] = shot["path"]
+        if marker is not None and not self.end_saved:
+            marker.scroll_into_view_if_needed(timeout=1800)
+            # Keep neighbouring comments visible when a normal-sized panel allows it.
+            use_panel = bool(panel.evaluate(FULLY_SHOWN))
+            surface = panel if use_panel else marker
+            self.end_saved = bool(self.save(surface, kind, [], lambda: marker.evaluate(FULLY_SHOWN)))
 
 
 def folded_controls(panel):
@@ -267,7 +400,7 @@ def read_declared_comment_count(page: Any, timeout_ms: int = 1500) -> int | None
     return parse_declared_comment_count(text)
 
 
-def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[str, Any]:
+def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int, *, writer=None) -> Dict[str, Any]:
     source = urlsplit(target["url"])
     host = (source.hostname or "").casefold()
     if source.scheme not in ("http", "https") or (host != "douyin.com" and not host.endswith(".douyin.com")):
@@ -278,7 +411,18 @@ def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[
     if status or not on_assigned_video(page.url, target):
         return {"capture_status": status or "inaccessible", "capture_complete": False, "comments": [],
                 "warnings": [status or "target_identity_unconfirmed"]}
-    if visible_marker(page, ("作品已删除", "视频不存在", "该视频已删除", "作品暂时无法观看")):
+    resolved_id = video_id(page.url)
+    if visible_marker(page, UNAVAILABLE):
+        if writer is not None:
+            notice = page.get_by_text(re.compile(r"^\s*(?:作品已删除|视频不存在|该视频已删除|作品暂时无法观看)\s*$")).and_(page.locator(outside(ROW)))
+            try:
+                if notice.count() == 1 and video_id(page.url) == resolved_id and not security_status(page):
+                    shot = writer.save(notice, "unavailable")
+                    if shot and (video_id(page.url) != resolved_id or security_status(page) or not notice.count()):
+                        writer.discard(shot)
+            except Exception:
+                writer.discard_all()
+                writer.failed = True
         return {"capture_status": "inaccessible", "capture_complete": False, "comments": [],
                 "warnings": ["target_unavailable"]}
 
@@ -307,52 +451,88 @@ def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[
     recycled = False
     gap = False
     complete = False
+    pictures = CommentPictures(writer, page, resolved_id) if writer is not None else None
+    def remember(indexed):
+        counts = Counter()
+        for _, row in indexed:
+            key = identity(row)
+            counts[key] += 1
+            # Anonymous duplicates are counted only if actually seen together.
+            all_rows[key, counts[key]] = row
+        return counts
     try:
         for iteration in range(max_scrolls + 1):
+            items = panel.locator(f':is({ROW}):visible')
+            before_expansion = Counter()
             if iteration < max_scrolls:
+                if pictures and folded_controls(panel).count():
+                    before, parsed = read_cards(items)
+                    gap |= not parsed
+                    before_expansion = remember(before)
+                    try:
+                        pictures.collect(panel, items, before, None, "comments")
+                    except Exception:
+                        writer.failed = True
                 expand_controls(page, panel, clicked, pending)
-            rows, parsed = read_rows(panel)
-            counts = Counter()
+            indexed, parsed = read_cards(items)
+            rows = [row for _, row in indexed]
+            counts = remember(indexed)
             gap |= not parsed
-            for row in rows:
-                key = identity(row)
-                counts[key] += 1
-                # Anonymous duplicates are counted only if actually seen together.
-                all_rows[key, counts[key]] = row
             if counts - previous:
                 visible_progress()
-            recycled |= bool(previous - counts)
+            recycled |= bool(previous - counts or before_expansion - counts)
             stable = stable + 1 if previous == counts else 0
             previous = counts
             outside_comments = panel.locator(outside(ROW))
-            terminal = panel.get_by_text(END).and_(outside_comments).count()
-            empty = not rows and panel.get_by_text(EMPTY).and_(outside_comments).count()
+            end_marker = panel.get_by_text(END).and_(outside_comments)
+            empty_marker = panel.get_by_text(EMPTY).and_(outside_comments)
+            terminal = end_marker.count()
+            empty = not rows and empty_marker.count()
             busy = panel.get_attribute("aria-busy") == "true" or panel.locator(f':is({LOADING}):visible').count()
             if ((terminal and all_rows) or empty) and not busy and not folded_controls(panel).count():
                 confirmed = all(r.evaluate("s => s.added() >= s.required") for r in pending)
                 if (parsed and not gap and confirmed and (not recycled or declared is not None)
                         and (declared is None or len(all_rows) >= declared)):
                     complete = True
-                    break
+            if pictures:
+                marker = (empty_marker if empty else end_marker).first if complete else None
+                try:
+                    pictures.collect(panel, items, indexed, marker, ("empty" if empty else "end") if complete else "comments")
+                except Exception:
+                    # The receipt stays incomplete when a node is recycled mid-photo.
+                    # Keep the live visibility result and let a resumed task obtain new screenshots.
+                    writer.failed = True
+                if complete:
+                    after, still_parsed = read_cards(items)
+                    complete = bool(still_parsed and [card_key(r) for _,r in after] == [card_key(r) for r in rows]
+                                    and marker.count() and not folded_controls(panel).count()
+                                    and panel.get_attribute("aria-busy") != "true"
+                                    and not panel.locator(f':is({LOADING}):visible').count())
+                    if not complete:
+                        pictures.discard_terminal()
+            if complete:
+                break
             if stable >= 4 or iteration == max_scrolls:
                 break
-            items = panel.locator(f':is({ROW}):visible')
             if items.count():
                 items.last.scroll_into_view_if_needed(timeout=3000)
             panel.hover(timeout=2000)
             page.mouse.wheel(0, 600)
             page.wait_for_timeout(random.randint(900, 1500))
             status = security_status(page)
-            if status or not on_assigned_video(page.url, target):
+            if status or video_id(page.url) != resolved_id:
                 break
     finally:
         for receipt in pending:
             receipt.dispose()
         clicked.dispose()
     status = security_status(page)
-    if status or not on_assigned_video(page.url, target):
+    unavailable = visible_marker(page, UNAVAILABLE)
+    if status or video_id(page.url) != resolved_id or unavailable:
+        if pictures:
+            writer.discard_all()
         return {"capture_status": status or "inaccessible", "capture_complete": False, "comments": [],
-                "warnings": [status or "target_identity_unconfirmed"]}
+                "warnings": [status or ("target_unavailable" if unavailable else "target_identity_unconfirmed")]}
     comments = [dict(row, dom_index=i) for i, row in enumerate(all_rows.values())]
     result = {"capture_status": "ok", "capture_complete": complete, "declared_comment_count": declared,
               "captured_comment_count": len(comments), "image_detection_complete": not gap,
@@ -362,6 +542,13 @@ def capture_target(page: Any, target: Dict[str, Any], max_scrolls: int) -> Dict[
         result["capture_complete_source"] = "visible_comment_list_end"
     else:
         result["warnings"] = ["comments_pagination_incomplete"]
+    if pictures:
+        for comment in comments:
+            path = pictures.paths.get(card_key(comment))
+            if path:
+                comment["evidence_path"] = path
+        if not all(c.get("evidence_path") for c in comments) or (complete and not pictures.end_saved):
+            writer.failed = True
     return result
 
 
@@ -369,6 +556,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected", action="append", required=True)
     parser.add_argument("--output", required=True)
+    shots = parser.add_mutually_exclusive_group()
+    shots.add_argument("--screenshot-dir", type=Path, help="Directory for finance review screenshots (default: 评论截图 beside the checkpoint)")
+    shots.add_argument("--no-screenshots", action="store_true", help="Collect comment records without screenshots")
     parser.add_argument("--profile", default=str(default_profile("douyin")))
     parser.add_argument("--delay-min", type=float, default=5.0)
     parser.add_argument("--delay-max", type=float, default=8.0)
@@ -395,6 +585,7 @@ def main() -> int:
             parser.error("--only-target-key not found")
 
     output = Path(args.output)
+    screenshot_dir = None if args.no_screenshots else (args.screenshot_dir or output.parent/DEFAULT_SCREENSHOT_DIR)
     if any(output.resolve() == Path(path).resolve() or (output.exists() and output.samefile(path))
            for path in args.expected):
         parser.error("--output must differ from --expected")
@@ -415,7 +606,13 @@ def main() -> int:
     previous = {str(item["target_key"]): item for item in records if item.get("platform") == "douyin"}
     existing = previous.copy()
     total_targets = len(targets)
-    targets = pending_targets(targets, existing, "douyin", "target_key", refresh=args.refresh)
+    pending = pending_targets(targets, existing, "douyin", "target_key", refresh=args.refresh)
+    if screenshot_dir is not None and not args.refresh:
+        needed = {t["target_key"] for t in pending}
+        targets = [t for t in targets if t["target_key"] in needed
+                   or not screenshots_valid(existing[t["target_key"]], screenshot_dir)]
+    else:
+        targets = pending
     print(f"[resume-plan] total={total_targets} reused={total_targets-len(targets)} pending={len(targets)}", flush=True)
     if not targets:
         if scope and not output.exists():
@@ -451,15 +648,24 @@ def main() -> int:
                         break
                     captured_at = datetime.now(timezone.utc).isoformat()
                     target_started = time.monotonic()
+                    writer = NoteScreenshots(screenshot_dir, "douyin", key) if screenshot_dir is not None else None
                     try:
-                        result = capture_target(page, target, args.max_scrolls)
+                        result = capture_target(page, target, args.max_scrolls, writer=writer)
                     except Exception as exc:
+                        if writer is not None:
+                            writer.discard_all()
                         result = {
                             "capture_status": "inaccessible",
                             "capture_complete": False,
                             "comments": [],
                             "warnings": [f"capture_error:{type(exc).__name__}"],
                         }
+                    if writer is not None:
+                        result["comment_screenshots"] = writer.records
+                        if not writer.records:
+                            result["screenshot_status"] = "missing"
+                        else:
+                            result["screenshot_status"] = "partial" if writer.failed or not result["capture_complete"] else "captured"
                     result["capture_duration_ms"] = round((time.monotonic() - target_started) * 1000)
                     observation = {
                         "platform": "douyin",

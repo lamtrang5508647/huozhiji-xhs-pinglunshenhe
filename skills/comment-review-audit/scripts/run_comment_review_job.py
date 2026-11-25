@@ -24,6 +24,7 @@ from capture_watchdog import DEFAULT_IDLE_SECONDS, IDLE_EXIT, positive_seconds
 from build_audited_workbook import build_workbook
 from profile_lock import default_profile
 from review_comments import compare, unwrap_rows
+from screenshot_evidence import DEFAULT_SCREENSHOT_DIR, attach_screenshots, screenshots_valid
 from runtime_environment import child_environment, configure_stdio
 from table_to_expected import convert_xlsx_sheets, parse_amount_rules, parse_maps
 from xhs_batch_capture import SINGLE_NOTE_PAGE_STATES, capture_covers_tasks, group_note_requirements, has_visible_comment, plan_targets, target_from_url
@@ -86,8 +87,10 @@ def latest_note_observations(checkpoint):
     return list({(c.get("platform"), str(c.get("target_key"))): c for c in captures}.values())
 
 
-def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=(), *, context_rows=None) -> bool:
-    return capture_covers_tasks(last_capture(observations, target_key), target_key, rows, context_rows=context_rows)
+def has_healthy_capture(observations: list[dict[str, Any]], target_key: str, rows=(), *, context_rows=None, screenshot_dir=None) -> bool:
+    item = last_capture(observations, target_key)
+    return (capture_covers_tasks(item, target_key, rows, context_rows=context_rows)
+            and (screenshot_dir is None or screenshots_valid(item, screenshot_dir)))
 
 
 def readable_recheck_probe(item, key, rows, started_at, *, recheck=True):
@@ -115,7 +118,7 @@ def readable_recheck_probe(item, key, rows, started_at, *, recheck=True):
         return False
 
 
-def checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=None):
+def checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=None, *, screenshot_dir=None):
     if checkpoint.get("stopped"):
         return False
     captures = unwrap_rows(checkpoint, "observations")
@@ -125,6 +128,8 @@ def checkpoint_covers_workbook(rows, checkpoint, requirements, contexts=None):
     keys = dict.fromkeys(str(row["target_key"]) for row in rows
                          if row.get("platform") == "xiaohongshu" and row.get("target_key"))
     targets = [{"note_id": key} for key in keys]
+    if screenshot_dir is not None and any(not screenshots_valid(existing.get(key), screenshot_dir) for key in keys):
+        return False
     return bool(targets) and not plan_targets(targets, existing, requirements, contexts=contexts)
 
 
@@ -143,6 +148,13 @@ def retry_incomplete_notes(rows, checkpoint, report, path, capture_command, alre
     captures = unwrap_rows(checkpoint, "observations")
     current = {str(item["target_key"]): item for item in captures if item.get("platform") == "xiaohongshu"}
     retry = {}
+    if "--screenshot-dir" in capture_command:
+        for row in rows:
+            key = row.get("target_key")
+            item = current.get(key, {})
+            if (key not in already_retried and row.get("platform") == "xiaohongshu" and item.get("capture_status") == "ok"
+                    and item.get("screenshot_status") in ("partial", "missing")):
+                retry[key] = []
     for result in report["results"]:
         key = result["target_key"]
         if result["platform"] != "xiaohongshu" or result["triage"] != "待人审" or key in already_retried:
@@ -232,6 +244,7 @@ def write_manifest(path: Path, source: Path, output: Path, rows, results, workbo
                 **({"unreviewed_rows": counts["未复核"]} if counts.get("未复核") else {}),
                 **({"settlement_pending_count": summary["settlement_pending_count"]} if summary.get("settlement_pending_count") else {}),
                 "audit_pass": summary["audit_pass"], **pass_state,
+                **({"screenshot_evidence": summary["screenshot_evidence"]} if "screenshot_evidence" in summary else {}),
                 "approved_amount": float(payout.quantize(Decimal("0.01"))),
                 "source_sha256": workbook["source_sha256"] if workbook else sha256(source.read_bytes()).hexdigest(),
                 "output_sha256": workbook["output_sha256"] if workbook else sha256(output.read_bytes()).hexdigest(),
@@ -256,6 +269,7 @@ def main() -> int:
                         help="Opt out of the default low-risk capture profile for an explicitly approved legacy run")
     parser.add_argument("--wait-for-confirmation", action="store_true",
                         help="Hold actual verification pages until the owner confirms via stdin (use a PTY)")
+    parser.add_argument("--no-screenshots", action="store_true", help="Skip saving comment screenshots for this job")
     args = parser.parse_args()
 
     source = Path(args.source).resolve()
@@ -315,6 +329,9 @@ def main() -> int:
             selected = compare([], [], amount_mode="expected-only")
             write_state(observations, {"observations": [], "stopped": False, "recheck_scope": scope})
         payload = merge_audit_results(rows, selected)
+        if not args.no_screenshots and active:
+            attach_screenshots(payload, latest_note_observations(read_checkpoint(observations)),
+                               work_dir, enabled=True)
         return export_job(args, source, expected, report, output, previews, manifest, rows, payload, pass_state)
     except (subprocess.CalledProcessError, RuntimeError, OSError, ValueError, KeyError,
             ArithmeticError, zipfile.BadZipFile, ET.ParseError) as exc:
@@ -354,6 +371,8 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
         "--input", str(source), "--output", str(observations), "--expected", str(expected),
         "--task-targets", "--profile", args.profile, "--expand-dom", "--headed",
     ]
+    screenshot_dir = None if getattr(args, "no_screenshots", False) else observations.parent / DEFAULT_SCREENSHOT_DIR
+    capture_base.extend(["--screenshot-dir", str(screenshot_dir)] if screenshot_dir is not None else ["--no-screenshots"])
     for mapping in args.maps or ():
         capture_base.extend(["--map", mapping])
     if not args.normal_pace:
@@ -374,6 +393,8 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
         item = last_capture(unwrap_rows(updated, "observations"), key)
         healthy = not updated.get("stopped") and capture_covers_tasks(
             item, key, requirements.get(key), context_rows=contexts.get(key))
+        if healthy and screenshot_dir and item.get("screenshot_status") in ("partial", "missing"):
+            probed_partial.add(key)
         if (not healthy and not updated.get("stopped") and readable_recheck_probe(
                 item, key, requirements.get(key, ()), started, recheck=bool(pass_state.get("recheck_id")))):
             # This visit already read the page. Defer any missing tasks to the bounded final retry.
@@ -381,7 +402,8 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
             healthy = True
         return updated, healthy
 
-    if restoring_session or not has_healthy_capture(captures, target, requirements.get(target), context_rows=contexts.get(target)):
+    if restoring_session or not has_healthy_capture(captures, target, requirements.get(target),
+                                                   context_rows=contexts.get(target), screenshot_dir=screenshot_dir):
         checkpoint, healthy = probe(target, refresh=restoring_session)
         if not healthy and not restoring_session and not checkpoint.get("stopped"):
             # An isolated inaccessible or incomplete post cannot establish session health.
@@ -401,7 +423,7 @@ def collect_rows(args, source, expected, observations, manifest, rows, pass_stat
     else:
         print(f"[canary] resume-skip healthy target {target}", flush=True)
     batch_rows = [r for r in rows if r.get("target_key") not in probed_partial] if probed_partial else rows
-    if batch_rows and not checkpoint_covers_workbook(batch_rows, checkpoint, requirements, contexts=contexts):
+    if batch_rows and not checkpoint_covers_workbook(batch_rows, checkpoint, requirements, contexts=contexts, screenshot_dir=screenshot_dir):
         command = capture_base.copy()
         for key in sorted(probed_partial):
             command.extend(["--skip-note-id", key])
@@ -423,6 +445,7 @@ def export_job(args, source, expected, report, output, previews, manifest, rows,
         node_modules = discover_node_modules(args.node_modules)
         env = os.environ.copy()
         env["CODEX_NODE_MODULES"] = node_modules
+        env["AUDIT_PYTHON"] = sys.executable
         run([
             "node", str(SCRIPT_DIR / "build_audited_workbook.mjs"),
             "--source", str(source), "--expected", str(expected),

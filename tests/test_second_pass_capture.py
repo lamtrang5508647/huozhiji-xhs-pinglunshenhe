@@ -1,9 +1,11 @@
+import base64
 import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills/comment-review-audit/scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -54,3 +56,31 @@ class DouyinSecondPassTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 dy.main()
             self.assertEqual(self.output.read_bytes(), original)
+
+    def test_default_capture_requires_verified_existing_image_to_skip_a_visit(self):
+        self.write([("123","成功")])
+        _, scope = dy.capture_plan([self.source])
+        now = datetime.now(timezone.utc).isoformat()
+        old = dict(platform="douyin", target_key="123", capture_status="ok", capture_complete=True,
+                   parser_revision=dy.PARSER_REVISIONS["douyin"], captured_at=now,
+                   captured_comment_count=0, comments=[], image_detection_complete=True)
+        args=["capture","--expected",str(self.source),"--output",str(self.output),"--profile",str(self.output.parent/"profile")]
+        def checkpoint():
+            self.output.write_text(json.dumps(dict(recheck_scope=scope,observations=[old])),encoding="utf8")
+        checkpoint()
+        with patch.object(sys,"argv",args+["--no-screenshots"]), patch.object(dy,"sync_playwright",side_effect=AssertionError("unexpected browser")):
+            self.assertEqual(dy.main(),0)
+        with patch.object(sys,"argv",args), patch.object(dy,"network_fingerprint",return_value="same"), patch.object(
+                dy,"sync_playwright",side_effect=RuntimeError("recapture required")):
+            with self.assertRaisesRegex(RuntimeError,"recapture required"):
+                dy.main()
+            writer=dy.NoteScreenshots(self.output.parent/"评论截图","douyin","123")
+            png=base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+d7ckAAAAASUVORK5CYII=")
+            record=writer.save(Mock(screenshot=Mock(return_value=png)), "empty")
+            old.update(screenshot_status="captured",comment_screenshots=writer.records)
+            checkpoint()
+            self.assertEqual(dy.main(),0)
+            image=self.output.parent/record["path"]
+            image.write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeError,"recapture required"):
+                dy.main()

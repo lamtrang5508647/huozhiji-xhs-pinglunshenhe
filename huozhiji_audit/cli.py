@@ -118,6 +118,7 @@ def main(argv=None):
     audit = commands.add_parser("audit", help="Offline XLSX audit against supplied evidence; never opens Chrome")
     audit.add_argument("--source", required=True)
     audit.add_argument("--observations", required=True)
+    audit.add_argument("--screenshot-dir", type=Path, help="Original screenshot directory if stored separately from observations.json")
     audit.add_argument("--output", required=True, help="Distinct audited XLSX destination")
     audit.add_argument("--report", help="Optional JSON report destination")
     for command in (compare, audit):
@@ -195,7 +196,9 @@ def main(argv=None):
             result = audit_workbook(args.source, read_json(args.observations), args.output,
                                     mapping=table_to_expected.parse_maps(args.map),
                                     amount_rules=table_to_expected.parse_amount_rules(args.amount_rules),
-                                    require_reply_parent=args.require_reply_parent)
+                                    require_reply_parent=args.require_reply_parent,
+                                    evidence_base=(args.screenshot_dir.resolve().parent if args.screenshot_dir
+                                                   else Path(args.observations).resolve().parent))
             report_path = args.report
         brief = None
         if args.brief:
@@ -208,6 +211,8 @@ def main(argv=None):
                 brief["summary"]["settlement_pending_count"] = result["summary"]["settlement_pending_count"]
             if args.command == "audit":
                 brief["output"] = result["workbook"]["output"]
+                if "screenshot_evidence" in result["summary"]:
+                    brief["summary"]["screenshot_evidence"] = result["summary"]["screenshot_evidence"]
         emit(result, report_path, brief=brief)
         audit_pass = result["summary"].get("audit_pass", {})
         counts = audit_pass.get("reviewed_triage_counts", result["summary"]["triage_counts"])
