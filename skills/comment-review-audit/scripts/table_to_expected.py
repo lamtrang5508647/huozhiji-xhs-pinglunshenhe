@@ -51,7 +51,7 @@ PRIOR_CATEGORIES = {
     "图字成功": "图字成功", "图文成功": "图字成功", "文字成功": "文字成功",
     "图片成功": "图片成功", "失败": "失败", "未通过": "失败", "审核失败": "失败",
     "初审失败": "失败", "首审失败": "失败", "审核未通过": "失败", "审核不通过": "失败",
-    "核验失败": "失败", "待人审": "待人审", "需人审": "待人审", "待人工复核": "待人审",
+    "核验失败": "失败", "待人审": "待人审", "需人审": "待人审", "待人工复核": "待人审", "原帖不可访问": "原帖不可访问",
 }
 
 
@@ -699,11 +699,11 @@ def convert(
             amount = row.get(settled_header)
             item["prior_review"] = {
                 "category": category, "raw_category": raw,
-                "triage": category if category in ("", "失败", "待人审") else "成功",
+                "triage": "待人审" if category == "原帖不可访问" else category if category in ("", "失败", "待人审") else "成功",
                 "amount": None if amount in (None, "") else amount,
                 "result_column": columns.get(result_header), "amount_column": columns.get(settled_header),
             }
-            if category in ("失败", "待人审", "文字成功", "图片成功") and price_header == settled_header:
+            if category in ("失败", "待人审", "原帖不可访问", "文字成功", "图片成功") and price_header == settled_header:
                 # A failure zero or an approved component is never a full-task quote.
                 item.pop("expected_amount", None)
         if "expected_amount" not in item or not str(item["expected_amount"]).strip():

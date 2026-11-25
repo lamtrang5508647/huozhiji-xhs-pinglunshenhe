@@ -391,6 +391,13 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     if has_pending:
         write_cell("Y11", "结算说明", style=styles["detail"])
     counts = Counter(item["triage"] for item in results)
+    unavailable = sum(item["result_category"] == "原帖不可访问" for item in results)
+    if unavailable:
+        write_cell("S1", "原帖不可访问（全部任务）", style=styles["header"])
+        write_cell("T1", unavailable, formula=f'COUNTIF($V$12:$V${end},"原帖不可访问")', style=styles["body"])
+        combo_unavailable = sum(r.get("comment_type") == "text+image" and by_id[r["case_id"]]["result_category"] == "原帖不可访问" for r in rows)
+        write_cell("P10", "原帖不可访问", style=styles["body"])
+        write_cell("Q10", combo_unavailable, formula=f'COUNTIFS($U$12:$U${end},"text+image",$V$12:$V${end},P10)', style=styles["body"])
     if counts["未复核"]:
         write_cell("P7", "未复核（原结果空白或未识别）", style=styles["body"])
         write_cell("Q7", counts["未复核"], formula=f'COUNTIF($W$12:$W${end},"未复核")', style=styles["body"])

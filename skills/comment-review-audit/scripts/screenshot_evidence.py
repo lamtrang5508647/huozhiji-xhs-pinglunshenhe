@@ -160,7 +160,8 @@ def attach_screenshots(report, observations, source_base, *, enabled=False):
             continue
         key = row["platform"], row["target_key"]
         visit = (row.get("capture") or {}).get("captured_at")
-        cache_key = (*key, visit)
+        unavailable = row.get("result_category") == "原帖不可访问"
+        cache_key = (*key, visit, unavailable)
         if cache_key not in cache:
             shots = []
             statuses = []
@@ -168,8 +169,14 @@ def attach_screenshots(report, observations, source_base, *, enabled=False):
             for obs in grouped.get(key, []):
                 if visit and obs.get("captured_at") != visit:
                     continue
+                if unavailable and (obs.get("capture_status") != "inaccessible" or obs.get("target_page_state") != "post_unavailable"
+                                    or obs.get("resolved_target_key") not in (None, "", key[1])
+                                    or (not visit and len(grouped[key]) != 1)):
+                    continue
                 statuses.append(obs.get("screenshot_status", "missing"))
                 for original in obs.get("comment_screenshots") or ():
+                    if unavailable and (not isinstance(original, dict) or original.get("kind") != "unavailable"):
+                        continue
                     checked = materialize_screenshot(original, source_base, source_base, *key)
                     if checked is None:
                         statuses.append("partial")

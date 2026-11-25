@@ -9,10 +9,12 @@ import re
 import sys
 import unicodedata
 from collections import Counter, deque
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit
 if __package__:
     from .capture_resume import consistent_empty_state
 else:
@@ -237,7 +239,7 @@ def prepare_observation(raw: Dict[str, Any]) -> Dict[str, Any]:
     result["platform"] = canonical_platform(raw.get("platform")) or str(raw.get("platform", "")).strip().casefold()
     result["target_key"] = target_key(raw)
     if not consistent_empty_state(result):
-        return {**result, "capture_status": "inaccessible", "capture_complete": False,
+        return {**result, "capture_status": "inaccessible", "capture_complete": False, "target_page_state": None,
                 "image_detection_complete": False, "comments": []}
     records = raw.get("comments")
     result["comments"] = []
@@ -583,6 +585,39 @@ def _matching_replies(evidence, parent_text, candidates):
     return [c for c in replies if _identifier(c.get("comment_id")) not in contradicted] if contradicted else replies
 
 
+def latest_visit(captures):
+    """Return all fragments of the most recent dated visit, or the legacy undated group."""
+    if len(captures) < 2:
+        return captures
+    dated = []
+    for capture in captures:
+        try:
+            timestamp = datetime.fromisoformat(str(capture.get("captured_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if timestamp.tzinfo is not None:
+            dated.append((timestamp, capture))
+    if not dated:
+        return captures
+    newest = max(timestamp for timestamp, _ in dated)
+    return [capture for timestamp, capture in dated if timestamp == newest]
+
+
+def confirmed_post_unavailable(capture):
+    return (capture.get("capture_status") == "inaccessible" and capture.get("target_page_state") == "post_unavailable"
+            and capture.get("resolved_target_key") in (None, "", capture.get("target_key")))
+
+
+def unbound_short_note(expected):
+    if platform_key(expected) != "xiaohongshu":
+        return False
+    try:
+        host = (urlsplit(str(expected.get("target_url") or "")).hostname or "").lower()
+    except ValueError:
+        return True
+    return host in {"xhslink.com", "www.xhslink.com", "xhslink.cn", "www.xhslink.cn"}
+
+
 class _TargetEvidence:
     """Ordered captures for one target, with indexes built only when needed."""
 
@@ -594,6 +629,11 @@ class _TargetEvidence:
     @cached_property
     def usable(self):
         return [c for c in self.captures if str(c.get("capture_status", "error")).casefold() == "ok"]
+
+    @cached_property
+    def blocked_capture(self):
+        visit = latest_visit(self.captures)
+        return next((capture for capture in visit if confirmed_post_unavailable(capture)), visit[0])
 
     @cached_property
     def complete(self):
@@ -886,14 +926,17 @@ def compare(
 
         usable = evidence.usable
         if not usable:
-            first = evidence.captures[0]
+            first = evidence.blocked_capture
             result["status"] = "blocked"
             result["reason_codes"].append(str(first.get("capture_status", "blocked")))
             result["capture"] = {
                 "capture_status": first.get("capture_status"),
+                "captured_at": first.get("captured_at"),
                 "evidence_path": first.get("evidence_path"),
                 "warnings": first.get("warnings", []),
             }
+            if confirmed_post_unavailable(first) and not unbound_short_note(expected):
+                result["capture"]["target_page_state"] = "post_unavailable"
             results.append(result)
             continue
 
@@ -1108,6 +1151,8 @@ def compare(
                                           else "legacy_douyin_visible_recheck_required")
         if result.get("expected_type") == "text+image" and result["status"] == "verified":
             result["result_category"] = "图字成功"
+        elif result.get("capture", {}).get("target_page_state") == "post_unavailable":
+            result["result_category"] = "原帖不可访问"
         else:
             result["result_category"] = category_map[result["status"]]
         expected_row = expected_by_case.get(result.get("case_id"), {})
@@ -1173,7 +1218,7 @@ def compare(
     }
     result_category_counts = {
         label: sum(1 for item in results if item["result_category"] == label)
-        for label in ("成功", "图字成功", "文字成功", "图片成功", "失败", "待人审")
+        for label in ("成功", "图字成功", "文字成功", "图片成功", "失败", "待人审", "原帖不可访问")
     }
     return {
         "summary": {

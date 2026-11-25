@@ -11,7 +11,8 @@ from xml.etree import ElementTree as ET
 
 from huozhiji_audit import convert_table, review
 from huozhiji_audit._engine.build_audited_workbook import P, R, add_worksheet_part, build_workbook, encode, set_cell, tag
-from huozhiji_audit._engine.screenshot_evidence import NoteScreenshots
+from huozhiji_audit._engine.screenshot_evidence import NoteScreenshots, attach_screenshots
+from huozhiji_audit._engine.audit_validation import validate_results
 from huozhiji_audit._engine.screenshot_drawing import XDR, relfile
 from huozhiji_audit._engine.workbook_screenshots import display_gallery
 from huozhiji_audit._engine.table_to_expected import xlsx_shared_strings, xlsx_sheet_members, xlsx_text
@@ -41,6 +42,63 @@ def link_target(links, relationships, cell):
 
 
 class ScreenshotWorkbookTests(unittest.TestCase):
+    def test_explicit_unavailable_page_uses_its_visit_and_survives_reimport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "源表.xlsx"
+            observations = fixture(source)["observations"]
+            rows = convert_table(source)["rows"]
+            stamp = "2026-11-25T10:00:00+00:00"
+            older = "2026-11-24T10:00:00+00:00"
+            recorder = NoteScreenshots(base/"评论截图","xiaohongshu","n1")
+            closed = recorder.save(Mock(screenshot=Mock(return_value=PNG)), "unavailable")
+            stale = recorder.save(Mock(screenshot=Mock(return_value=PNG)), "comment", ["old"])
+            confirmed = dict(platform="xiaohongshu",target_key="n1",resolved_target_key="n1",captured_at=stamp,
+                             capture_status="inaccessible",target_page_state="post_unavailable",
+                             screenshot_status="captured",comment_screenshots=[closed])
+            generic = dict(confirmed, target_key="n2", resolved_target_key="n2", target_page_state=None,
+                           warnings=["note_identity_unconfirmed"],screenshot_status="missing",comment_screenshots=[])
+            wrong = dict(confirmed, target_key="n3", resolved_target_key="different")
+            history = dict(confirmed,captured_at=older,target_page_state=None,comment_screenshots=[stale])
+            observations[:3] = [history,confirmed,generic,wrong]
+            report = review(rows,observations)
+            attach_screenshots(report,observations,base,enabled=True)
+            decision = report["results"][0]
+            self.assertEqual((decision["status"],decision["result_category"],decision["triage"],decision["approved_amount"]),
+                             ("blocked","原帖不可访问","待人审",None))
+            self.assertEqual(decision["capture"]["captured_at"],stamp)
+            self.assertEqual(decision["comment_screenshots"], [closed])
+            self.assertEqual([r["result_category"] for r in report["results"][1:3]],["待人审","待人审"])
+            self.assertEqual(report["summary"]["result_category_counts"]["原帖不可访问"], 1)
+            # An old short-link observation has no same-visit proof tying the short code to the resolved note.
+            short = dict(rows[0],target_url="https://xhslink.com/a/shortCode",target_key="shortCode")
+            for unverified_id in ("a"*24, None, "shortCode"):
+                uncertain = dict(confirmed,target_key="shortCode",resolved_target_key=unverified_id)
+                short_result = review([short],[uncertain])["results"][0]
+                self.assertEqual((short_result["result_category"],short_result["approved_amount"]),("待人审",None))
+            bad = copy.deepcopy(report["results"])
+            bad[0]["capture"]["target_page_state"] = None
+            with self.assertRaisesRegex(RuntimeError,"unconfirmed_post_unavailable"):
+                validate_results(rows,bad)
+
+            output = base/"一审.xlsx"
+            build_workbook(source, rows, report["results"], output)
+            self.assertEqual(sheet_data(output,"品牌A")[0]["G2"],"原帖不可访问")
+            self.assertEqual(sheet_data(output,"评论原图")[0]["D3"],"原帖不可访问")
+            self.assertEqual(sheet_data(output,"评论原图")[0]["E3"],"未核定")
+            summary = sheet_data(output,"审核汇总")[0]
+            self.assertEqual((summary["V12"],summary["W12"],summary["T1"]),("原帖不可访问","待人审","1"))
+            rerows = convert_table(output)["rows"]
+            prior = rerows[0]["prior_review"]
+            self.assertEqual((prior["category"],prior["triage"],prior["amount"]),("原帖不可访问","待人审",None))
+            second = review(rerows,observations)
+            self.assertEqual(second["results"][0]["review_action"],"carried_forward")
+            self.assertEqual(second["summary"]["result_category_counts"]["原帖不可访问"],1)
+            rerun = base/"二审.xlsx"
+            build_workbook(output,rerows,second["results"],rerun)
+            self.assertEqual(sheet_data(rerun,"品牌A")[0]["G2"],"原帖不可访问")
+            self.assertEqual(sheet_data(rerun,"评论截图")[0]["G3"],"本次未复核")
+
     def test_tall_images_and_many_related_rows_have_space_and_never_overlap(self):
         tasks=[dict(number=i+3,source="表1",location="'表1'!A2",body="核对任务",category="成功",amount=1,
                     status="已留图",images=[1],carried=False,url="",url_label="打开原笔记") for i in range(3)]

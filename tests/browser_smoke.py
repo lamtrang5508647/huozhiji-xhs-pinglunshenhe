@@ -21,6 +21,7 @@ from recheck_dom import exercise_recheck_dom
 from douyin_visibility import exercise_douyin_visibility
 from xhs_empty_state import exercise_empty_state
 from xhs_finance_screenshots import exercise_finance_screenshots
+from xhs_note_error import exercise_note_error
 
 assert login_modules()[-1] is XhsClient
 assert capture_modules()[2] is XhsClient
@@ -72,6 +73,7 @@ with tempfile.TemporaryDirectory(prefix="audit-browser-") as directory:
                     exercise_visible_comments(page)
                     exercise_empty_state(page, xhs_batch_capture)
                     exercise_finance_screenshots(page, xhs_batch_capture)
+                    exercise_note_error(page, xhs_batch_capture)
                     exercise_deferred_comments(page, xhs_batch_capture)
                     exercise_recheck_dom(page, xhs_batch_capture)
                     exercise_douyin_visibility(page)

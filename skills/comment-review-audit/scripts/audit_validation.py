@@ -39,11 +39,16 @@ def validate_results(rows: list[dict[str, Any]], results: list[dict[str, Any]]) 
         if "prior_review" in source and source["prior_review"].get("triage") != "成功":
             raise RuntimeError("missing_carried_forward_row")
         triage, category = item.get("triage"), item.get("result_category")
-        if triage not in ("成功", "失败", "待人审") or category not in ("成功", "失败", "待人审", "图字成功", "文字成功", "图片成功"):
+        if triage not in ("成功", "失败", "待人审") or category not in ("成功", "失败", "待人审", "原帖不可访问", "图字成功", "文字成功", "图片成功"):
             raise RuntimeError("report_category_missing_or_invalid")
+        if category == "原帖不可访问":
+            capture = item.get("capture") or {}
+            if (item.get("status") != "blocked" or capture.get("capture_status") != "inaccessible"
+                    or capture.get("target_page_state") != "post_unavailable"):
+                raise RuntimeError("unconfirmed_post_unavailable")
         if ((triage == "成功" and category not in ("成功", "图字成功", "文字成功", "图片成功"))
                 or (triage == "失败" and category != "失败")
-                or (triage == "待人审" and category not in ("待人审", "文字成功", "图片成功"))):
+                or (triage == "待人审" and category not in ("待人审", "原帖不可访问", "文字成功", "图片成功"))):
             raise RuntimeError("report_category_triage_conflict")
         value = item.get("approved_amount")
         reasons = PENDING_SETTLEMENT_REASONS.get(item.get("settlement_status"))

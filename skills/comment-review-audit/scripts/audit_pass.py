@@ -1,12 +1,11 @@
 """Select successful rows for recheck and reconcile them with untouched source rows."""
 from collections import defaultdict
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 if __package__:
-    from .review_comments import compare, platform_key, target_key
+    from .review_comments import compare, latest_visit, platform_key, target_key
 else:
-    from review_comments import compare, platform_key, target_key
+    from review_comments import compare, latest_visit, platform_key, target_key
 
 
 def rows_to_review(rows):
@@ -80,22 +79,7 @@ def current_recheck_captures(captures):
     for item in captures:
         visits[platform_key(item), target_key(item)].append(item)
     for group in visits.values():
-        if len(group) == 1:
-            yield group[0]
-            continue
-        dated = []
-        for item in group:
-            try:
-                when = datetime.fromisoformat(str(item.get("captured_at", "")).replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if when.tzinfo is not None:
-                dated.append((when, item))
-        if dated:
-            newest = max(when for when, item in dated)
-            yield from (item for when, item in dated if when == newest)
-        else:
-            yield from group
+        yield from latest_visit(group)
 
 
 def compare_audit_rows(rows, captures, *, require_reply_parent=False, amount_mode="expected-only", allow_duplicates=False):

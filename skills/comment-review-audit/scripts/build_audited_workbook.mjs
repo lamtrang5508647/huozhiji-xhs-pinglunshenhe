@@ -55,6 +55,14 @@ function approvedAmount(result) {
   if (result.status === "carried_forward") {
     return result.approved_amount == null ? null : Number(result.approved_amount);
   }
+  if (result.result_category === "原帖不可访问") {
+    if (result.status !== "blocked" || result.capture?.capture_status !== "inaccessible" ||
+        result.capture?.target_page_state !== "post_unavailable" || derivedTriage(result) !== "待人审" ||
+        (result.approved_amount != null && result.approved_amount !== "")) {
+      throw new Error("Unconfirmed unavailable post or invalid settlement");
+    }
+    return null;
+  }
   if (settlementNotes.has(result.settlement_status)) {
     const imageReview = result.settlement_status === "pending_specified_image" && derivedTriage(result) === "待人审";
     if ((!imageReview && derivedTriage(result) !== "成功") || (result.approved_amount != null && result.approved_amount !== "")) {
@@ -332,6 +340,12 @@ summarySheet.getRange(`J${groupStartRow}:N${groupEndRow}`).values = groups.map((
 
 summarySheet.getRange("P1:Q1").values = [["图文组合结果", "数量"]];
 summarySheet.getRange("P2:P6").values = [["图字成功"], ["文字成功"], ["图片成功"], ["失败"], ["待人审"]];
+if (results.some((result) => derivedCategory(result) === "原帖不可访问")) {
+  summarySheet.getRange("S1").values = [["原帖不可访问（全部任务）"]];
+  summarySheet.getRange("T1").formulas = [[`=COUNTIF($V$${detailStartRow}:$V$${detailEndRow},"原帖不可访问")`]];
+  summarySheet.getRange("P10").values = [["原帖不可访问"]];
+  summarySheet.getRange("Q10").formulas = [[`=COUNTIFS($U$${detailStartRow}:$U$${detailEndRow},"text+image",$V$${detailStartRow}:$V$${detailEndRow},P10)`]];
+}
 if (results.some((result) => result.triage === "未复核")) {
   summarySheet.getRange("H1").values = [["成功率（有审核结果）"]];
   summarySheet.getRange("P7").values = [["未复核（原结果空白或未识别）"]];
@@ -527,7 +541,7 @@ if (needsIndex) {
 
 const triage = countBy(results, derivedTriage, results.some((r) => r.triage === "未复核") ? ["成功", "失败", "待人审", "未复核"] : ["成功", "失败", "待人审"]);
 const comboRows = results.filter((item) => item.expected_type === "text+image");
-const combo = countBy(comboRows, derivedCategory, ["图字成功", "文字成功", "图片成功", "失败", "待人审"]);
+const combo = countBy(comboRows, derivedCategory, ["图字成功", "文字成功", "图片成功", "失败", "待人审", "原帖不可访问"]);
 const payout = results
   .filter((item) => derivedTriage(item) === "成功")
   .reduce((sum, item) => sum + Number(approvedAmount(item) || 0), 0);

@@ -63,7 +63,7 @@ class CheckpointedJobTests(unittest.TestCase):
         (self.job / first["comment_screenshots"][0]["path"]).unlink()
         def restore(command):
             self.assertEqual(command[command.index("--only-note-id") + 1], first["target_key"])
-            self.assertEqual(Path(command[command.index("--screenshot-dir")+1]), directory)
+            self.assertEqual(Path(command[command.index("--screenshot-dir") + 1]).resolve(), directory.resolve())
             snapshot(first)
             runner.write_state(destination, self.checkpoint)
         with patch.object(sys, "argv", argv), patch.object(runner, "run_capture", side_effect=restore) as calls:

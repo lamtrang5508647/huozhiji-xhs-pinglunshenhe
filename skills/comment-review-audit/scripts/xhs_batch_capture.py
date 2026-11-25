@@ -83,6 +83,8 @@ def target_from_url(value: str) -> Optional[Dict[str, Any]]:
                 "token": "", "short_url": url, "sources": []}
     if host != "xiaohongshu.com" and not host.endswith(".xiaohongshu.com"):
         return None
+    if parsed.path.rstrip("/") == "/404":
+        return None  # Its query names the failed request, not a readable note.
     note_id = note_id_from_url(url)
     if not note_id:
         return None
@@ -748,8 +750,9 @@ class CommentPhotos:
         target = target_from_url(str(self.page.url))
         return target and target["note_id"] == self.note_id and note_page_state(self.page, self.note_id) != "wrong_note"
 
-    def take(self, node, kind, *, valid, ids=(), image_keys=()):
+    def take(self, node, kind, *, valid, ids=(), image_keys=(), bound=None):
         record = None
+        check_identity = bound or self.same_note
         try:
             # Responsive note layouts can keep Playwright's action-stability wait pending
             # even when the correct card already fills a stationary, visible rectangle.
@@ -788,9 +791,9 @@ class CommentPhotos:
             # Lazy thumbnails can start loading only when the card is scrolled into view.
             wait = 800 if any(k not in self.waited_for_images for k in image_keys) else 0
             self.waited_for_images.update(image_keys)
-            if self.same_note() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, wait)):
+            if check_identity() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, wait)):
                 record = self.writer.save(node, kind, comment_ids=ids)
-                if record and self.same_note() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, 0)):
+                if record and check_identity() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, 0)):
                     return record
         except Exception:
             # A recycled or detached node still needs a new, verifiable screenshot.
@@ -1201,6 +1204,92 @@ def check_note_comments(page, key, raw_comments, declared, requirements, args, *
 
 SINGLE_NOTE_PAGE_STATES = ("target_note", "post_unavailable")
 
+NOTE_ERROR_TEXT = re.compile(
+    r"^\s*(?:抱歉[，,！!\s]*)?(?:你访问的页面不见了|你访问的笔记不见了|(?:这篇|该|当前)?笔记(?:已被删除|已删除|不存在|暂时无法浏览|暂时无法查看)"
+    r"|(?:该|当前)内容(?:不存在|暂时无法查看|暂时无法浏览|不可见))[。！!～~]?\s*$")
+
+
+def official_note_error_url(url, note_id):
+    """The note-specific 404 has a signed-in official origin and one explicit target."""
+    try:
+        parsed = urlparse(url)
+        if (parsed.scheme != "https" or parsed.hostname != "www.xiaohongshu.com" or parsed.port not in (None,443)
+                or parsed.username is not None or parsed.password is not None or parsed.path != "/404" or parsed.fragment):
+            return False
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return False
+    ids = [k for k in query if k.lower().replace("_","") == "noteid"]
+    return ids == ["noteId"] and query["noteId"] == [note_id] and query.get("errorCode") == ["-510001"]
+
+
+class NoteErrorPage:
+    """Preserve the official note-specific error notice before its timed redirect to the home page."""
+    def __init__(self, client, key, photos):
+        self.client, self.key, self.photos = client, key, photos
+        self.page = client._page
+        self.requested = self.seen = self.reading = False
+        self.image = None
+
+    def listen(self, stack):
+        source = getattr(self.client, "_audit_source_url", None)
+        if not isinstance(source, str) or getattr(self.client, "_audit_note_id", None) != self.key:
+            return
+        parsed = urlparse(source)
+        original = re.fullmatch(r"/(?:explore|discovery/item)/([a-zA-Z0-9]+)/?", parsed.path)
+        try:
+            allowed_origin = (parsed.scheme == "https" and parsed.hostname in ("www.xiaohongshu.com", "xiaohongshu.com")
+                              and parsed.username is None and parsed.password is None and parsed.port in (None, 443))
+        except ValueError:
+            return
+        if not allowed_origin or not original or original[1] != self.key:
+            return
+        def requested(request):
+            if request.is_navigation_request() and request.url == source and request.frame == self.page.main_frame:
+                self.requested = True
+        def navigated(frame):
+            if frame == self.page.main_frame:
+                if frame.url == source:
+                    self.requested = True
+                elif official_note_error_url(frame.url, self.key):
+                    self.inspect()
+        for signal, callback in (("request", requested), ("framenavigated", navigated)):
+            self.page.on(signal, callback)
+            stack.callback(self.page.remove_listener, signal, callback)
+
+    def inspect(self):
+        if self.reading or not self.requested or not official_note_error_url(self.page.url, self.key) or self.image:
+            return
+        self.reading = True
+        try:
+            excluded = ".note-container,.comments-container,.comment-item,.note-content,.desc,[role=dialog],nav,header"
+            notice = self.page.get_by_text(NOTE_ERROR_TEXT).and_(self.page.locator(
+                f":visible:not(:is({excluded})):not(:is({excluded}) *)")).first
+            notice.wait_for(state="visible", timeout=900)
+            def bound():
+                return official_note_error_url(self.page.url, self.key) and not reply_page_blocker(self.client)
+            if bound() and notice.is_visible():
+                self.seen = True
+                if self.photos is not None:
+                    self.image = self.photos.take(notice, "unavailable", valid=notice.is_visible, bound=bound)
+        except Exception:
+            # The error component may already have navigated away.
+            pass
+        finally:
+            self.reading = False
+
+    def applies(self):
+        self.inspect()
+        if not self.seen:
+            return False
+        current = str(self.page.url)
+        if official_note_error_url(current, self.key):
+            return True
+        home = urlparse(current)
+        return (home.scheme == "https" and home.netloc == "www.xiaohongshu.com"
+                and home.path == "/explore" and not home.fragment
+                and set(parse_qs(home.query, keep_blank_values=True)) <= {"source"})
+
 
 def note_page_state(page, note_id):
     # xhs-cli falls back to the first map entry when the requested note is absent.
@@ -1230,8 +1319,11 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
     directory = getattr(args, "screenshot_dir", None)
     photos = CommentPhotos(NoteScreenshots(directory, "xiaohongshu", source_key), client._page, note_id) if directory else None
     try:
-        return _collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error,
-                                      prior, context_rows=context_rows, photos=photos)
+        with ExitStack() as stack:
+            error_page = NoteErrorPage(client, note_id, photos)
+            error_page.listen(stack)
+            return _collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error,
+                                          prior, context_rows=context_rows, photos=photos, error_page=error_page)
     except BaseException:
         if photos is not None:
             photos.writer.discard_all()
@@ -1239,7 +1331,7 @@ def collect_note_evidence(client, source_key, note_id, token, requirements, args
 
 
 def _collect_note_evidence(client, source_key, note_id, token, requirements, args, login_error, fetch_error, prior,
-                           *, context_rows, photos):
+                           *, context_rows, photos, error_page):
     def check_note_identity(check=None):
         active_note = target_from_url(str(client._page.url))
         page_state = note_page_state(client._page, note_id)
@@ -1251,11 +1343,18 @@ def _collect_note_evidence(client, source_key, note_id, token, requirements, arg
             raise error
         return page_state
 
-    def restricted_result():
+    def restricted_result(official=False):
         observation = {"target_key": source_key, "platform": "xiaohongshu", "capture_status": "inaccessible",
                        "capture_complete": False, "image_detection_complete": False, "comments": [],
                        "target_page_state": "post_unavailable", "warnings": ["post_unavailable"]}
-        if photos is not None:
+        if official:
+            observation["availability_source"] = "official_note_error_page"
+            if photos is not None:
+                for shot in list(photos.writer.records):
+                    if shot is not error_page.image:
+                        photos.writer.discard(shot)
+                photos.attach(observation, False)
+        elif photos is not None:
             photos.writer.discard_all()
             messages = client._page.locator('[role=alert], [class*="unavailable"], [class*="not-found"], [class*="error"], .access-wrapper')
             reason = re.compile("这篇笔记已被删除|笔记不存在|笔记已删除|当前笔记暂时无法浏览|作者设置了权限|该笔记仅作者可见")
@@ -1275,14 +1374,14 @@ def _collect_note_evidence(client, source_key, note_id, token, requirements, arg
         if isinstance(note, dict):
             detail_id = note.get("noteId") or note.get("note_id") or note.get("id")
         declared = declared_comment_count(detail)
-        raw = [] if detail_id and str(detail_id) != note_id else client.get_note_comments(note_id, token, max_comments=0)
+        raw = [] if (detail_id and str(detail_id) != note_id) or error_page.applies() else client.get_note_comments(note_id, token, max_comments=0)
     except login_error:
         raise
     except fetch_error as error:
         status = classify_failure(1, str(error))
         if status in ("session_expired", "captcha", "risk_control"):
             raise login_error(status if status != "session_expired" else "login required") from None
-        if not requirements and not args.expand_dom:
+        if not requirements and not args.expand_dom and not error_page.applies():
             raise
         # An unavailable data view can still leave the ordinary note page usable.
         structured_ok = False
@@ -1290,6 +1389,11 @@ def _collect_note_evidence(client, source_key, note_id, token, requirements, arg
     blocker = reply_page_blocker(client)
     if blocker:
         raise login_error(blocker)
+    if error_page.applies():
+        return restricted_result(official=True)
+    if error_page.image is not None:
+        photos.writer.discard(error_page.image)
+        error_page.image = None
     if check_note_identity() == "post_unavailable":
         return restricted_result()
     evidence, terminal, parse_failed = check_note_comments(
@@ -1302,6 +1406,8 @@ def _collect_note_evidence(client, source_key, note_id, token, requirements, arg
         if check.get("page_attempted"):
             error.reply_verification = {**check, "status": "blocked", "unconfirmed_after": None}
         raise error
+    if error_page.applies():
+        return restricted_result(official=True)
     page_state = check_note_identity(check)
     if page_state == "post_unavailable":
         return restricted_result()

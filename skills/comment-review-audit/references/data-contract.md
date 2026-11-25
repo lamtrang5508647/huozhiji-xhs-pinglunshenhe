@@ -142,7 +142,8 @@ Every row has both `result_category` and `triage`.
 | Image component only with explicit component rate | `图片成功` | `成功` | Image component rate |
 | Confirmed text/image component without an explicit component rate (default) | `文字成功` / `图片成功` | `成功` | Blank |
 | Complete capture, neither required component / conflicting type or amount | `失败` | `失败` | `0.00` |
-| Any blocker or ambiguity | `待人审` | `待人审` | Blank |
+| The identified original post displays a verified unavailability notice | `原帖不可访问` | `待人审` | Blank |
+| Other blockers or ambiguities | `待人审` | `待人审` | Blank |
 
 `失败` for a text+image task means neither required component was established in a healthy complete capture. A partial component remains distinct and is paid only when its component rate is explicitly defined by the source table.
 

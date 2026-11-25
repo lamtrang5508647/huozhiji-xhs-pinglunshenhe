@@ -72,7 +72,7 @@ For finance review, live capture saves PNGs of the current note's comments. Deli
    ```
 
 7. Inspect `失败`, `待人审`, `文字成功` and `图片成功` decisions made in the current pass. The required user-facing classifications are:
-   - General triage: `成功`, `失败`, `待人审`.
+   - General triage: `成功`, `失败`, `待人审`. A confirmed unavailability notice for the assigned post has the detailed result `原帖不可访问` and an empty approved amount.
    - Text+image detail: `图字成功`, `文字成功`, `图片成功`, `失败`, `待人审`.
    - `文字成功` and `图片成功` identify the verified component. Use the explicit component rate for payment. Leave an unresolved payment blank and report the settlement reason. Confirmed failures receive `0.00`.
 8. Build the audited workbook. Preserve the original sheets and embedded images, use the workbook’s result and approved-amount columns, using free columns or appending missing ones while preserving source rates and notes, and add/refresh `审核汇总` in the required settlement template: `团长 / 产品名 / 涉及工作表数 / 总条数 / 成功数 / 失败数 / 需人审数 / 成功率 / 报销金额 / 涉及工作表 / 团长联系方式 / 跟团长结算时间 / 结算凭证 / 二维码`. The summary `团长` must directly use the complete value from the product sheet's `团长` field (legacy `团` is accepted); never substitute the `负责人` abbreviation. Group rows by source `团长` + `产品`; preserve previously entered values in the last four manual columns when rebuilding.

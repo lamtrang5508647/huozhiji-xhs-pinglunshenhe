@@ -25,6 +25,19 @@ def unavailable(key, state):
 
 
 class TargetScopeTests(unittest.TestCase):
+    def test_official_note_error_requires_the_exact_secure_origin_error_and_one_note_id(self):
+        official = "https://www.xiaohongshu.com/404?noteId=demo&errorCode=-510001"
+        self.assertTrue(xhs.official_note_error_url(official + "&source=share", "demo"))
+        self.assertIsNone(xhs.target_from_url(official))
+        for alternate in (official.replace("https:", "http:"), official.replace("www.", "else."),
+                          official.replace(".com/", ".com:444/"), official.replace("www.", "user@www."),
+                          official.replace(".com/", ".com.invalid/"), official.replace("/404?", "/login?"),
+                          official.replace("demo", "other"), official.replace("-510001", "-1"),
+                          official + "#login", official + "&noteId=demo", official + "&note_id=other",
+                          official + "&errorCode=-1", official.replace("noteId=", "itemId=")):
+            with self.subTest(url=alternate):
+                self.assertFalse(xhs.official_note_error_url(alternate, "demo"))
+
     def test_explicit_empty_proof_is_reusable_and_inconsistent_evidence_is_not(self):
         row = dict(case_id="s", target_key="a", platform="xiaohongshu", comment_text="wanted", expected_amount="1")
         proof = {**probe("a"), "capture_complete":True, "image_detection_complete":True, "comments":[],
