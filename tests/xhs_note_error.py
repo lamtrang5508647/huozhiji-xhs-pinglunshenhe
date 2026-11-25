@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.parse import urlparse
 import json
+import time
 
 
 def exercise_note_error(page, reader):
@@ -19,22 +20,31 @@ def exercise_note_error(page, reader):
         _page = page
         _audit_note_id = "demo"
         _audit_source_url = source
+        def __init__(self, _cookies):
+            pass
+        def _human_wait(self, minimum, maximum):
+            time.sleep(maximum)
         def get_note_detail(self, *_):
             page.goto(source, wait_until="domcontentloaded")
+            if goes_home:
+                # Match xhs-cli handing control back only after its pacing delay.
+                self._human_wait(1.25, 1.25)
             page.wait_for_url(home if goes_home else landing, wait_until="domcontentloaded", timeout=6000)
             return {"note":{"noteId":"demo"}}
         def get_note_comments(self, *args, **kwargs):
             return []
-    client = Client()
     examples = [
         (error, prompt, True, True, "inaccessible"),
         (error.replace("noteId=demo","noteId=foreign"), prompt, False, True, "wrong_note"),
         (error, prompt, False, False, "wrong_note"),
         (error, '<div class="note-container">'+prompt+'</div>', False, True, "wrong_note"),
+        (error, prompt+'<div style="position:fixed;inset:0;z-index:5;background:white">稍候</div>',
+         False, True, "wrong_note"),
         (error, '<div>系统正忙，请稍后重试</div>', False, True, "wrong_note"),
         (error, prompt+'<div role="dialog">请完成安全验证</div>', False, True, "security"),
     ]
     with TemporaryDirectory() as temp:
+        client = reader.persistent_client(Client, {}, temp, False)
         folder = Path(temp)/"评论截图"
         for landing, content, goes_home, authorized, desired in examples:
             client._audit_source_url = source if authorized else source.replace("/demo","/other")

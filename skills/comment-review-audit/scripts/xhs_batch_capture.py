@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -750,9 +751,8 @@ class CommentPhotos:
         target = target_from_url(str(self.page.url))
         return target and target["note_id"] == self.note_id and note_page_state(self.page, self.note_id) != "wrong_note"
 
-    def take(self, node, kind, *, valid, ids=(), image_keys=(), bound=None):
+    def take(self, node, kind, *, valid, ids=(), image_keys=()):
         record = None
-        check_identity = bound or self.same_note
         try:
             # Responsive note layouts can keep Playwright's action-stability wait pending
             # even when the correct card already fills a stationary, visible rectangle.
@@ -791,9 +791,9 @@ class CommentPhotos:
             # Lazy thumbnails can start loading only when the card is scrolled into view.
             wait = 800 if any(k not in self.waited_for_images for k in image_keys) else 0
             self.waited_for_images.update(image_keys)
-            if check_identity() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, wait)):
+            if self.same_note() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, wait)):
                 record = self.writer.save(node, kind, comment_ids=ids)
-                if record and check_identity() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, 0)):
+                if record and self.same_note() and node.evaluate(exposed) and valid() and (not image_keys or node.evaluate(image_ready, 0)):
                     return record
         except Exception:
             # A recycled or detached node still needs a new, verifiable screenshot.
@@ -1229,7 +1229,7 @@ class NoteErrorPage:
         self.client, self.key, self.photos = client, key, photos
         self.page = client._page
         self.requested = self.seen = self.reading = False
-        self.image = None
+        self.image = self.session = None
 
     def listen(self, stack):
         source = getattr(self.client, "_audit_source_url", None)
@@ -1244,6 +1244,9 @@ class NoteErrorPage:
             return
         if not allowed_origin or not original or original[1] != self.key:
             return
+        if self.photos is not None:
+            self.session = self.page.context.new_cdp_session(self.page)
+            stack.callback(self.session.detach)
         def requested(request):
             if request.is_navigation_request() and request.url == source and request.frame == self.page.main_frame:
                 self.requested = True
@@ -1266,20 +1269,66 @@ class NoteErrorPage:
             notice = self.page.get_by_text(NOTE_ERROR_TEXT).and_(self.page.locator(
                 f":visible:not(:is({excluded})):not(:is({excluded}) *)")).first
             notice.wait_for(state="visible", timeout=900)
-            def bound():
-                return official_note_error_url(self.page.url, self.key) and not reply_page_blocker(self.client)
-            if bound() and notice.is_visible():
-                self.seen = True
-                if self.photos is not None:
-                    self.image = self.photos.take(notice, "unavailable", valid=notice.is_visible, bound=bound)
+            self.image = self.capture_notice(notice)
         except Exception:
             # The error component may already have navigated away.
             pass
         finally:
             self.reading = False
 
+    def capture_notice(self, notice):
+        # This page automatically navigates away. Capture the pixels of its currently
+        # painted text directly, without locator scrolling, animation or font waits.
+        read_box = """e => {
+            const visibleText = document.body.innerText;
+            if (/手机号登录|输入验证码|登录后推荐更懂你的笔记|登录后查看更多评论|请完成(?:安全)?验证|访问(?:过于)?频繁/.test(visibleText))
+                return null;
+            const gates = document.querySelectorAll('[role=dialog], .captcha-container, .verify-dialog, .security-dialog');
+            if ([...gates].some(n => n.checkVisibility() && /安全验证|验证码|滑动验证/.test(n.innerText))) return null;
+            const range = document.createRange();
+            range.selectNodeContents(e);
+            const boxes = [...range.getClientRects()].filter(r => r.width && r.height);
+            if (!boxes.length) return null;
+            for (let p = e; p; p = p.parentElement) {
+                const css = getComputedStyle(p);
+                if (css.visibility !== 'visible' || Number(css.opacity) < 0.95) return null;
+            }
+            for (const r of boxes) {
+                if (r.left < 0 || r.top < 0 || r.right > innerWidth || r.bottom > innerHeight) return null;
+                for (const part of [0.12, 0.5, 0.88]) {
+                    const hit = document.elementFromPoint(r.left + part*r.width, r.top + r.height/2);
+                    if (!hit || !(e.contains(hit) || (hit.contains(e) && getComputedStyle(e).pointerEvents === 'none')))
+                        return null;
+                }
+            }
+            const x = Math.max(0, Math.floor(Math.min(...boxes.map(r=>r.left)))-16);
+            const y = Math.max(0, Math.floor(Math.min(...boxes.map(r=>r.top)))-12);
+            const right = Math.min(innerWidth, Math.ceil(Math.max(...boxes.map(r=>r.right)))+16);
+            const bottom = Math.min(innerHeight, Math.ceil(Math.max(...boxes.map(r=>r.bottom)))+12);
+            return {text:e.innerText.trim(), url:location.href, timeOrigin:performance.timeOrigin,
+                clip:{x:x+scrollX, y:y+scrollY, width:right-x, height:bottom-y, scale:1}};
+        }"""
+        for _ in range(6):
+            before = notice.evaluate(read_box, timeout=250)
+            if before and official_note_error_url(before["url"], self.key) and NOTE_ERROR_TEXT.fullmatch(before["text"]):
+                self.seen = True
+                if self.photos is None:
+                    return None
+                frame = self.session.send("Page.captureScreenshot", {"format":"png", "clip":before["clip"],
+                                          "captureBeyondViewport":False, "fromSurface":True})
+                if notice.evaluate(read_box, timeout=250) == before:
+                    data = base64.b64decode(frame["data"], validate=True)
+                    return self.photos.writer.save(notice, "unavailable", capture=lambda: data)
+            if not official_note_error_url(self.page.url, self.key):
+                break
+            self.page.wait_for_timeout(70)
+
     def applies(self):
         self.inspect()
+        if self.reading:
+            deadline = time.monotonic() + 0.9
+            while self.reading and time.monotonic() < deadline:
+                self.page.wait_for_timeout(25)
         if not self.seen:
             return False
         current = str(self.page.url)

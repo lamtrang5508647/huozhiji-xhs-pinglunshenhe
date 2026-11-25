@@ -15,6 +15,18 @@ PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4
 
 
 class FinanceWorkbookTests(unittest.TestCase):
+    def test_viewport_capture_uses_the_same_note_binding_and_png_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "评论截图"
+            writer = NoteScreenshots(directory, "xiaohongshu", "note")
+            locator = Mock()
+            record = writer.save(locator, "unavailable", capture=lambda: PNG)
+            self.assertEqual(image_bytes(record, directory, "xiaohongshu", "note"), PNG)
+            self.assertIsNone(image_bytes(record, directory, "xiaohongshu", "other"))
+            self.assertIsNone(writer.save(locator, "unavailable", capture=lambda: b"bad"))
+            self.assertEqual(writer.records, [record])
+            locator.screenshot.assert_not_called()
+
     def test_post_link_preserves_the_assigned_share_and_rejects_other_targets(self):
         xhs = "https://www.xiaohongshu.com/explore/example?xsec_token=fixture"
         self.assertEqual(checked_note_url(xhs, "xiaohongshu", "example"), xhs)

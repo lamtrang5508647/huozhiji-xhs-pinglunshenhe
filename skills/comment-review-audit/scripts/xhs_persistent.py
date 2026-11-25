@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import Any, Dict, Type
 from urllib.parse import urlsplit
@@ -36,6 +37,14 @@ def persistent_client(
                     and parsed.hostname == "www.xiaohongshu.com" and parsed.path == f"/explore/{note_id}"):
                 url = self._audit_source_url
             return super()._goto(url, **kwargs)
+
+        def _human_wait(self, min_sec=1.0, max_sec=3.0):
+            # Keep the CLI's full pacing delay while allowing an official note
+            # error page to be observed before its own timer returns to the feed.
+            if getattr(self, "_audit_note_id", None):
+                self._page.wait_for_timeout(random.uniform(min_sec, max_sec) * 1000)
+            else:
+                super()._human_wait(min_sec, max_sec)
 
         def start(self) -> None:
             from playwright.sync_api import sync_playwright

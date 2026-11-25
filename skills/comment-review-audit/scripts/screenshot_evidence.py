@@ -73,7 +73,7 @@ class NoteScreenshots:
         self._owned = {}
         self._sequence = 0
 
-    def save(self, locator, kind, comment_ids=()):
+    def save(self, locator, kind, comment_ids=(), *, capture=None):
         if kind not in KINDS:
             raise ValueError("unknown screenshot kind")
         if isinstance(comment_ids, (str, int)):
@@ -82,7 +82,10 @@ class NoteScreenshots:
         file = self.folder / f"{self._sequence:04}-{kind}.png"
         temp = file.with_suffix(".tmp")
         try:
-            data = locator.screenshot(type="png", timeout=4500, animations="disabled")
+            if capture is None:
+                data = locator.screenshot(type="png", timeout=4500, animations="disabled")
+            else:
+                data = capture()
             if not _is_png(data):
                 raise ValueError("browser did not return a PNG")
             self.folder.mkdir(parents=True, exist_ok=True)
