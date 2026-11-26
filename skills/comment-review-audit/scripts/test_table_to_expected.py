@@ -9,7 +9,9 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from table_to_expected import convert, read_xlsx, infer_platform, xlsx_text  # noqa: E402
+from huozhiji_audit import review  # noqa: E402
 
 
 def run():
@@ -103,9 +105,9 @@ def run():
         assert read_xlsx(path)[0]["case_id"] == "a2"
 
         image_path = Path(directory) / "floating-image.xlsx"
-        image_sheet = """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>文章链接</t></is></c><c r="B1" t="inlineStr"><is><t>评论文字需求</t></is></c><c r="C1" t="inlineStr"><is><t>需要回复评论内容【左边填写回第几条】</t></is></c><c r="F1" t="inlineStr"><is><t>评论图片需求</t></is></c><c r="G1" t="inlineStr"><is><t>金额【文字1.5，文字加图2元，单图1.5】</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>https://www.xiaohongshu.com/discovery/item/n2?token=private</t></is></c><c r="B2" t="inlineStr"><is><t>图文评论</t></is></c></row></sheetData><drawing r:id="rIdDrawing1"/></worksheet>"""
+        image_sheet = """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>文章链接</t></is></c><c r="B1" t="inlineStr"><is><t>评论文字需求</t></is></c><c r="C1" t="inlineStr"><is><t>需要回复评论内容【左边填写回第几条】</t></is></c><c r="F1" t="inlineStr"><is><t>评论图片需求</t></is></c><c r="G1" t="inlineStr"><is><t>金额【文字1.5，文字加图2元，单图1.5】</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>https://www.xiaohongshu.com/discovery/item/n2?token=private</t></is></c><c r="B2" t="inlineStr"><is><t>图文评论</t></is></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>https://www.xiaohongshu.com/discovery/item/n2?token=private</t></is></c><c r="B3" t="inlineStr"><is><t>回复序号2</t></is></c><c r="C3" t="inlineStr"><is><t></t></is></c></row></sheetData><drawing r:id="rIdDrawing1"/></worksheet>"""
         image_sheet_rels = """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing1" Target="../drawings/drawing1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"/></Relationships>"""
-        drawing = """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:twoCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic/></xdr:twoCellAnchor></xdr:wsDr>"""
+        drawing = """<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:twoCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic/></xdr:twoCellAnchor><xdr:twoCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic/></xdr:twoCellAnchor></xdr:wsDr>"""
         with zipfile.ZipFile(image_path, "w") as archive:
             archive.writestr("xl/workbook.xml", workbook)
             archive.writestr("xl/_rels/workbook.xml.rels", rels)
@@ -118,6 +120,51 @@ def run():
         assert image_converted[0]["comment_type"] == "text+image"
         assert image_converted[0]["has_image"] is True
         assert image_converted[0]["expected_amount"] == "2.00"
+        directive = image_converted[1]
+        assert directive["reply_to"] == "回复序号2"
+        assert directive["comment_text"] == ""
+        assert directive["comment_type"] == "image"
+        assert directive["has_image"] is True
+        assert directive["expected_amount"] == "1.50"
+
+        positive = review([directive], [{
+            "platform": "xiaohongshu", "target_key": "n2", "capture_status": "ok",
+            "capture_complete": False, "visible_comment_panel_readable": True,
+            "image_detection_complete": True,
+            "comments": [{"comment_id": "image-reply", "text": "", "has_image": True}],
+        }])["results"][0]
+        assert positive["status"] == "verified", positive
+        assert positive["triage"] == "成功", positive
+        assert positive["approved_amount"] == "1.50", positive
+
+    directive_with_body = convert([{
+        "文章链接": "https://www.xiaohongshu.com/discovery/item/n3",
+        "评论文字需求": "回复序号2",
+        "需要回复评论内容【左边填写回第几条】": "孩子愿意坚持吃这点很重要",
+        "评论图片需求": "embedded-image.png",
+        "金额【文字1.5，文字加图2元，单图1.5】": "",
+    }], {}, "fixture.xlsx")[0]
+    assert directive_with_body["reply_to"] == "回复序号2"
+    assert directive_with_body["comment_text"] == "孩子愿意坚持吃这点很重要"
+    assert directive_with_body["comment_type"] == "text+image"
+    assert directive_with_body["expected_amount"] == "2.00"
+
+    missing_reply_body = convert([{
+        "文章链接": "https://www.xiaohongshu.com/discovery/item/n4",
+        "评论文字需求": "回复序号2",
+        "需要回复评论内容【左边填写回第几条】": "",
+        "评论图片需求": "",
+        "金额【文字1.5，文字加图2元，单图1.5】": "",
+    }], {}, "fixture.xlsx")[0]
+    assert missing_reply_body["comment_text"] == ""
+    assert missing_reply_body["reply_body_missing"] is True
+    assert missing_reply_body["comment_type"] == "text"
+    malformed = review([missing_reply_body], [{
+        "platform": "xiaohongshu", "target_key": "n4", "capture_status": "ok",
+        "capture_complete": True, "visible_comment_panel_readable": True,
+        "comments": [{"comment_id": "unrelated", "text": "任意正文", "has_image": False}],
+    }])["results"][0]
+    assert malformed["reason_codes"] == ["invalid_or_contradictory_comment_type"], malformed
 
     print("ok: table converter regression tests")
 

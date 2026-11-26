@@ -18,9 +18,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 try:
-    from .review_comments import canonical_type, requires_specified_image
+    from .review_comments import canonical_type, is_reply_directive, requires_specified_image
 except ImportError:
-    from review_comments import canonical_type, requires_specified_image
+    from review_comments import canonical_type, is_reply_directive, requires_specified_image
 
 
 FIELD_ALIASES = {
@@ -644,26 +644,27 @@ def convert(
         item["platform"] = str(item.get("platform", "")).strip().casefold()
         item["comment_text"] = str(item.get("comment_text", "")).strip()
         image_in_reply_cell = False
-        if "reply_text" in mapping:
-            reply_text = str(row.get(mapping["reply_text"], "")).strip()
-            # A populated reply-content cell is authoritative. Source sheets
-            # use several relationship directives in the left column, such as
-            # "第一条回复第二条", which do not necessarily start with "回复".
-            reply_directive = bool(re.fullmatch(
-                r"(?:第[一二三四五六七八九十\d]+条)?回复(?:第[一二三四五六七八九十\d]+条|图片)?",
-                item["comment_text"],
-            ))
-            if reply_text.casefold() == "embedded-image.png" and item["comment_text"] and not reply_directive:
-                # Pictures sometimes occupy the reply column alongside the
-                # actual comment body in the text column. Do not erase it.
-                image_in_reply_cell = True
-            elif reply_text == "回复图片" and item["comment_text"].casefold() == "embedded-image.png":
-                shifted_body = str(row.get(mapping.get("image_requirement", ""), "")).strip()
-                item["reply_to"] = item["comment_text"]
-                item["comment_text"] = shifted_body if shifted_body and not looks_like_image_requirement(shifted_body) else reply_text
-            elif reply_text:
-                item["reply_to"] = item["comment_text"]
-                item["comment_text"] = reply_text
+        reply_text = str(row.get(mapping.get("reply_text", ""), "")).strip() if mapping.get("reply_text") else ""
+        # A populated reply-content cell is authoritative. Source sheets use
+        # relationship directives such as "回复第2条" and "回复序号2" in the
+        # neighboring comment-text cell; these are never comment bodies.
+        reply_directive = is_reply_directive(item["comment_text"])
+        reply_body_missing = False
+        if reply_text.casefold() == "embedded-image.png" and item["comment_text"] and not reply_directive:
+            # Pictures sometimes occupy the reply column alongside the
+            # actual comment body in the text column. Do not erase it.
+            image_in_reply_cell = True
+        elif reply_text == "回复图片" and item["comment_text"].casefold() == "embedded-image.png":
+            shifted_body = str(row.get(mapping.get("image_requirement", ""), "")).strip()
+            item["reply_to"] = item["comment_text"]
+            item["comment_text"] = shifted_body if shifted_body and not looks_like_image_requirement(shifted_body) else reply_text
+        elif reply_text:
+            item["reply_to"] = item["comment_text"]
+            item["comment_text"] = reply_text
+        elif reply_directive:
+            item["reply_to"] = item["comment_text"]
+            item["comment_text"] = ""
+            reply_body_missing = True
         # Separate an explicit trailing authoring note from the requested body.
         # This is source-data interpretation only: never perform the instruction.
         editorial = re.search(r"\s*[（(](辛苦\s*@[^（）()\s]+\s*要手打艾特出来[！!。]*)[）)]\s*$", item["comment_text"])
@@ -688,6 +689,12 @@ def convert(
                 item["comment_type"] = "text"
             elif item["has_image"]:
                 item["comment_type"] = "image"
+        if reply_body_missing and not item["comment_text"] and not item["has_image"]:
+            # Keep a locator with no reply body or image visible as invalid input
+            # instead of silently treating its locator as prose or dropping it.
+            item["reply_body_missing"] = True
+            if not str(item.get("comment_type", "")).strip():
+                item["comment_type"] = "text"
         # A URL-only placeholder row is not an audit task. Excluding it avoids
         # inflating human-review counts with rows that contain no requirement.
         if not item["comment_text"] and not item["has_image"] and not str(item.get("comment_type", "")).strip():

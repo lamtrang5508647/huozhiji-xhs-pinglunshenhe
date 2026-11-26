@@ -113,6 +113,9 @@ def test_shared_settlement():
 def run():
     test_shared_evidence()
     test_shared_settlement()
+    assert review_comments._reply_number("回复序号2") == 2
+    assert review_comments._reply_number("回复序号二") == 2
+    assert review_comments._reply_number("第2条回复") == 2
     assert normalize_text('@点点. 有什么作用') == normalize_text('@点点 有什么作用')
     assert normalize_text('可以。') == normalize_text('可以.')
     assert normalize_text('1.5元') != normalize_text('15元')

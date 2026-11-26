@@ -4,7 +4,7 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
-0.4.9 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
+0.4.10 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。回复位置标记（如“回复序号2”）会作为关系指令处理，不再误当评论正文；空正文加图片按单图任务审核。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
 
 ## WorkBuddy 使用
 

@@ -40,7 +40,9 @@ The converter:
 - carries the product and full group-leader value down within the same worksheet block, without substituting the owner/responsible-person abbreviation;
 - sanitizes target URLs by removing query strings;
 - combines all worksheets when `--all-sheets` is used;
-- changes a reply directive such as `回复第一条` to the mapped `reply_text`;
+- treats reply-location markers such as `回复第一条`, `回复第2条`, and `回复序号2` as relationship instructions, never as comment bodies;
+- uses a populated `reply_text` cell as the expected body; if the body cell is empty but the task row has an attached image, converts the task to image-only and derives its amount from the single-image rate;
+- retains a reply-only row with neither body nor image as invalid input so it cannot be silently dropped or matched as literal directive text;
 - recognizes `=DISPIMG(...)`, ordinary image markers, and floating OOXML pictures whose drawing anchor lands on the mapped row/column;
 - derives blank amounts from the rate-bearing header or explicit `--amount-rules`.
 
@@ -96,7 +98,7 @@ Comment fields:
 - `parent_comment_id`: ID of the directly replied-to comment when supplied by the platform. Explicit null denotes a known top-level comment. Omit the field when the relationship is unknown.
 - `parent_text`: optional direct-parent text from a trusted capture. The matcher checks its consistency with identifiers and the uniquely observed parent in the same capture.
 
-By default, one visible occurrence of the requested body anywhere on the assigned platform and post satisfies a text task. This includes top-level comments, nested replies, and a visible child of a deleted root. A numbered directive identifies the source reply body. Only the optional offline `--require-reply-parent` mode additionally requires direct-parent attribution.
+By default, one visible occurrence of the requested body anywhere on the assigned platform and post satisfies a text task. This includes top-level comments, nested replies, and a visible child of a deleted root. A numbered directive identifies reply placement; it is not a body to search for. If no body is supplied and the row contains an attached image, the task is image-only. Only the optional offline `--require-reply-parent` mode additionally requires direct-parent attribution.
 
 In optional direct-parent mode, `reply_source_parent_ambiguous`, `reply_parent_unconfirmed`, and `reply_thread_root_deleted` distinguish missing evidence about placement.
 

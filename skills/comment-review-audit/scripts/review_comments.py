@@ -279,7 +279,16 @@ def _observed_type(comment: Dict[str, Any]) -> Optional[str]:
     return infer_type({**comment, "comment_text": _observed_body(comment)})
 
 
-_REPLY_DIRECTIVE = re.compile(r"(?:第[一二三四五六七八九十0-9]+条)?回复(?:第([一二三四五六七八九十0-9]+)条|图片)?")
+_REPLY_ORDINAL = r"(?:[0-9]+|[零一二三四五六七八九十]+)"
+_REPLY_DIRECTIVE = re.compile(
+    rf"(?:第(?P<prefix>{_REPLY_ORDINAL})条)?(?:回复|回覆)"
+    rf"(?:(?:第(?P<after>{_REPLY_ORDINAL})条)|(?:序号(?P<sequence>{_REPLY_ORDINAL}))|图片)?"
+)
+
+
+def is_reply_directive(value):
+    """Whether source text identifies a reply relationship instead of a body."""
+    return _reply_number(value) is not None
 
 
 def _reply_number(value):
@@ -289,7 +298,7 @@ def _reply_number(value):
     match = _REPLY_DIRECTIVE.fullmatch(unicodedata.normalize("NFKC", str(value)).strip())
     if not match:
         return None
-    number = match[1] or ""
+    number = match.group("after") or match.group("sequence") or match.group("prefix") or ""
     if number.isdecimal() and len(number) <= 6:
         return int(number)
     digits = "一二三四五六七八九"

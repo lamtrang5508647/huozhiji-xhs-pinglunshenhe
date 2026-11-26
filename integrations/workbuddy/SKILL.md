@@ -5,7 +5,7 @@ display_name_en: Xiaohongshu and Douyin Comment Audit
 description: 根据任务表和平台证据核对小红书、抖音评论文字及配图，生成审核版 Excel、待人审结果与结算汇总。用户要求核对评论是否发布、核算评论任务金额或续审时使用。
 description_zh: 逐行核对评论与配图，回填审核结果和核定金额，生成结算汇总。
 description_en: Check comment evidence against assigned tasks and export a reconciled workbook.
-version: 0.4.9
+version: 0.4.10
 author: lamtrang5508647
 ---
 
