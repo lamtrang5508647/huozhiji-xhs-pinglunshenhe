@@ -61,6 +61,8 @@ def encode(root, original=b""):
     # Serialize XML into a string buffer, then encode each complete part once.
     data = ET.tostring(root, encoding="unicode", xml_declaration=True).encode("utf-8")
     first_end = data.index(b">", data.index(b"?>") + 2)
+    if data[first_end - 1:first_end] == b"/":
+        first_end -= 1
     first = data[:first_end]
     missing = []
     for prefix, uri in namespaces.items():
@@ -540,6 +542,24 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
     with_screenshots = any("screenshot_status" in result or "comment_screenshots" in result for result in results)
     finance_rows = with_finance_note_urls(source,rows) if with_screenshots or any(name.startswith(("评论原图","评论截图")) for name in sheet_paths) else rows
     screenshot_index = add_screenshot_index(parts, finance_rows, results, screenshot_base or output.parent, removed_screenshot_media)
+    inserted = {name: col_index(info["column"]) for name, info in (screenshot_index or {}).get("sheets", {}).items() if info["inserted"]}
+    if __package__:
+        from .workbook_columns import shift_reference, shift_formula
+    else:
+        from workbook_columns import shift_reference, shift_formula
+    def moved_signature(signature, owner):
+        if signature is None:
+            return None
+        name, attributes, text, children = signature
+        attrs = dict(attributes)
+        if owner in inserted:
+            for key in ("r", "ref"):
+                if key in attrs:
+                    attrs[key] = shift_reference(attrs[key], inserted[owner])
+        if name == tag("f") and text:
+            for changed, at in inserted.items():
+                text = shift_formula(text, owner, changed, at)
+        return name, sorted(attrs.items()), text, tuple(moved_signature(c, owner) for c in children)
     output.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(dir=output.parent, prefix=".audit-", suffix=".xlsx", delete=False)
     temporary = Path(handle.name)
@@ -558,14 +578,18 @@ def build_workbook(source: Path, rows: list[dict], results: list[dict], output: 
                 root = ET.fromstring(archive.read(sheet_paths[name]))
                 cells = {c.get("r"): c for c in root.iter(tag("c"))}
                 category_column, amount_column = layouts[name]
+                original_columns = (category_column, amount_column)
+                if name in inserted:
+                    category_column = shift_reference(category_column, inserted[name])
+                    amount_column = shift_reference(amount_column, inserted[name]) if amount_column else amount_column
                 for item in selected:
                     result = by_id[item["case_id"]]
                     if result.get("status") == "carried_forward":
-                        for col in (category_column, amount_column):
+                        for original_col, col in zip(original_columns, (category_column, amount_column)):
                             if not col:
                                 continue
                             ref = f'{col}{item["source_row"]}'
-                            original = preserved_cells[name].get(ref)
+                            original = moved_signature(preserved_cells[name].get(f'{original_col}{item["source_row"]}'), name)
                             saved = cell_signature(cells[ref]) if ref in cells else None
                             if original != saved:
                                 raise RuntimeError("export_retained_row_changed")

@@ -61,7 +61,7 @@ def source_picture_ownership(parts, sheet_path, gallery):
     return counts
 
 
-def install_pictures(parts, sheet_path, old_sheet, sheet, types, pictures, removed, source_owned=None):
+def install_pictures(parts, sheet_path, old_sheet, sheet, types, pictures, removed, source_owned=None, keep_rows=()):
     sheet_rels = relationships(parts, sheet_path)
     existing = old_sheet.find(tag("drawing")) if old_sheet is not None else None
     if existing is None and not pictures:
@@ -97,6 +97,9 @@ def install_pictures(parts, sheet_path, old_sheet, sheet, types, pictures, remov
                 signed=True
         if not signed:
             continue
+        origin = anchor.find(f"{{{XDR}}}from/{{{XDR}}}row")
+        if origin is not None and int(origin.text) + 1 in keep_rows:
+            continue
         old_refs.update(b.get(f"{{{R}}}embed") for b in anchor.iter(f"{{{A}}}blip"))
         drawing.remove(anchor)
     in_use = {b.get(f"{{{R}}}embed") for b in drawing.iter(f"{{{A}}}blip")}
@@ -125,7 +128,7 @@ def install_pictures(parts, sheet_path, old_sheet, sheet, types, pictures, remov
         pic_id += 1
         anchor = ET.SubElement(drawing,f"{{{XDR}}}oneCellAnchor")
         start = ET.SubElement(anchor,f"{{{XDR}}}from")
-        for name, value in (("col",0),("colOff",6*9525),("row",image["row"]-1),("rowOff",4*9525)):
+        for name, value in (("col",image.get("col",0)),("colOff",6*9525),("row",image["row"]-1),("rowOff",image.get("offset_y",4)*9525)):
             ET.SubElement(start,f"{{{XDR}}}{name}").text = str(value)
         extent = {"cx":str(image["width"]*9525),"cy":str(image["height"]*9525)}
         ET.SubElement(anchor,f"{{{XDR}}}ext",extent)
@@ -143,7 +146,8 @@ def install_pictures(parts, sheet_path, old_sheet, sheet, types, pictures, remov
         ET.SubElement(xfrm,f"{{{A}}}ext",extent)
         ET.SubElement(ET.SubElement(shape,f"{{{A}}}prstGeom",{"prst":"rect"}), f"{{{A}}}avLst")
         ET.SubElement(anchor,f"{{{XDR}}}clientData")
-    sheet.append(existing)
+    if sheet.find(tag("drawing")) is None:
+        sheet.append(existing)
     parts[drawing_path] = encode(drawing,original)
     parts[relfile(sheet_path)] = encode(sheet_rels, parts.get(relfile(sheet_path),b""))
     parts[relfile(drawing_path)] = encode(drels, parts.get(relfile(drawing_path),b""))

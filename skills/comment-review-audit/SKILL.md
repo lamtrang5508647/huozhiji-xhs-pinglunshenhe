@@ -149,3 +149,5 @@ Never “improve” success rate by weakening completeness, image, duplicate, or
 - `scripts/sync_openclaw_skill.sh`: force-syncs the validated source into OpenClaw agent `main` and verifies Skill readiness plus Feishu channel health without sending a message.
 - `scripts/verify_feishu_intake.py`: rejects deployments whose Feishu inbound-media limit would drop image-heavy audit workbooks.
 - `scripts/test_*.py`: offline regression suite.
+
+Successful tasks embed their matched original PNGs in a 评论截图 column immediately after the result column on the original task sheet. The column is reused on later passes. Current unsuccessful rows have no success screenshot. The workbook opens on the original task sheet.

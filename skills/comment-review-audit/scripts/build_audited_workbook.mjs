@@ -520,6 +520,7 @@ await renderAllSheets(
 await fs.mkdir(path.dirname(args.output), { recursive: true });
 const exported = await SpreadsheetFile.exportXlsx(workbook);
 const needsIndex = results.some(row => "screenshot_status" in row || "comment_screenshots" in row)
+  || [...layouts.keys()].some(name => workbook.worksheets.getItem(name).getRange("A1:ZZ1").values[0].includes("评论截图"))
   || [...sourceSheetNames].some(name => /^评论(?:截图|原图)(?:（\d+）)?$/.test(name));
 if (needsIndex) {
   // The embedded finance gallery and internal XLSX links are shared with the portable writer.

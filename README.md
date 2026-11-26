@@ -4,11 +4,11 @@
 
 核心只需要 Python 3.11+，不需要飞书机器人、OpenClaw、Codex、Node.js、Excel 或第三方 Python 库。飞书只是可选的任务接收/交付渠道。
 
-0.4.8 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
+0.4.9 支持 Windows、macOS、Linux 共用一套 SDK/CLI，并可打包为 WorkBuddy 本地技能。Windows 安装和启动入口见 [Windows 使用说明](docs/windows.md)。
 
 ## WorkBuddy 使用
 
-在线审核按笔记保存评论区原图，交付一份审核版 Excel。财务打开「评论原图」工作表，左侧看截图，右侧逐条对照任务原文、审核结果、金额、原表行号和可点击的原笔记链接。二审只复核原先成功的行。
+在线审核按笔记保存评论区原图，交付一份审核版 Excel。在原任务表的「审核结果」右侧新增「评论截图」列，成功评论的真实截图嵌在对应行，原笔记链接和金额在同一行。截图随 Excel 文件携带。二审只复核原先成功的行。
 
 下载 [WorkBuddy 技能包](https://github.com/lamtrang5508647/huozhiji-xhs-pinglunshenhe/releases/latest/download/comment-review-audit.zip)，在 WorkBuddy 的「专家·技能·连接器 → 技能 → 添加技能 → 上传技能」导入。本地包内含审核脚本，离线审核使用 Python 3.11+。需要从源码生成技能包时，在仓库根目录运行 `python tools/package_workbuddy.py --output dist/comment-review-audit.zip`。导入入口见 [WorkBuddy 官方说明](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Skills-Market)。
 
